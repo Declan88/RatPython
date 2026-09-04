@@ -1,5 +1,40 @@
+"""
+Simplified Cook-Torrance PBR shader + cascaded-shadow-aware material binding.
+
+Changes from the original version:
+- GLSL: shadow bias scaling per cascade replaced with an array lookup
+  instead of an if/else chain. No functional change.
+- GLSL: texture/sampler unit numbers and the shadow-map resolution used
+  for PCF texel size are now named constants at the top of the fragment
+  shader, so the "2048" and "3" scattered through the code only need to
+  match CascadedShadowMap.resolution / cascade_count in one place.
+- Python: bind_material() split into small helpers (_write_uniform,
+  _bind_material_textures, _bind_shadow_uniforms) instead of one function
+  doing uniform building, texture binding, and shadow wiring all inline.
+  This also removes the redundant double-set of "u_has_shadows" (it was
+  set to 0 in the base dict, then unconditionally overwritten to 1 inside
+  the shadow branch).
+- Python: texture unit numbers are named constants instead of bare 0/1/2.
+- Behavior and the public function signatures (create_program,
+  bind_material) are unchanged, so this is a drop-in replacement.
+
+Known fragility carried over from the original (not changed here, flagging
+for awareness): the shader hardcodes 3 shadow-cascade samplers and a PCF
+texel size derived from a 2048 shadow-map resolution. If you ever construct
+CascadedShadowMap with cascade_count != 3 or a different resolution, the
+shader's assumptions (u_shadow_maps[3], u_cascade_splits[3], texel_size)
+will silently mismatch it. Worth keeping these two files' constants in sync,
+or passing resolution in as a uniform, if that ever changes.
+"""
+
 import moderngl
 import numpy as np
+
+# Fixed texture units used when binding materials.
+TEX_UNIT_ALBEDO = 0
+TEX_UNIT_METALLIC_ROUGHNESS = 1
+TEX_UNIT_SHADOW_START = 2  # cascades occupy TEX_UNIT_SHADOW_START..+cascade_count-1
+MAX_SHADOW_CASCADES = 3
 
 VERTEX_SHADER = """
 #version 330
@@ -28,6 +63,9 @@ void main() {
 FRAGMENT_SHADER = """
 #version 330
 
+#define NUM_CASCADES 3
+#define SHADOW_MAP_RESOLUTION 2048.0
+
 uniform vec3 u_light_dir;
 uniform vec3 u_eye_pos;
 uniform mat4 u_view_matrix;
@@ -42,9 +80,9 @@ uniform int u_has_texture;
 uniform sampler2D u_metallic_roughness_texture;
 uniform int u_has_metallic_roughness_texture;
 
-uniform sampler2D u_shadow_maps[3];
-uniform mat4 u_light_mvps[3];
-uniform float u_cascade_splits[3];
+uniform sampler2D u_shadow_maps[NUM_CASCADES];
+uniform mat4 u_light_mvps[NUM_CASCADES];
+uniform float u_cascade_splits[NUM_CASCADES];
 uniform int u_has_shadows;
 
 in vec3 v_position;
@@ -68,7 +106,7 @@ float geometrySchlickGGX(float NdotV, float roughness) {
 }
 
 float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) * 
+    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
            geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
 }
 
@@ -84,7 +122,7 @@ int get_cascade_index(float view_depth) {
 
 float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light_dir) {
     if (u_has_shadows == 0 || view_depth <= 0.0) return 0.0;
-    
+
     int cascade = get_cascade_index(view_depth);
     vec4 light_space = u_light_mvps[cascade] * vec4(world_pos, 1.0);
     if (light_space.w <= 0.00001) return 0.0;
@@ -92,12 +130,12 @@ float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light
     vec3 shadow_coord = (light_space.xyz / light_space.w) * 0.5 + 0.5;
     if (any(lessThan(shadow_coord, vec3(0.0))) || any(greaterThan(shadow_coord, vec3(1.0)))) return 0.0;
 
+    float bias_scale[NUM_CASCADES] = float[NUM_CASCADES](1.0, 1.5, 2.0);
     float bias = max(0.0005, 0.003 * (1.0 - clamp(dot(normal, light_dir), 0.0, 1.0)));
-    if (cascade == 1) bias *= 1.5;
-    else if (cascade == 2) bias *= 2.0;
+    bias *= bias_scale[cascade];
 
     float shadow = 0.0;
-    vec2 texel_size = vec2(1.0 / 2048.0);
+    vec2 texel_size = vec2(1.0 / SHADOW_MAP_RESOLUTION);
     for (int x = -1; x <= 1; x++) {
         for (int y = -1; y <= 1; y++) {
             vec2 uv = clamp(shadow_coord.xy + vec2(x, y) * texel_size, vec2(0.001), vec2(0.999));
@@ -154,13 +192,65 @@ def create_program(ctx):
     return ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
 
 
+def _write_uniform(prog, name, value):
+    """Set a uniform whether it needs .write() (matrices) or .value = (scalars/vectors)."""
+    if name not in prog:
+        return
+    if isinstance(value, (bytes, bytearray)):
+        prog[name].write(value)
+    else:
+        prog[name].value = value
+
+
+def _bind_material_textures(prog, item_data):
+    for key, unit in (
+        ("texture", TEX_UNIT_ALBEDO),
+        ("metallic_roughness_texture", TEX_UNIT_METALLIC_ROUGHNESS),
+    ):
+        tex = item_data.get(key)
+        uniform_name = f"u_{key}"
+        if tex and uniform_name in prog:
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tex.use(location=unit)
+            prog[uniform_name].value = unit
+
+
+def _bind_shadow_uniforms(prog, shadow_manager):
+    if shadow_manager is None:
+        return
+
+    cascades = shadow_manager.depth_textures[:MAX_SHADOW_CASCADES]
+    for i, tex in enumerate(cascades):
+        tex.use(location=TEX_UNIT_SHADOW_START + i)
+
+    _write_uniform(prog, "u_has_shadows", 1)
+    if "u_shadow_maps" in prog:
+        units = tuple(TEX_UNIT_SHADOW_START + i for i in range(MAX_SHADOW_CASCADES))
+        prog["u_shadow_maps"].value = units
+
+    splits = list(shadow_manager.splits)
+    while len(splits) < MAX_SHADOW_CASCADES:
+        splits.append(shadow_manager.far)
+    _write_uniform(
+        prog,
+        "u_cascade_splits",
+        np.array(splits[:MAX_SHADOW_CASCADES], dtype=np.float32).tobytes(),
+    )
+
+    _write_uniform(
+        prog,
+        "u_light_mvps",
+        b"".join(m.to_bytes() for m in shadow_manager.light_mvps[:MAX_SHADOW_CASCADES]),
+    )
+
+
 def bind_material(
     prog, item_data, model_matrix, camera, light_dir, shadow_manager=None
 ):
     view = camera.get_view_matrix()
     mvp = camera.get_projection_matrix() * view * model_matrix
 
-    uniforms = {
+    base_uniforms = {
         "u_mvp": mvp.to_bytes(),
         "u_model": model_matrix.to_bytes(),
         "u_view_matrix": view.to_bytes(),
@@ -175,37 +265,8 @@ def bind_material(
         ),
         "u_has_shadows": 0,
     }
+    for name, value in base_uniforms.items():
+        _write_uniform(prog, name, value)
 
-    for name, val in uniforms.items():
-        if name in prog:
-            if isinstance(val, (bytes, bytearray)):
-                prog[name].write(val)
-            else:
-                prog[name].value = val
-
-    if shadow_manager:
-        for i, tex in enumerate(shadow_manager.depth_textures[:3]):
-            tex.use(location=2 + i)
-        if "u_shadow_maps" in prog:
-            prog["u_shadow_maps"].value = (2, 3, 4)
-        if "u_has_shadows" in prog:
-            prog["u_has_shadows"].value = 1
-        if "u_cascade_splits" in prog:
-            splits = list(shadow_manager.splits)
-            while len(splits) < 3:
-                splits.append(shadow_manager.far)
-            prog["u_cascade_splits"].write(
-                np.array(splits[:3], dtype=np.float32).tobytes()
-            )
-        if "u_light_mvps" in prog:
-            prog["u_light_mvps"].write(
-                b"".join(m.to_bytes() for m in shadow_manager.light_mvps[:3])
-            )
-
-    for key, loc in [("texture", 0), ("metallic_roughness_texture", 1)]:
-        tex = item_data.get(key)
-        uname = f"u_{key}"
-        if tex and uname in prog:
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            tex.use(location=loc)
-            prog[uname].value = loc
+    _bind_material_textures(prog, item_data)
+    _bind_shadow_uniforms(prog, shadow_manager)

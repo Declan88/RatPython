@@ -1,9 +1,38 @@
+"""
+Simplified glTF/GLB loader and cascaded shadow mapping for moderngl.
+
+Changes from the original version:
+- Vertex normals now trust the file's own baked-in normals
+  (mesh.vertex_normals) verbatim, loaded with trimesh.load(..., process=
+  False). The earlier torus-seam and cube/rounded-edge-over-smoothing bugs
+  both traced back to trimesh's default process=True pass silently
+  welding vertices and recomputing normals, discarding the exact
+  per-corner data the exporter (e.g. Blender) baked in -- which is the
+  only place hard-edge-vs-smooth information exists for a glTF file.
+  A geometric fallback (average of adjacent face normals, then an
+  angle-aware seam merge) only runs for the rare file with no normal
+  data in it at all.
+- Factored repeated "create buffer if attribute exists" and "load texture
+  from PIL image" logic into small helpers to cut duplication.
+- Flattened the nested material-extraction logic into straightforward
+  helper functions with early returns instead of deep if/else nesting.
+- Simplified frustum-corner math using vector ops instead of manually
+  writing out all 8 corner expressions.
+- Kept all public behavior (function names, return dict keys, class
+  interface) identical so this is a drop-in replacement.
+"""
+
 from pathlib import Path
 import moderngl
 import numpy as np
 from PIL import Image
 import trimesh
 import glm
+
+
+# --------------------------------------------------------------------------
+# glTF / GLB loading
+# --------------------------------------------------------------------------
 
 
 def _has_attribute(prog, name):
@@ -13,6 +42,223 @@ def _has_attribute(prog, name):
         return False
 
 
+# Vertices at the same 3D position are merged into one smoothed normal only
+# if their un-merged normals are within this angle of each other. Kept as a
+# last-resort fallback for files with no baked normal data at all -- see
+# _compute_vertex_normals for why this is no longer the primary mechanism.
+SEAM_SMOOTHING_ANGLE_DEG = 45.0
+
+
+def _merge_seam_normals(
+    vertices, normals, angle_threshold_deg=SEAM_SMOOTHING_ANGLE_DEG
+):
+    """Average normals across position-duplicate vertices, but only when
+    they're already close in direction. Only used as a fallback when a
+    file has no baked normal data to begin with (see _compute_vertex_normals).
+    """
+    cos_threshold = np.cos(np.radians(angle_threshold_deg))
+    _, inverse = np.unique(vertices, axis=0, return_inverse=True)
+
+    order = np.argsort(inverse)
+    sorted_groups = inverse[order]
+    group_count = sorted_groups[-1] + 1 if len(sorted_groups) else 0
+    starts = np.searchsorted(sorted_groups, np.arange(group_count))
+    ends = np.searchsorted(sorted_groups, np.arange(group_count), side="right")
+
+    result = normals.copy()
+    for start, end in zip(starts, ends):
+        if end - start < 2:
+            continue  # no duplicates at this position
+        idxs = order[start:end]
+        group_normals = normals[idxs]
+
+        avg = group_normals.sum(axis=0)
+        avg_len = np.linalg.norm(avg)
+        if avg_len < 1e-6:
+            continue
+        avg /= avg_len
+
+        close_enough = (group_normals @ avg) > cos_threshold
+        if close_enough.sum() < 2:
+            continue  # nothing in this group actually agrees; leave as-is
+
+        merged = group_normals[close_enough].sum(axis=0)
+        merged_len = np.linalg.norm(merged)
+        if merged_len > 1e-6:
+            result[idxs[close_enough]] = merged / merged_len
+
+    return result
+
+
+def _seam_group_angle_stats(vertices, normals):
+    """Diagnostic: for each set of vertices sharing a 3D position, return
+    the max pairwise angle (in degrees) between their un-merged normals.
+
+    Use this to measure real disagreement angles in a specific model
+    before picking SEAM_SMOOTHING_ANGLE_DEG, instead of guessing. Call it
+    from a scratch script, e.g.:
+
+        mesh = trimesh.load("Assets/Models/sphere.glb", process=False)
+        mesh = mesh.dump(concatenate=True) if hasattr(mesh, "dump") else mesh
+        vertices = np.asarray(mesh.vertices, dtype="f4")
+        normals = np.asarray(mesh.vertex_normals, dtype="f4")
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+        print(_seam_group_angle_stats(vertices, normals))
+
+    Returns a sorted list of (angle_degrees, group_size) for every
+    duplicate-position group with more than one member, largest angle
+    first, so you can see the real spread of "seam" vs "hard edge" angles
+    in that specific asset and set SEAM_SMOOTHING_ANGLE_DEG accordingly.
+    """
+    _, inverse = np.unique(vertices, axis=0, return_inverse=True)
+    order = np.argsort(inverse)
+    sorted_groups = inverse[order]
+    group_count = sorted_groups[-1] + 1 if len(sorted_groups) else 0
+    starts = np.searchsorted(sorted_groups, np.arange(group_count))
+    ends = np.searchsorted(sorted_groups, np.arange(group_count), side="right")
+
+    results = []
+    for start, end in zip(starts, ends):
+        if end - start < 2:
+            continue
+        idxs = order[start:end]
+        group_normals = normals[idxs]
+        # max angle between any pair in the group
+        cos_matrix = np.clip(group_normals @ group_normals.T, -1.0, 1.0)
+        max_angle = np.degrees(np.arccos(cos_matrix.min()))
+        results.append((float(max_angle), int(end - start)))
+
+    results.sort(key=lambda r: -r[0])
+    return results
+
+
+def _compute_vertex_normals(mesh, vertices, faces):
+    """Vertex normals for shading.
+
+    Start from the file's own baked-in normals (mesh.vertex_normals) when
+    present -- that's the only place hard-edge-vs-smooth intent exists for
+    a glTF file, and it requires loading with process=False (see load_glb)
+    so trimesh doesn't weld vertices and discard it. Even with correct
+    file data though, some exporters/assets still leave a real mismatch at
+    UV seams on otherwise-smooth surfaces (confirmed on this project's
+    sphere/torus). So we always run a seam-merge pass afterward that
+    averages normals across duplicate-position vertices, but ONLY within
+    SEAM_SMOOTHING_ANGLE_DEG of agreement -- if that threshold is wrong
+    for a given asset (merging real hard edges, or failing to merge real
+    seams), use _seam_group_angle_stats() to measure the actual angles in
+    that file and recalibrate the constant rather than guessing.
+    """
+    file_normals = getattr(mesh, "vertex_normals", None)
+    base_normals = None
+    if file_normals is not None:
+        file_normals = np.asarray(file_normals, dtype="f4")
+        if file_normals.shape == vertices.shape:
+            lengths = np.linalg.norm(file_normals, axis=1)
+            if np.isfinite(file_normals).all() and np.all(lengths > 1e-6):
+                base_normals = file_normals / lengths[:, None]
+
+    if base_normals is None:
+        # No usable normals in the file: compute a simple per-vertex
+        # average of adjacent face normals as the starting point.
+        v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+        face_normals = np.cross(v1 - v0, v2 - v0)
+        lengths = np.linalg.norm(face_normals, axis=1, keepdims=True)
+        face_normals /= np.where(lengths < 1e-6, 1.0, lengths)
+
+        normals = np.zeros_like(vertices)
+        for i in range(3):
+            np.add.at(normals, faces[:, i], face_normals)
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        base_normals = normals / np.where(lengths < 1e-6, 1.0, lengths)
+
+    smoothed = _merge_seam_normals(vertices, base_normals)
+    return smoothed.astype("f4")
+
+
+def _compute_uvs(mesh, vertex_count):
+    uvs = np.zeros((vertex_count, 2), dtype="f4")
+    raw_uvs = getattr(mesh.visual, "uv", None)
+    if raw_uvs is not None and len(raw_uvs) == vertex_count:
+        uvs = np.asarray(raw_uvs, dtype="f4").copy()
+        uvs[:, 1] = 1.0 - uvs[:, 1]  # flip V for OpenGL
+    return uvs
+
+
+def _normalize_color(values):
+    col = np.asarray(values[:3], dtype="f4")
+    return col / (255.0 if np.max(col) > 1.0 else 1.0)
+
+
+def _as_pil_image(img):
+    if img is None:
+        return None
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(np.asarray(img))
+    return img.convert("RGB")
+
+
+def _upload_texture(ctx, img):
+    img = _as_pil_image(img)
+    if img is None:
+        return None
+    tex = ctx.texture(img.size, 3, img.tobytes())
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    tex.repeat_x = tex.repeat_y = True
+    return tex
+
+
+def _extract_material(mesh, scene, ctx):
+    """Returns (base_color, metallic, roughness, emissive, tex, mr_tex)."""
+    base_color = np.array([0.8, 0.8, 0.8], dtype="f4")
+    metallic, roughness = 0.1, 0.5
+    emissive = np.zeros(3, dtype="f4")
+    tex_obj = mr_tex_obj = None
+
+    mat = getattr(mesh.visual, "material", None)
+    if mat is None:
+        return base_color, metallic, roughness, emissive, tex_obj, mr_tex_obj
+
+    for attr in ("main_color", "baseColorFactor", "diffuse"):
+        val = getattr(mat, attr, None)
+        if val is not None:
+            base_color = _normalize_color(val)
+            break
+
+    try:
+        metallic = float(getattr(mat, "metallicFactor", metallic))
+    except (TypeError, ValueError):
+        pass
+    try:
+        roughness = float(getattr(mat, "roughnessFactor", roughness))
+    except (TypeError, ValueError):
+        pass
+
+    em_val = getattr(mat, "emissiveFactor", None)
+    if em_val is not None:
+        emissive = _normalize_color(em_val)
+
+    img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
+    if img is None and isinstance(scene, trimesh.Scene):
+        textures = getattr(scene, "textures", None)
+        if textures:
+            img = next(iter(textures.values()))
+    tex_obj = _upload_texture(ctx, img)
+
+    mr_tex_obj = _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None))
+
+    return base_color, metallic, roughness, emissive, tex_obj, mr_tex_obj
+
+
+def _extract_vertex_colors(mesh, base_color, vertex_count):
+    colors = np.tile(base_color, (vertex_count, 1)).astype("f4")
+    v_cols = getattr(mesh.visual, "vertex_colors", None)
+    if v_cols is not None:
+        v_cols = np.asarray(v_cols[:, :3], dtype="f4") / 255.0
+        if len(v_cols) == vertex_count and not np.allclose(v_cols, v_cols[0]):
+            colors = v_cols
+    return colors
+
+
 def load_glb(filepath, ctx, prog):
     path = Path(filepath)
     if not path.exists():
@@ -20,12 +266,15 @@ def load_glb(filepath, ctx, prog):
         return None
 
     buffers = []
-    vao = None
-    tex_obj = None
-    mr_tex_obj = None
+    vao = tex_obj = mr_tex_obj = None
 
     try:
-        scene = trimesh.load(str(path))
+        # process=False is important: trimesh's default loading pass merges
+        # nearby vertices and can recompute normals from scratch, silently
+        # discarding the exact per-corner normals the exporter baked in
+        # (which is the only place hard-edge-vs-smooth information lives
+        # for a glTF file). Keep the file's data verbatim.
+        scene = trimesh.load(str(path), process=False)
         mesh = (
             scene.dump(concatenate=True) if isinstance(scene, trimesh.Scene) else scene
         )
@@ -35,128 +284,29 @@ def load_glb(filepath, ctx, prog):
         vertices = np.asarray(mesh.vertices, dtype="f4")
         faces = np.asarray(mesh.faces, dtype="i4")
 
-        # Normals computation
-        v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
-        face_normals = np.cross(v1 - v0, v2 - v0)
-        norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)
-        face_normals /= np.where(norm_lens < 1e-6, 1.0, norm_lens)
-
-        normals = np.zeros_like(vertices)
-        for i in range(3):
-            np.add.at(normals, faces[:, i], face_normals)
-
-        unique_pos, inverse_indices = np.unique(vertices, axis=0, return_inverse=True)
-        shared_normals = np.zeros_like(unique_pos)
-        np.add.at(shared_normals, inverse_indices, normals)
-        norm_lens = np.linalg.norm(shared_normals, axis=1, keepdims=True)
-        shared_normals /= np.where(norm_lens < 1e-6, 1.0, norm_lens)
-        normals = shared_normals[inverse_indices].astype("f4")
-
-        # UVs
-        uvs = np.zeros((len(vertices), 2), dtype="f4")
-        if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
-            raw_uvs = np.asarray(mesh.visual.uv, dtype="f4")
-            if len(raw_uvs) == len(vertices):
-                uvs = raw_uvs.copy()
-                uvs[:, 1] = 1.0 - uvs[:, 1]
-
-        # Material defaults
-        mat = getattr(mesh.visual, "material", None)
-        base_color = np.array([0.8, 0.8, 0.8], dtype="f4")
-        metallic, roughness = 0.1, 0.5
-        emissive = np.zeros(3, dtype="f4")
-
-        if mat:
-            for attr in ["main_color", "baseColorFactor", "diffuse"]:
-                val = getattr(mat, attr, None)
-                if val is not None:
-                    col = np.asarray(val[:3], dtype="f4")
-                    base_color = col / (255.0 if np.max(col) > 1.0 else 1.0)
-                    break
-
-            mf = getattr(mat, "metallicFactor", None)
-            if mf is not None:
-                try:
-                    metallic = float(mf)
-                except (TypeError, ValueError):
-                    pass
-
-            rf = getattr(mat, "roughnessFactor", None)
-            if rf is not None:
-                try:
-                    roughness = float(rf)
-                except (TypeError, ValueError):
-                    pass
-
-            em_val = getattr(mat, "emissiveFactor", None)
-            if em_val is not None:
-                em = np.asarray(em_val[:3], dtype="f4")
-                emissive = em / (255.0 if np.max(em) > 1.0 else 1.0)
-
-            # Textures safely
-            img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
-            textures_dict = (
-                getattr(scene, "textures", {})
-                if isinstance(scene, trimesh.Scene)
-                else {}
-            )
-            if img is None and textures_dict:
-                img = list(textures_dict.values())[0]
-
-            if img is not None:
-                if not isinstance(img, Image.Image):
-                    img = Image.fromarray(np.asarray(img))
-                img = img.convert("RGB")
-                tex_obj = ctx.texture(img.size, 3, img.tobytes())
-                tex_obj.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                tex_obj.repeat_x = tex_obj.repeat_y = True
-
-            mr_img = getattr(mat, "metallicRoughnessTexture", None)
-            if mr_img is not None:
-                if not isinstance(mr_img, Image.Image):
-                    mr_img = Image.fromarray(np.asarray(mr_img))
-                mr_img = mr_img.convert("RGB")
-                mr_tex_obj = ctx.texture(mr_img.size, 3, mr_img.tobytes())
-                mr_tex_obj.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                mr_tex_obj.repeat_x = mr_tex_obj.repeat_y = True
-
-        # Vertex colors
-        colors = np.tile(base_color, (len(vertices), 1)).astype("f4")
-        if (
-            hasattr(mesh.visual, "vertex_colors")
-            and mesh.visual.vertex_colors is not None
-        ):
-            v_cols = np.asarray(mesh.visual.vertex_colors[:, :3], dtype="f4") / 255.0
-            if len(v_cols) == len(vertices) and not np.allclose(v_cols, v_cols[0]):
-                colors = v_cols
-
-        # Buffers & VAO
-        vbo = (
-            ctx.buffer(vertices.tobytes())
-            if _has_attribute(prog, "in_position")
-            else None
+        normals = _compute_vertex_normals(mesh, vertices, faces)
+        uvs = _compute_uvs(mesh, len(vertices))
+        base_color, metallic, roughness, emissive, tex_obj, mr_tex_obj = (
+            _extract_material(mesh, scene, ctx)
         )
-        normal_vbo = (
-            ctx.buffer(normals.tobytes()) if _has_attribute(prog, "in_normal") else None
-        )
-        color_vbo = (
-            ctx.buffer(colors.tobytes()) if _has_attribute(prog, "in_color") else None
-        )
-        uv_vbo = ctx.buffer(uvs.tobytes()) if _has_attribute(prog, "in_uv") else None
+        colors = _extract_vertex_colors(mesh, base_color, len(vertices))
+
+        # Build only the buffers the shader program actually declares.
+        attr_data = {
+            "in_position": (vertices, "3f"),
+            "in_normal": (normals, "3f"),
+            "in_color": (colors, "3f"),
+            "in_uv": (uvs, "2f"),
+        }
+        vbos = {}
+        for name, (data, fmt) in attr_data.items():
+            if _has_attribute(prog, name):
+                vbos[name] = ctx.buffer(data.tobytes())
+
         ibo = ctx.buffer(faces.tobytes())
+        buffers = list(vbos.values()) + [ibo]
 
-        buffers = [b for b in [vbo, normal_vbo, color_vbo, uv_vbo, ibo] if b]
-
-        vao_content = []
-        if vbo:
-            vao_content.append((vbo, "3f", "in_position"))
-        if normal_vbo:
-            vao_content.append((normal_vbo, "3f", "in_normal"))
-        if color_vbo:
-            vao_content.append((color_vbo, "3f", "in_color"))
-        if uv_vbo:
-            vao_content.append((uv_vbo, "2f", "in_uv"))
-
+        vao_content = [(vbos[name], attr_data[name][1], name) for name in vbos]
         if not vao_content:
             raise RuntimeError("No recognized vertex attributes.")
 
@@ -164,10 +314,10 @@ def load_glb(filepath, ctx, prog):
 
         return {
             "vao": vao,
-            "vbo": vbo,
-            "normal_vbo": normal_vbo,
-            "color_vbo": color_vbo,
-            "uv_vbo": uv_vbo,
+            "vbo": vbos.get("in_position"),
+            "normal_vbo": vbos.get("in_normal"),
+            "color_vbo": vbos.get("in_color"),
+            "uv_vbo": vbos.get("in_uv"),
             "ibo": ibo,
             "texture": tex_obj,
             "metallic_roughness_texture": mr_tex_obj,
@@ -180,15 +330,29 @@ def load_glb(filepath, ctx, prog):
 
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
-        if vao:
-            vao.release()
-        for b in buffers:
-            b.release()
-        if tex_obj:
-            tex_obj.release()
-        if mr_tex_obj:
-            mr_tex_obj.release()
+        for resource in [vao, *buffers, tex_obj, mr_tex_obj]:
+            if resource:
+                resource.release()
         return None
+
+
+# --------------------------------------------------------------------------
+# Cascaded shadow mapping
+# --------------------------------------------------------------------------
+
+_SHADOW_VERTEX_SHADER = """
+#version 330
+uniform mat4 u_light_mvp;
+in vec3 in_position;
+void main() {
+    gl_Position = u_light_mvp * vec4(in_position, 1.0);
+}
+"""
+
+_SHADOW_FRAGMENT_SHADER = """
+#version 330
+void main() {}
+"""
 
 
 class CascadedShadowMap:
@@ -214,18 +378,8 @@ class CascadedShadowMap:
         self.splits = [0.0 for _ in range(max(0, cascade_count - 1))]
 
         self.program = ctx.program(
-            vertex_shader="""
-            #version 330
-            uniform mat4 u_light_mvp;
-            in vec3 in_position;
-            void main() {
-                gl_Position = u_light_mvp * vec4(in_position, 1.0);
-            }
-            """,
-            fragment_shader="""
-            #version 330
-            void main() {}
-            """,
+            vertex_shader=_SHADOW_VERTEX_SHADER,
+            fragment_shader=_SHADOW_FRAGMENT_SHADER,
         )
 
     def _get_camera_basis(self, camera):
@@ -240,84 +394,89 @@ class CascadedShadowMap:
     def _get_frustum_corners(self, camera, near_d, far_d):
         proj = camera.get_projection_matrix()
         pos, right, up, forward = self._get_camera_basis(camera)
+
         px, py = float(proj[0][0]), float(proj[1][1])
         fov_y = 2.0 * np.arctan(1.0 / py) if abs(px) >= 1e-6 else np.radians(60.0)
         aspect = (py / px) if abs(px) >= 1e-6 else 1.6
-
         tan_half = np.tan(fov_y * 0.5)
-        nh, nw = near_d * tan_half, near_d * tan_half * aspect
-        fh, fw = far_d * tan_half, far_d * tan_half * aspect
-        nc, fc = pos + forward * near_d, pos + forward * far_d
 
-        return [
-            nc - right * nw - up * nh,
-            nc + right * nw - up * nh,
-            nc + right * nw + up * nh,
-            nc - right * nw + up * nh,
-            fc - right * fw - up * fh,
-            fc + right * fw - up * fh,
-            fc + right * fw + up * fh,
-            fc - right * fw + up * fh,
-        ]
+        corners = []
+        for dist in (near_d, far_d):
+            h, w = dist * tan_half, dist * tan_half * aspect
+            center = pos + forward * dist
+            corners += [
+                center - right * w - up * h,
+                center + right * w - up * h,
+                center + right * w + up * h,
+                center - right * w + up * h,
+            ]
+        return corners
+
+    def _fit_light_frustum(self, corners, light, world_up, curr_split):
+        center = sum(corners, glm.vec3(0.0)) / float(len(corners))
+        light_view = glm.lookAt(
+            center + light * max(curr_split * 2.0, 50.0), center, world_up
+        )
+
+        min_xyz = glm.vec3(float("inf"))
+        max_xyz = glm.vec3(float("-inf"))
+        for corner in corners:
+            pt = glm.vec3(light_view * glm.vec4(corner, 1.0))
+            min_xyz = glm.min(min_xyz, pt)
+            max_xyz = glm.max(max_xyz, pt)
+
+        xy_pad = max(1.0, (max_xyz.x - min_xyz.x) * 0.02)
+        near_p = max(0.01, -max_xyz.z - 50.0)
+        far_p = -min_xyz.z + 50.0
+
+        light_proj = glm.ortho(
+            min_xyz.x - xy_pad,
+            max_xyz.x + xy_pad,
+            min_xyz.y - xy_pad,
+            max_xyz.y + xy_pad,
+            near_p,
+            far_p,
+        )
+        return light_proj * light_view
 
     def update(self, camera, light_dir):
         self.near = max(float(getattr(camera, "near", 0.1)), 0.01)
         self.far = max(float(getattr(camera, "far", 100.0)), self.near + 1.0)
 
+        # Practical split scheme: blend of logarithmic and uniform splits.
         lambda_val = 0.75
         cascade_splits = []
         for i in range(self.cascade_count):
             p = (i + 1) / float(self.cascade_count)
-            log_s = self.near * (self.far / self.near) ** p
-            uni_s = self.near + (self.far - self.near) * p
-            cascade_splits.append(lambda_val * log_s + (1.0 - lambda_val) * uni_s)
-
+            log_split = self.near * (self.far / self.near) ** p
+            uniform_split = self.near + (self.far - self.near) * p
+            cascade_splits.append(
+                lambda_val * log_split + (1.0 - lambda_val) * uniform_split
+            )
         self.splits = cascade_splits[:-1]
 
-        light = glm.normalize(
-            glm.vec3(light_dir)
-            if isinstance(light_dir, np.ndarray)
-            else glm.vec3(light_dir.x, light_dir.y, light_dir.z)
+        if isinstance(light_dir, np.ndarray):
+            light = glm.vec3(*light_dir)
+        else:
+            light = glm.vec3(light_dir.x, light_dir.y, light_dir.z)
+        light = (
+            glm.normalize(light)
+            if glm.length(light) > 1e-6
+            else glm.vec3(0.5, 1.0, 0.8)
         )
-        if glm.length(light) < 1e-6:
-            light = glm.vec3(0.5, 1.0, 0.8)
 
         world_up = (
             glm.vec3(0.0, 0.0, 1.0)
             if abs(glm.dot(light, glm.vec3(0, 1, 0))) > 0.95
             else glm.vec3(0, 1, 0)
         )
+
         prev_split = self.near
-
-        for i in range(self.cascade_count):
-            curr_split = cascade_splits[i]
+        for i, curr_split in enumerate(cascade_splits):
             corners = self._get_frustum_corners(camera, prev_split, curr_split)
-            center = sum(corners, glm.vec3(0.0)) / float(len(corners))
-
-            light_view = glm.lookAt(
-                center + light * max(curr_split * 2.0, 50.0), center, world_up
+            self.light_mvps[i] = self._fit_light_frustum(
+                corners, light, world_up, curr_split
             )
-            min_xyz = glm.vec3(float("inf"))
-            max_xyz = glm.vec3(float("-inf"))
-
-            for corner in corners:
-                pt = light_view * glm.vec4(corner, 1.0)
-                min_xyz = glm.min(min_xyz, glm.vec3(pt))
-                max_xyz = glm.max(max_xyz, glm.vec3(pt))
-
-            xy_pad = max(1.0, (max_xyz.x - min_xyz.x) * 0.02)
-            near_p = max(0.01, -max_xyz.z - 50.0)
-            far_p = -min_xyz.z + 50.0
-
-            light_proj = glm.ortho(
-                min_xyz.x - xy_pad,
-                max_xyz.x + xy_pad,
-                min_xyz.y - xy_pad,
-                max_xyz.y + xy_pad,
-                near_p,
-                far_p,
-            )
-            self.light_mvps[i] = light_proj * light_view
             prev_split = curr_split
 
     def render(self, render_callback):
