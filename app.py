@@ -5,6 +5,7 @@ from Modules.Camera.camera import Camera
 from Modules.Scenes.torus_scene import TorusScene
 
 def main():
+    print("Welcome!")
     window = WindowManager(800, 600, "Pygame-ce Engine - Scene Switcher")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
 
