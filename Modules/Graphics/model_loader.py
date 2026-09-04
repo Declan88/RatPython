@@ -1,593 +1,345 @@
-import trimesh
-import numpy as np
 from pathlib import Path
-from PIL import Image
 import moderngl
+import numpy as np
+from PIL import Image
+import trimesh
+import glm
 
 
 def _has_attribute(prog, name):
-    """
-    Safely determine whether a ModernGL program contains
-    a particular vertex attribute.
-    """
     try:
-        prog[name]
-        return True
-    except (KeyError, IndexError, AttributeError):
+        return prog[name] is not None
+    except Exception:
         return False
 
 
 def load_glb(filepath, ctx, prog):
     path = Path(filepath)
-
     if not path.exists():
-        print(
-            f"[Warning] Model file not found: "
-            f"{path.resolve()}. Skipping load."
-        )
+        print(f"[Warning] Model file not found: {path.resolve()}")
         return None
 
-    vbo = None
-    normal_vbo = None
-    color_vbo = None
-    uv_vbo = None
-    ibo = None
+    buffers = []
     vao = None
-    texture_obj = None
-    metallic_roughness_texture_obj = None
+    tex_obj = None
+    mr_tex_obj = None
 
     try:
-        # ---------------------------------------------------------
-        # Load mesh
-        # ---------------------------------------------------------
-
-        scene_or_mesh = trimesh.load(str(path))
-
-        if isinstance(scene_or_mesh, trimesh.Scene):
-            mesh = scene_or_mesh.dump(concatenate=True)
-        else:
-            mesh = scene_or_mesh
-
-        if mesh is None:
-            raise RuntimeError("Trimesh returned no mesh.")
-
-        if len(mesh.vertices) == 0:
-            raise RuntimeError("Mesh contains no vertices.")
-
-        if len(mesh.faces) == 0:
-            raise RuntimeError("Mesh contains no faces.")
-
-        vertices = np.asarray(
-            mesh.vertices,
-            dtype="f4"
+        scene = trimesh.load(str(path))
+        mesh = (
+            scene.dump(concatenate=True) if isinstance(scene, trimesh.Scene) else scene
         )
+        if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            raise RuntimeError("Invalid or empty mesh.")
 
-        faces = np.asarray(
-            mesh.faces,
-            dtype="i4"
-        )
+        vertices = np.asarray(mesh.vertices, dtype="f4")
+        faces = np.asarray(mesh.faces, dtype="i4")
 
-        # ---------------------------------------------------------
-        # Normals
-        # ---------------------------------------------------------
-
-        v0 = vertices[faces[:, 0]]
-        v1 = vertices[faces[:, 1]]
-        v2 = vertices[faces[:, 2]]
-
-        face_normals = np.cross(
-            v1 - v0,
-            v2 - v0
-        )
-
-        norm_lens = np.linalg.norm(
-            face_normals,
-            axis=1,
-            keepdims=True
-        )
-
-        norm_lens[norm_lens < 0.000001] = 1.0
-
-        face_normals /= norm_lens
+        # Normals computation
+        v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+        face_normals = np.cross(v1 - v0, v2 - v0)
+        norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)
+        face_normals /= np.where(norm_lens < 1e-6, 1.0, norm_lens)
 
         normals = np.zeros_like(vertices)
-
         for i in range(3):
-            np.add.at(
-                normals,
-                faces[:, i],
-                face_normals
-            )
+            np.add.at(normals, faces[:, i], face_normals)
 
-        # ---------------------------------------------------------
-        # Average normals across identical positions
-        # ---------------------------------------------------------
+        unique_pos, inverse_indices = np.unique(vertices, axis=0, return_inverse=True)
+        shared_normals = np.zeros_like(unique_pos)
+        np.add.at(shared_normals, inverse_indices, normals)
+        norm_lens = np.linalg.norm(shared_normals, axis=1, keepdims=True)
+        shared_normals /= np.where(norm_lens < 1e-6, 1.0, norm_lens)
+        normals = shared_normals[inverse_indices].astype("f4")
 
-        unique_pos, inverse_indices = np.unique(
-            vertices,
-            axis=0,
-            return_inverse=True
-        )
-
-        shared_normals = np.zeros_like(
-            unique_pos
-        )
-
-        np.add.at(
-            shared_normals,
-            inverse_indices,
-            normals
-        )
-
-        norm_lens = np.linalg.norm(
-            shared_normals,
-            axis=1,
-            keepdims=True
-        )
-
-        norm_lens[norm_lens < 0.000001] = 1.0
-
-        shared_normals /= norm_lens
-
-        normals = (
-            shared_normals[inverse_indices]
-            .astype("f4")
-        )
-
-        # ---------------------------------------------------------
         # UVs
-        # ---------------------------------------------------------
-
-        if (
-            hasattr(mesh.visual, "uv")
-            and mesh.visual.uv is not None
-        ):
-            uvs = np.asarray(
-                mesh.visual.uv,
-                dtype="f4"
-            )
-
-            if len(uvs) == len(vertices):
-                uvs = uvs.copy()
+        uvs = np.zeros((len(vertices), 2), dtype="f4")
+        if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
+            raw_uvs = np.asarray(mesh.visual.uv, dtype="f4")
+            if len(raw_uvs) == len(vertices):
+                uvs = raw_uvs.copy()
                 uvs[:, 1] = 1.0 - uvs[:, 1]
-            else:
-                uvs = np.zeros(
-                    (len(vertices), 2),
-                    dtype="f4"
-                )
-        else:
-            uvs = np.zeros(
-                (len(vertices), 2),
-                dtype="f4"
-            )
 
-        # ---------------------------------------------------------
         # Material defaults
-        # ---------------------------------------------------------
+        mat = getattr(mesh.visual, "material", None)
+        base_color = np.array([0.8, 0.8, 0.8], dtype="f4")
+        metallic, roughness = 0.1, 0.5
+        emissive = np.zeros(3, dtype="f4")
 
-        base_color = np.array(
-            [0.8, 0.8, 0.8],
-            dtype="f4"
-        )
+        if mat:
+            for attr in ["main_color", "baseColorFactor", "diffuse"]:
+                val = getattr(mat, attr, None)
+                if val is not None:
+                    col = np.asarray(val[:3], dtype="f4")
+                    base_color = col / (255.0 if np.max(col) > 1.0 else 1.0)
+                    break
 
-        metallic = 0.1
-        roughness = 0.5
+            mf = getattr(mat, "metallicFactor", None)
+            if mf is not None:
+                try:
+                    metallic = float(mf)
+                except (TypeError, ValueError):
+                    pass
 
-        emissive = np.array(
-            [0.0, 0.0, 0.0],
-            dtype="f4"
-        )
+            rf = getattr(mat, "roughnessFactor", None)
+            if rf is not None:
+                try:
+                    roughness = float(rf)
+                except (TypeError, ValueError):
+                    pass
 
-        # ---------------------------------------------------------
-        # Material
-        # ---------------------------------------------------------
+            em_val = getattr(mat, "emissiveFactor", None)
+            if em_val is not None:
+                em = np.asarray(em_val[:3], dtype="f4")
+                emissive = em / (255.0 if np.max(em) > 1.0 else 1.0)
 
-        if (
-            hasattr(mesh.visual, "material")
-            and mesh.visual.material is not None
-        ):
-            mat = mesh.visual.material
-
-            # -----------------------------------------------------
-            # Base color
-            # -----------------------------------------------------
-
-            main_color = getattr(
-                mat,
-                "main_color",
-                None
+            # Textures safely
+            img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
+            textures_dict = (
+                getattr(scene, "textures", {})
+                if isinstance(scene, trimesh.Scene)
+                else {}
             )
-
-            if main_color is not None:
-                color = np.asarray(
-                    main_color[:3],
-                    dtype="f4"
-                )
-
-                if np.max(color) > 1.0:
-                    color /= 255.0
-
-                base_color = color
-
-            else:
-                base_factor = getattr(
-                    mat,
-                    "baseColorFactor",
-                    None
-                )
-
-                if base_factor is not None:
-                    color = np.asarray(
-                        base_factor[:3],
-                        dtype="f4"
-                    )
-
-                    if np.max(color) > 1.0:
-                        color /= 255.0
-
-                    base_color = color
-
-                else:
-                    diffuse = getattr(
-                        mat,
-                        "diffuse",
-                        None
-                    )
-
-                    if diffuse is not None:
-                        color = np.asarray(
-                            diffuse[:3],
-                            dtype="f4"
-                        )
-
-                        if np.max(color) > 1.0:
-                            color /= 255.0
-
-                        base_color = color
-
-            # -----------------------------------------------------
-            # Metallic
-            # -----------------------------------------------------
-
-            metallic_factor = getattr(
-                mat,
-                "metallicFactor",
-                None
-            )
-
-            if metallic_factor is not None:
-                metallic = float(
-                    metallic_factor
-                )
-
-            # -----------------------------------------------------
-            # Roughness
-            # -----------------------------------------------------
-
-            roughness_factor = getattr(
-                mat,
-                "roughnessFactor",
-                None
-            )
-
-            if roughness_factor is not None:
-                roughness = float(
-                    roughness_factor
-                )
-
-            # -----------------------------------------------------
-            # Emissive
-            # -----------------------------------------------------
-
-            emissive_factor = getattr(
-                mat,
-                "emissiveFactor",
-                None
-            )
-
-            if emissive_factor is not None:
-                emissive = np.asarray(
-                    emissive_factor[:3],
-                    dtype="f4"
-                )
-
-                if np.max(emissive) > 1.0:
-                    emissive /= 255.0
-
-            # -----------------------------------------------------
-            # Base color texture
-            # -----------------------------------------------------
-
-            img = getattr(
-                mat,
-                "image",
-                None
-            )
-
-            if (
-                img is None
-                and hasattr(mat, "baseColorTexture")
-            ):
-                img = getattr(
-                    mat,
-                    "baseColorTexture",
-                    None
-                )
-
-            if (
-                img is None
-                and isinstance(
-                    scene_or_mesh,
-                    trimesh.Scene
-                )
-                and hasattr(
-                    scene_or_mesh,
-                    "textures"
-                )
-            ):
-                textures = scene_or_mesh.textures
-
-                if textures:
-                    img = list(
-                        textures.values()
-                    )[0]
+            if img is None and textures_dict:
+                img = list(textures_dict.values())[0]
 
             if img is not None:
-                if not isinstance(
-                    img,
-                    Image.Image
-                ):
-                    img = Image.fromarray(
-                        np.asarray(img)
-                    )
-
+                if not isinstance(img, Image.Image):
+                    img = Image.fromarray(np.asarray(img))
                 img = img.convert("RGB")
+                tex_obj = ctx.texture(img.size, 3, img.tobytes())
+                tex_obj.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                tex_obj.repeat_x = tex_obj.repeat_y = True
 
-                texture_obj = ctx.texture(
-                    img.size,
-                    3,
-                    img.tobytes()
-                )
-
-                texture_obj.filter = (
-                    moderngl.LINEAR,
-                    moderngl.LINEAR
-                )
-
-                texture_obj.repeat_x = True
-                texture_obj.repeat_y = True
-
-            # -----------------------------------------------------
-            # Metallic / roughness texture
-            # -----------------------------------------------------
-
-            mr_img = getattr(
-                mat,
-                "metallicRoughnessTexture",
-                None
-            )
-
+            mr_img = getattr(mat, "metallicRoughnessTexture", None)
             if mr_img is not None:
-                if not isinstance(
-                    mr_img,
-                    Image.Image
-                ):
-                    mr_img = Image.fromarray(
-                        np.asarray(mr_img)
-                    )
-
+                if not isinstance(mr_img, Image.Image):
+                    mr_img = Image.fromarray(np.asarray(mr_img))
                 mr_img = mr_img.convert("RGB")
+                mr_tex_obj = ctx.texture(mr_img.size, 3, mr_img.tobytes())
+                mr_tex_obj.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                mr_tex_obj.repeat_x = mr_tex_obj.repeat_y = True
 
-                metallic_roughness_texture_obj = (
-                    ctx.texture(
-                        mr_img.size,
-                        3,
-                        mr_img.tobytes()
-                    )
-                )
-
-                metallic_roughness_texture_obj.filter = (
-                    moderngl.LINEAR,
-                    moderngl.LINEAR
-                )
-
-                metallic_roughness_texture_obj.repeat_x = True
-                metallic_roughness_texture_obj.repeat_y = True
-
-        # ---------------------------------------------------------
         # Vertex colors
-        # ---------------------------------------------------------
-
-        colors = np.tile(
-            base_color,
-            (len(vertices), 1)
-        ).astype("f4")
-
+        colors = np.tile(base_color, (len(vertices), 1)).astype("f4")
         if (
             hasattr(mesh.visual, "vertex_colors")
             and mesh.visual.vertex_colors is not None
-            and len(mesh.visual.vertex_colors) == len(vertices)
         ):
-            v_cols = np.asarray(
-                mesh.visual.vertex_colors[:, :3],
-                dtype="f4"
-            )
-
-            v_cols /= 255.0
-
-            # Only use vertex colors when they actually contain
-            # useful variation.
-            if not np.allclose(
-                v_cols,
-                v_cols[0]
-            ):
+            v_cols = np.asarray(mesh.visual.vertex_colors[:, :3], dtype="f4") / 255.0
+            if len(v_cols) == len(vertices) and not np.allclose(v_cols, v_cols[0]):
                 colors = v_cols
 
-        # ---------------------------------------------------------
-        # Create individual buffers
-        #
-        # Using separate buffers is intentional.
-        # It means shadow shaders can use only in_position,
-        # while PBR shaders can use all four attributes.
-        # ---------------------------------------------------------
-
-        if _has_attribute(
-            prog,
-            "in_position"
-        ):
-            vbo = ctx.buffer(
-                vertices.tobytes()
-            )
-
-        if _has_attribute(
-            prog,
-            "in_normal"
-        ):
-            normal_vbo = ctx.buffer(
-                normals.tobytes()
-            )
-
-        if _has_attribute(
-            prog,
-            "in_color"
-        ):
-            color_vbo = ctx.buffer(
-                colors.tobytes()
-            )
-
-        if _has_attribute(
-            prog,
-            "in_uv"
-        ):
-            uv_vbo = ctx.buffer(
-                uvs.tobytes()
-            )
-
-        ibo = ctx.buffer(
-            faces.tobytes()
+        # Buffers & VAO
+        vbo = (
+            ctx.buffer(vertices.tobytes())
+            if _has_attribute(prog, "in_position")
+            else None
         )
+        normal_vbo = (
+            ctx.buffer(normals.tobytes()) if _has_attribute(prog, "in_normal") else None
+        )
+        color_vbo = (
+            ctx.buffer(colors.tobytes()) if _has_attribute(prog, "in_color") else None
+        )
+        uv_vbo = ctx.buffer(uvs.tobytes()) if _has_attribute(prog, "in_uv") else None
+        ibo = ctx.buffer(faces.tobytes())
 
-        # ---------------------------------------------------------
-        # Build VAO
-        # ---------------------------------------------------------
+        buffers = [b for b in [vbo, normal_vbo, color_vbo, uv_vbo, ibo] if b]
 
         vao_content = []
-
-        if vbo is not None:
-            vao_content.append(
-                (
-                    vbo,
-                    "3f",
-                    "in_position"
-                )
-            )
-
-        if normal_vbo is not None:
-            vao_content.append(
-                (
-                    normal_vbo,
-                    "3f",
-                    "in_normal"
-                )
-            )
-
-        if color_vbo is not None:
-            vao_content.append(
-                (
-                    color_vbo,
-                    "3f",
-                    "in_color"
-                )
-            )
-
-        if uv_vbo is not None:
-            vao_content.append(
-                (
-                    uv_vbo,
-                    "2f",
-                    "in_uv"
-                )
-            )
+        if vbo:
+            vao_content.append((vbo, "3f", "in_position"))
+        if normal_vbo:
+            vao_content.append((normal_vbo, "3f", "in_normal"))
+        if color_vbo:
+            vao_content.append((color_vbo, "3f", "in_color"))
+        if uv_vbo:
+            vao_content.append((uv_vbo, "2f", "in_uv"))
 
         if not vao_content:
-            raise RuntimeError(
-                "Shader contains no recognized "
-                "vertex attributes."
-            )
+            raise RuntimeError("No recognized vertex attributes.")
 
-        vao = ctx.vertex_array(
-            prog,
-            vao_content,
-            ibo
-        )
+        vao = ctx.vertex_array(prog, vao_content, ibo)
 
         return {
             "vao": vao,
-
             "vbo": vbo,
             "normal_vbo": normal_vbo,
             "color_vbo": color_vbo,
             "uv_vbo": uv_vbo,
             "ibo": ibo,
-
-            "texture": texture_obj,
-
-            "metallic_roughness_texture":
-                metallic_roughness_texture_obj,
-
+            "texture": tex_obj,
+            "metallic_roughness_texture": mr_tex_obj,
             "metallic": metallic,
             "roughness": roughness,
-
-            "emissive": [
-                float(emissive[0]),
-                float(emissive[1]),
-                float(emissive[2])
-            ],
-
-            "has_texture":
-                1 if texture_obj is not None else 0,
-
-            "has_metallic_roughness_texture":
-                1
-                if metallic_roughness_texture_obj is not None
-                else 0
+            "emissive": emissive.tolist(),
+            "has_texture": 1 if tex_obj else 0,
+            "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
         }
 
     except Exception as e:
-        print(
-            f"[Error] Failed to parse model "
-            f"{path}: {e}"
+        print(f"[Error] Failed to parse model {path}: {e}")
+        if vao:
+            vao.release()
+        for b in buffers:
+            b.release()
+        if tex_obj:
+            tex_obj.release()
+        if mr_tex_obj:
+            mr_tex_obj.release()
+        return None
+
+
+class CascadedShadowMap:
+    def __init__(self, ctx, resolution=2048, cascade_count=3):
+        self.ctx = ctx
+        self.resolution = resolution
+        self.cascade_count = cascade_count
+        self.num_cascades = cascade_count
+        self.near = 0.1
+        self.far = 100.0
+
+        self.depth_textures = [
+            ctx.depth_texture((resolution, resolution)) for _ in range(cascade_count)
+        ]
+        for tex in self.depth_textures:
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            tex.repeat_x = tex.repeat_y = False
+
+        self.fbos = [
+            ctx.framebuffer(depth_attachment=tex) for tex in self.depth_textures
+        ]
+        self.light_mvps = [glm.mat4(1.0) for _ in range(cascade_count)]
+        self.splits = [0.0 for _ in range(max(0, cascade_count - 1))]
+
+        self.program = ctx.program(
+            vertex_shader="""
+            #version 330
+            uniform mat4 u_light_mvp;
+            in vec3 in_position;
+            void main() {
+                gl_Position = u_light_mvp * vec4(in_position, 1.0);
+            }
+            """,
+            fragment_shader="""
+            #version 330
+            void main() {}
+            """,
         )
 
-        if vao is not None:
+    def _get_camera_basis(self, camera):
+        inv_view = glm.inverse(camera.get_view_matrix())
+        return (
+            glm.vec3(inv_view[3]),
+            glm.normalize(glm.vec3(inv_view[0])),
+            glm.normalize(glm.vec3(inv_view[1])),
+            glm.normalize(-glm.vec3(inv_view[2])),
+        )
+
+    def _get_frustum_corners(self, camera, near_d, far_d):
+        proj = camera.get_projection_matrix()
+        pos, right, up, forward = self._get_camera_basis(camera)
+        px, py = float(proj[0][0]), float(proj[1][1])
+        fov_y = 2.0 * np.arctan(1.0 / py) if abs(px) >= 1e-6 else np.radians(60.0)
+        aspect = (py / px) if abs(px) >= 1e-6 else 1.6
+
+        tan_half = np.tan(fov_y * 0.5)
+        nh, nw = near_d * tan_half, near_d * tan_half * aspect
+        fh, fw = far_d * tan_half, far_d * tan_half * aspect
+        nc, fc = pos + forward * near_d, pos + forward * far_d
+
+        return [
+            nc - right * nw - up * nh,
+            nc + right * nw - up * nh,
+            nc + right * nw + up * nh,
+            nc - right * nw + up * nh,
+            fc - right * fw - up * fh,
+            fc + right * fw - up * fh,
+            fc + right * fw + up * fh,
+            fc - right * fw + up * fh,
+        ]
+
+    def update(self, camera, light_dir):
+        self.near = max(float(getattr(camera, "near", 0.1)), 0.01)
+        self.far = max(float(getattr(camera, "far", 100.0)), self.near + 1.0)
+
+        lambda_val = 0.75
+        cascade_splits = []
+        for i in range(self.cascade_count):
+            p = (i + 1) / float(self.cascade_count)
+            log_s = self.near * (self.far / self.near) ** p
+            uni_s = self.near + (self.far - self.near) * p
+            cascade_splits.append(lambda_val * log_s + (1.0 - lambda_val) * uni_s)
+
+        self.splits = cascade_splits[:-1]
+
+        light = glm.normalize(
+            glm.vec3(light_dir)
+            if isinstance(light_dir, np.ndarray)
+            else glm.vec3(light_dir.x, light_dir.y, light_dir.z)
+        )
+        if glm.length(light) < 1e-6:
+            light = glm.vec3(0.5, 1.0, 0.8)
+
+        world_up = (
+            glm.vec3(0.0, 0.0, 1.0)
+            if abs(glm.dot(light, glm.vec3(0, 1, 0))) > 0.95
+            else glm.vec3(0, 1, 0)
+        )
+        prev_split = self.near
+
+        for i in range(self.cascade_count):
+            curr_split = cascade_splits[i]
+            corners = self._get_frustum_corners(camera, prev_split, curr_split)
+            center = sum(corners, glm.vec3(0.0)) / float(len(corners))
+
+            light_view = glm.lookAt(
+                center + light * max(curr_split * 2.0, 50.0), center, world_up
+            )
+            min_xyz = glm.vec3(float("inf"))
+            max_xyz = glm.vec3(float("-inf"))
+
+            for corner in corners:
+                pt = light_view * glm.vec4(corner, 1.0)
+                min_xyz = glm.min(min_xyz, glm.vec3(pt))
+                max_xyz = glm.max(max_xyz, glm.vec3(pt))
+
+            xy_pad = max(1.0, (max_xyz.x - min_xyz.x) * 0.02)
+            near_p = max(0.01, -max_xyz.z - 50.0)
+            far_p = -min_xyz.z + 50.0
+
+            light_proj = glm.ortho(
+                min_xyz.x - xy_pad,
+                max_xyz.x + xy_pad,
+                min_xyz.y - xy_pad,
+                max_xyz.y + xy_pad,
+                near_p,
+                far_p,
+            )
+            self.light_mvps[i] = light_proj * light_view
+            prev_split = curr_split
+
+    def render(self, render_callback):
+        for i in range(self.cascade_count):
+            fbo = self.fbos[i]
+            fbo.use()
+            fbo.clear(depth=1.0)
+            self.program["u_light_mvp"].write(self.light_mvps[i])
+            render_callback(self.program)
+
+    def destroy(self):
+        for fbo in self.fbos:
             try:
-                vao.release()
+                fbo.release()
             except Exception:
                 pass
-
-        for buffer in (
-            vbo,
-            normal_vbo,
-            color_vbo,
-            uv_vbo,
-            ibo
-        ):
-            if buffer is not None:
-                try:
-                    buffer.release()
-                except Exception:
-                    pass
-
-        if texture_obj is not None:
+        for tex in self.depth_textures:
             try:
-                texture_obj.release()
+                tex.release()
             except Exception:
                 pass
-
-        if metallic_roughness_texture_obj is not None:
-            try:
-                metallic_roughness_texture_obj.release()
-            except Exception:
-                pass
-
-        return None
+        try:
+            self.program.release()
+        except Exception:
+            pass
