@@ -5,9 +5,13 @@ import glm
 
 from Modules.Graphics.pbr_shader import (
     create_program,
-    bind_material
+    bind_material,
+    bind_point_lights,
+    MAX_SHADOW_POINT_LIGHTS
 )
 from Modules.Graphics.shadow_module import CascadedShadowMap
+from Modules.Graphics.point_shadow_module import PointShadowMap
+from Modules.Graphics.gltf_lights import extract_punctual_lights
 from Modules.Graphics.model_loader import load_glb
 
 
@@ -17,6 +21,9 @@ class Scene:
 
         self.static_objects = []
         self.dynamic_objects = []
+
+        self.point_lights = []
+        self.point_shadow_maps = []
 
         self.light_dir = glm.vec3(
             0.5,
@@ -201,6 +208,10 @@ class Scene:
             model
         )
 
+        # New static geometry invalidates any cached point-light
+        # shadow bakes, since they only cover static objects.
+        self.mark_static_dirty()
+
         return model
 
     # =============================================================
@@ -257,6 +268,112 @@ class Scene:
         )
 
         return model
+
+    # =============================================================
+    # POINT LIGHTS
+    # =============================================================
+
+    def add_point_light(
+        self,
+        position,
+        color=(1.0, 1.0, 1.0),
+        intensity=1.0,
+        radius=10.0,
+        cast_shadows=False
+    ):
+        light = {
+            "position": glm.vec3(position),
+            "color": glm.vec3(color),
+            "intensity": float(intensity),
+            "radius": float(radius),
+            "shadow_map": None
+        }
+
+        if cast_shadows:
+            if len(self.point_shadow_maps) < MAX_SHADOW_POINT_LIGHTS:
+                shadow_map = PointShadowMap(
+                    self.ctx,
+                    resolution=1024,
+                    near=0.05,
+                    far=max(radius * 2.0, 1.0)
+                )
+
+                shadow_map.set_position(
+                    light["position"]
+                )
+
+                self.point_shadow_maps.append(
+                    shadow_map
+                )
+
+                light["shadow_map"] = shadow_map
+            else:
+                print(
+                    f"[Scene] Max shadow-casting point lights "
+                    f"({MAX_SHADOW_POINT_LIGHTS}) reached; light at "
+                    f"{tuple(light['position'])} will be unshadowed."
+                )
+
+        self.point_lights.append(
+            light
+        )
+
+        return light
+
+    def add_lights_from_glb(
+        self,
+        model_path,
+        cast_shadows=False,
+        default_radius=8.0,
+        intensity_multiplier=1.0,
+        radius_multiplier=1.0
+    ):
+        """Reads KHR_lights_punctual lights out of a glb and adds any
+        point lights found as real point lights in the scene.
+
+        intensity_multiplier: scales the converted intensity (see the
+        unit-conversion note in gltf_lights.extract_punctual_lights) -
+        useful since the candela->linear conversion is only approximate
+        and glTF-authored lights often end up too dim/bright as-is.
+
+        radius_multiplier: scales the light's falloff radius (from the
+        glTF "range" field, or default_radius if range wasn't authored).
+        Useful because "range" is just a culling hint in the glTF spec,
+        not a value tuned for your shader's specific falloff curve.
+        """
+        added = []
+
+        for light in extract_punctual_lights(model_path):
+            if light["type"] != "point":
+                print(
+                    f"[Scene] Skipping '{light['type']}' light from "
+                    f"{model_path} - only 'point' lights are supported "
+                    f"(no spot cone / directional handling)."
+                )
+                continue
+
+            added.append(
+                self.add_point_light(
+                    position=light["position"],
+                    color=light["color"],
+                    intensity=(light["intensity"] or 1.0) * intensity_multiplier,
+                    radius=(light["range"] or default_radius) * radius_multiplier,
+                    cast_shadows=cast_shadows,
+                )
+            )
+
+        return added
+
+    def mark_static_dirty(self):
+        """No-op for now. Point-light shadows used to cache static
+        geometry and only re-draw dynamic objects per frame, which
+        this method invalidated - that caching was removed (see
+        PointShadowMap's docstring) because the depth-copy step it
+        relied on couldn't be verified to work correctly. Kept here so
+        existing call sites like add_static() don't break; safe to
+        remove if caching is reintroduced with a different mechanism
+        or dropped from the API entirely."""
+        pass
 
     # =============================================================
     # MODEL MATRIX
@@ -320,7 +437,7 @@ class Scene:
                     )
 
     # =============================================================
-    # SHADOW PASS
+    # DIRECTIONAL SHADOW PASS
     # =============================================================
 
     def _render_shadows(self, camera):
@@ -428,6 +545,101 @@ class Scene:
         self.ctx.cull_face = "back"
 
     # =============================================================
+    # POINT LIGHT SHADOW PASS
+    # =============================================================
+
+    def _render_point_shadows(self):
+        if not self.point_shadow_maps:
+            return
+
+        old_viewport = self.ctx.viewport
+
+        self.ctx.enable(
+            moderngl.DEPTH_TEST
+        )
+
+        self.ctx.depth_func = "<="
+
+        self.ctx.enable(
+            moderngl.CULL_FACE
+        )
+
+        self.ctx.cull_face = "front"
+
+        for shadow_map in self.point_shadow_maps:
+            resolution = shadow_map.resolution
+
+            for face in range(6):
+                framebuffer = shadow_map.live_fbos[face]
+
+                framebuffer.use()
+
+                self.ctx.viewport = (
+                    0,
+                    0,
+                    resolution,
+                    resolution
+                )
+
+                framebuffer.clear(
+                    depth=1.0
+                )
+
+                light_vp = shadow_map.light_mvps[face]
+
+                for obj in self.static_objects:
+                    model_matrix = (
+                        self._get_model_matrix(obj)
+                    )
+
+                    light_mvp = (
+                        light_vp *
+                        model_matrix
+                    )
+
+                    self.shadow_program[
+                        "u_light_mvp"
+                    ].write(
+                        light_mvp.to_bytes()
+                    )
+
+                    obj["shadow_vao"].render()
+
+                for obj in self.dynamic_objects:
+                    model_matrix = (
+                        self._get_model_matrix(obj)
+                    )
+
+                    light_mvp = (
+                        light_vp *
+                        model_matrix
+                    )
+
+                    self.shadow_program[
+                        "u_light_mvp"
+                    ].write(
+                        light_mvp.to_bytes()
+                    )
+
+                    obj["shadow_vao"].render()
+
+        self.ctx.screen.use()
+
+        self.ctx.viewport = old_viewport
+
+        self.ctx.enable(
+            moderngl.DEPTH_TEST
+        )
+
+        self.ctx.depth_func = "<"
+
+        self.ctx.enable(
+            moderngl.CULL_FACE
+        )
+
+        self.ctx.cull_face = "back"
+
+    # =============================================================
     # PBR PASS
     # =============================================================
 
@@ -445,6 +657,14 @@ class Scene:
         )
 
         self.ctx.cull_face = "back"
+
+        # Point-light data and shadow textures are identical for every
+        # object this frame, so bind them once here rather than inside
+        # the per-object loop below.
+        bind_point_lights(
+            self.pbr_program,
+            self.point_lights
+        )
 
         for obj in self.static_objects:
             model_matrix = (
@@ -487,6 +707,8 @@ class Scene:
             camera
         )
 
+        self._render_point_shadows()
+
         self._render_scene(
             camera
         )
@@ -501,6 +723,15 @@ class Scene:
 
         for obj in self.dynamic_objects:
             self._release_object(obj)
+
+        for shadow_map in self.point_shadow_maps:
+            try:
+                shadow_map.destroy()
+            except Exception:
+                pass
+
+        self.point_shadow_maps.clear()
+        self.point_lights.clear()
 
         if self.shadow_manager is not None:
             try:
