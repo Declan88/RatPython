@@ -3,7 +3,6 @@ import moderngl
 import numpy as np
 from PIL import Image
 import trimesh
-import glm
 
 DEFAULT_CREASE_ANGLE_DEG = 30.0
 
@@ -87,18 +86,48 @@ def _normalize_color(values):
     col = np.asarray(values[:3], dtype="f4")
     return col / (255.0 if np.max(col) > 1.0 else 1.0)
 
-def _as_pil_image(img):
+def _upload_texture(ctx, img):
     if img is None: return None
     if not isinstance(img, Image.Image): img = Image.fromarray(np.asarray(img))
-    return img.convert("RGB")
-
-def _upload_texture(ctx, img):
-    img = _as_pil_image(img)
-    if img is None: return None
+    img = img.convert("RGB")
     tex = ctx.texture(img.size, 3, img.tobytes())
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.repeat_x = tex.repeat_y = True
     return tex
+
+def _read_gltf_uv1(path):
+    """Reads the TEXCOORD_1 (lightmap UV) accessor from the first mesh
+    primitive in the glb - trimesh only exposes TEXCOORD_0, so this
+    goes straight to the raw glTF data via pygltflib instead.
+
+    Scoped to the common case: a single mesh, single primitive, with a
+    plain non-sparse VEC2 float accessor (what Blender's glTF exporter
+    produces for a second UV map). Multi-node/multi-primitive scenes
+    aren't handled - matching trimesh's flattened geometry order against
+    pygltflib's raw mesh/primitive order isn't a relationship that can
+    be trusted to line up, so this returns None rather than guessing.
+    Also requires the lightmap UV to actually be the *second* UV map in
+    Blender (TEXCOORD_1 is whichever UV map is second in the mesh's UV
+    map list at export time, not anything named-based).
+    """
+    try:
+        from pygltflib import GLTF2
+        gltf = GLTF2().load(str(path))
+        prims = [p for m in (gltf.meshes or []) for p in m.primitives]
+        if len(prims) != 1: return None
+
+        idx = getattr(prims[0].attributes, "TEXCOORD_1", None)
+        if idx is None: return None
+
+        acc = gltf.accessors[idx]
+        if acc.sparse or acc.componentType != 5126 or acc.type != "VEC2": return None
+
+        view = gltf.bufferViews[acc.bufferView]
+        offset = (view.byteOffset or 0) + (acc.byteOffset or 0)
+        blob = gltf.binary_blob()
+        return np.frombuffer(blob, dtype="<f4", count=acc.count * 2, offset=offset).reshape(-1, 2).copy()
+    except Exception:
+        return None
 
 def _read_raw_gltf_material_factors(path):
     try:
@@ -125,7 +154,7 @@ def _extract_material(mesh, scene, ctx, raw_factors=None):
     for k, target in [("metallicFactor", "metallic"), ("roughnessFactor", "roughness")]:
         val = getattr(mat, k, None) if getattr(mat, k, None) is not None else file_factors.get(k)
         if val is not None:
-            try: 
+            try:
                 if target == "metallic": metallic = float(val)
                 else: roughness = float(val)
             except (TypeError, ValueError): pass
@@ -200,10 +229,15 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
         vertices, faces = np.asarray(mesh.vertices, dtype="f4"), np.asarray(mesh.faces, dtype="i4")
         normals = _get_vertex_normals(mesh, vertices, faces, recompute_normals, crease_angle_deg)
         uvs = _compute_uvs(mesh, len(vertices))
+
+        lightmap_uvs = _read_gltf_uv1(path)
+        has_lightmap_uv = lightmap_uvs is not None and len(lightmap_uvs) == len(vertices)
+        if not has_lightmap_uv: lightmap_uvs = np.zeros((len(vertices), 2), dtype="f4")
+
         base_color, metallic, roughness, emissive, tex_obj, mr_tex_obj = _extract_material(mesh, scene, ctx, _read_raw_gltf_material_factors(path))
         colors = _extract_vertex_colors(mesh, base_color, len(vertices))
 
-        attr_data = {"in_position": (vertices, "3f"), "in_normal": (normals, "3f"), "in_color": (colors, "3f"), "in_uv": (uvs, "2f")}
+        attr_data = {"in_position": (vertices, "3f"), "in_normal": (normals, "3f"), "in_color": (colors, "3f"), "in_uv": (uvs, "2f"), "in_lightmap_uv": (lightmap_uvs, "2f")}
         vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items() if _has_attribute(prog, name)}
         ibo = ctx.buffer(faces.tobytes())
         buffers = list(vbos.values()) + [ibo]
@@ -214,7 +248,8 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
 
         return {
             "vao": vao, "vbo": vbos.get("in_position"), "normal_vbo": vbos.get("in_normal"),
-            "color_vbo": vbos.get("in_color"), "uv_vbo": vbos.get("in_uv"), "ibo": ibo,
+            "color_vbo": vbos.get("in_color"), "uv_vbo": vbos.get("in_uv"),
+            "lightmap_uv_vbo": vbos.get("in_lightmap_uv"), "has_lightmap_uv": has_lightmap_uv, "ibo": ibo,
             "texture": tex_obj, "metallic_roughness_texture": mr_tex_obj,
             "metallic": metallic, "roughness": roughness, "emissive": emissive.tolist(),
             "has_texture": 1 if tex_obj else 0, "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
@@ -224,92 +259,3 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
         for res in [vao, *buffers, tex_obj, mr_tex_obj]:
             if res: res.release()
         return None
-
-_SHADOW_VERTEX_SHADER = "#version 330\nuniform mat4 u_light_mvp;\nin vec3 in_position;\nvoid main() { gl_Position = u_light_mvp * vec4(in_position, 1.0); }"
-_SHADOW_FRAGMENT_SHADER = "#version 330\nvoid main() {}"
-
-class CascadedShadowMap:
-    def __init__(self, ctx, resolution=2048, cascade_count=3):
-        self.ctx, self.resolution, self.cascade_count, self.num_cascades = ctx, resolution, cascade_count, cascade_count
-        self.near, self.far = 0.1, 100.0
-        self.depth_textures = [ctx.depth_texture((resolution, resolution)) for _ in range(cascade_count)]
-        for tex in self.depth_textures:
-            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            tex.repeat_x = tex.repeat_y = False
-        self.fbos = [ctx.framebuffer(depth_attachment=tex) for tex in self.depth_textures]
-        self.light_mvps = [glm.mat4(1.0) for _ in range(cascade_count)]
-        self.splits = [0.0 for _ in range(max(0, cascade_count - 1))]
-        self.program = ctx.program(vertex_shader=_SHADOW_VERTEX_SHADER, fragment_shader=_SHADOW_FRAGMENT_SHADER)
-
-    def _get_camera_basis(self, camera):
-        inv = glm.inverse(camera.get_view_matrix())
-        return glm.vec3(inv[3]), glm.normalize(glm.vec3(inv[0])), glm.normalize(glm.vec3(inv[1])), glm.normalize(-glm.vec3(inv[2]))
-
-    def _get_frustum_corners(self, camera, near_d, far_d):
-        proj = camera.get_projection_matrix()
-        pos, right, up, forward = self._get_camera_basis(camera)
-        px, py = float(proj[0][0]), float(proj[1][1])
-        tan_half = np.tan(0.5 * (2.0 * np.arctan(1.0 / py) if abs(px) >= 1e-6 else np.radians(60.0)))
-        aspect = (py / px) if abs(px) >= 1e-6 else 1.6
-        corners = []
-        for dist in (near_d, far_d):
-            h, w, center = dist * tan_half, dist * tan_half * aspect, pos + forward * dist
-            corners += [center - right * w - up * h, center + right * w - up * h, center + right * w + up * h, center - right * w + up * h]
-        return corners
-
-    def _fit_light_frustum(self, corners, light, world_up, curr_split):
-        center = sum(corners, glm.vec3(0.0)) / float(len(corners))
-        # Eye offset and near/far padding used to be a flat 50.0 world
-        # units regardless of scene scale. On a small-scale scene (this
-        # project's rat-sized rooms), that fixed padding could dwarf the
-        # actual cascade content -- e.g. a cascade whose real depth span
-        # is only a few units getting stretched to 100+ units of near/far
-        # range once padded. That wastes most of the depth buffer's
-        # precision on empty space, and the shadow bias constants in the
-        # shader (tuned for a much tighter range) end up translating into
-        # a huge world-space offset -- which looks exactly like peter-
-        # panning (the shadow detaching from its caster). Padding
-        # proportional to the cascade's own bounding-box depth keeps the
-        # depth range sane regardless of world scale.
-        light_view_probe = glm.lookAt(center + light * max(curr_split * 2.0, 1.0), center, world_up)
-        probe_min, probe_max = glm.vec3(float("inf")), glm.vec3(float("-inf"))
-        for corner in corners:
-            pt = glm.vec3(light_view_probe * glm.vec4(corner, 1.0))
-            probe_min, probe_max = glm.min(probe_min, pt), glm.max(probe_max, pt)
-        depth_extent = max(probe_max.z - probe_min.z, 1.0)  # avoid a zero-size box
-        padding = max(0.5, depth_extent * 0.5)
-
-        light_view = glm.lookAt(center + light * max(curr_split * 2.0, padding), center, world_up)
-        min_xyz, max_xyz = glm.vec3(float("inf")), glm.vec3(float("-inf"))
-        for corner in corners:
-            pt = glm.vec3(light_view * glm.vec4(corner, 1.0))
-            min_xyz, max_xyz = glm.min(min_xyz, pt), glm.max(max_xyz, pt)
-        xy_pad = max(1.0, (max_xyz.x - min_xyz.x) * 0.02)
-        return glm.ortho(min_xyz.x - xy_pad, max_xyz.x + xy_pad, min_xyz.y - xy_pad, max_xyz.y + xy_pad, max(0.01, -max_xyz.z - padding), -min_xyz.z + padding) * light_view
-
-    def update(self, camera, light_dir):
-        self.near, self.far = max(float(getattr(camera, "near", 0.1)), 0.01), max(float(getattr(camera, "far", 100.0)), self.near + 1.0)
-        cascade_splits = [0.75 * (self.near * (self.far / self.near) ** ((i + 1) / float(self.cascade_count))) + 
-                          0.25 * (self.near + (self.far - self.near) * ((i + 1) / float(self.cascade_count))) 
-                          for i in range(self.cascade_count)]
-        self.splits = cascade_splits[:-1]
-        light = glm.normalize(glm.vec3(*light_dir) if isinstance(light_dir, np.ndarray) else glm.vec3(light_dir.x, light_dir.y, light_dir.z))
-        if glm.length(light) <= 1e-6: light = glm.vec3(0.5, 1.0, 0.8)
-        world_up = glm.vec3(0.0, 0.0, 1.0) if abs(glm.dot(light, glm.vec3(0, 1, 0))) > 0.95 else glm.vec3(0, 1, 0)
-
-        prev = self.near
-        for i, split in enumerate(cascade_splits):
-            self.light_mvps[i] = self._fit_light_frustum(self._get_frustum_corners(camera, prev, split), light, world_up, split)
-            prev = split
-
-    def render(self, render_callback):
-        for i, fbo in enumerate(self.fbos):
-            fbo.use()
-            fbo.clear(depth=1.0)
-            self.program["u_light_mvp"].write(self.light_mvps[i])
-            render_callback(self.program)
-
-    def destroy(self):
-        for res in self.fbos + self.depth_textures + [self.program]:
-            try: res.release()
-            except Exception: pass
