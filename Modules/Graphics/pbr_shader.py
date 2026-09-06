@@ -131,7 +131,7 @@ float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light
     if (any(lessThan(shadow_coord, vec3(0.0))) || any(greaterThan(shadow_coord, vec3(1.0)))) return 0.0;
 
     float bias_scale[NUM_CASCADES] = float[NUM_CASCADES](1.0, 1.5, 2.0);
-    float bias = max(0.0005, 0.003 * (1.0 - clamp(dot(normal, light_dir), 0.0, 1.0)));
+    float bias = -0.0002;
     bias *= bias_scale[cascade];
 
     float shadow = 0.0;
@@ -210,7 +210,7 @@ def _bind_material_textures(prog, item_data):
         tex = item_data.get(key)
         uniform_name = f"u_{key}"
         if tex and uniform_name in prog:
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
             tex.use(location=unit)
             prog[uniform_name].value = unit
 

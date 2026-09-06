@@ -16,7 +16,7 @@ class CascadedShadowMap:
             ctx.depth_texture((resolution, resolution)) for _ in range(cascade_count)
         ]
         for tex in self.depth_textures:
-            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             tex.repeat_x = tex.repeat_y = False
 
         self.framebuffers = [

@@ -10,7 +10,7 @@ class Camera:
         self.up = glm.vec3(0.0, 1.0, 0.0)
         self.fov = fov
         self.aspect = aspect
-        self.speed = 2.5
+        self.speed = 7
         self.sensitivity = 0.1
 
     def get_view_matrix(self):

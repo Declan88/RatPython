@@ -14,10 +14,6 @@ class TorusScene(Scene):
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
         )
 
-        self.add_static(
-            "Assets/Models/cube.glb",
-            transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, 0, 0.0)),
-        )
 
         self.add_dynamic(
             "Assets/Models/torus.glb", position=glm.vec3(0.0, 3.0, 0.0), rot_speed=1
