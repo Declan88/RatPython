@@ -1,5 +1,20 @@
 """
-Simplified Cook-Torrance PBR shader + cascaded-shadow-aware material binding.
+Blinn-Phong (Source-engine-style) shading + cascaded-shadow-aware
+material binding.
+
+This used to be a Cook-Torrance PBR shader (GGX normal distribution +
+geometry attenuation + Fresnel-Schlick microfacet BRDF). Switched to
+Blinn-Phong to match how Source's actual material shading works - its
+$phong/$phongexponent/$phongboost VMT parameters are Blinn-Phong, not a
+physically-based microfacet model. The practical difference: Blinn-Phong
+is just pow(dot(N, H), shininess) - a simpler, more artist-tunable
+highlight shape, without GGX's distribution curve, without a geometry/
+shadowing attenuation term, and without a Fresnel edge-brightening
+curve. This is a purely stylistic swap in the GLSL math below - none of
+the Python-side binding code changed, since u_metallic/u_roughness are
+still uploaded exactly the same way; the shader just derives a Phong
+shininess exponent and a specular tint from them now instead of feeding
+a GGX/Fresnel pipeline.
 
 Point lights are always unshadowed in real time. Shadow-tested point
 light contributions against static geometry are baked once via
@@ -130,53 +145,47 @@ in vec2 v_lightmap_uv;
 out vec4 fragColor;
 const float PI = 3.14159265359;
 
-float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a2 = max(pow(roughness, 4.0), 0.00001);
-    float NdotH = max(dot(N, H), 0.0);
-    float denom = (NdotH * NdotH * (a2 - 1.0) + 1.0);
-    return a2 / max(PI * denom * denom, 0.0001);
-}
-
-float geometrySchlickGGX(float NdotV, float roughness) {
-    float k = pow(roughness + 1.0, 2.0) / 8.0;
-    return NdotV / (NdotV * (1.0 - k) + k);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
-           geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
-}
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
 int get_cascade_index(float view_depth) {
     if (view_depth < u_cascade_splits[0]) return 0;
     if (view_depth < u_cascade_splits[1]) return 1;
     return 2;
 }
 
+// Normal-offset bias, not a flat depth-comparison fudge factor: nudges
+// the tested point a real world-space distance off the surface along
+// its own normal before doing the shadow lookup, rather than tweaking
+// the comparison threshold in NDC space. This matters especially once
+// face culling is disabled for this pass (e.g. to fix peter-panning or
+// thin-geometry light bleed) - without culling, a fragment on one side
+// of a mesh can find its own near-coincident backface depth in the
+// shadow map, and a flat bias has no real separation to work with,
+// producing self-shadowing acne. A world-space offset scales correctly
+// regardless of depth or angle, which is also how Unreal and other
+// engines support two-sided/uncleared shadow passes without acne - it's
+// not that they skip bias, it's that they use a more robust kind of it.
+// offset_scale grows per cascade since farther cascades cover more
+// world space per shadow-map texel and need a proportionally bigger
+// offset to stay ahead of that coarser resolution.
 float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light_dir) {
     if (u_has_shadows == 0 || view_depth <= 0.0) return 0.0;
 
     int cascade = get_cascade_index(view_depth);
-    vec4 light_space = u_light_mvps[cascade] * vec4(world_pos, 1.0);
+
+    float offset_scale[NUM_CASCADES] = float[NUM_CASCADES](0.02, 0.05, 0.1);
+    vec3 offset_pos = world_pos + normal * offset_scale[cascade];
+
+    vec4 light_space = u_light_mvps[cascade] * vec4(offset_pos, 1.0);
     if (light_space.w <= 0.00001) return 0.0;
 
     vec3 shadow_coord = (light_space.xyz / light_space.w) * 0.5 + 0.5;
     if (any(lessThan(shadow_coord, vec3(0.0))) || any(greaterThan(shadow_coord, vec3(1.0)))) return 0.0;
-
-    float bias_scale[NUM_CASCADES] = float[NUM_CASCADES](1.0, 1.5, 2.0);
-    float bias = -.0005;
-    bias *= bias_scale[cascade];
 
     float shadow = 0.0;
     vec2 texel_size = vec2(1.0 / SHADOW_MAP_RESOLUTION);
     for (int x = -1; x <= 1; x++) {
         for (int y = -1; y <= 1; y++) {
             vec2 uv = clamp(shadow_coord.xy + vec2(x, y) * texel_size, vec2(0.001), vec2(0.999));
-            if (shadow_coord.z - bias > texture(u_shadow_maps[cascade], uv).r) {
+            if (shadow_coord.z > texture(u_shadow_maps[cascade], uv).r) {
                 shadow += 1.0;
             }
         }
@@ -186,7 +195,11 @@ float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light
 
 // Point lights are always unshadowed in real time - see the module
 // docstring for why (shadowed contributions are baked instead).
-vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float rough, float metal, vec3 F0, vec3 world_pos) {
+// Blinn-Phong: diffuse is plain Lambertian (albedo * NdotL, no PI
+// normalization - Source's model isn't energy-conserving, it's an
+// artist-tuned look), specular is pow(NdotH, shininess) tinted by
+// specular_color, gated by NdotL so it doesn't light backfacing spots.
+vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float shininess, vec3 specular_color, vec3 world_pos) {
     vec3 light_vec = u_point_light_pos[i] - world_pos;
     float dist = length(light_vec);
     vec3 L = light_vec / max(dist, 0.0001);
@@ -196,15 +209,13 @@ vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float rough, floa
     float falloff = clamp(1.0 - pow(dist / radius, 4.0), 0.0, 1.0);
     float atten = (falloff * falloff) / (dist * dist + 1.0);
 
-    float NDF = distributionGGX(N, H, rough);
-    float G = geometrySmith(N, V, L, rough);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-
-    vec3 specular = (NDF * G * F) / (4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001);
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
     float NdotL = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), shininess);
 
-    return (kD * albedo / PI + specular) * u_point_light_color[i] * NdotL * atten;
+    vec3 diffuse = albedo * NdotL;
+    vec3 specular = specular_color * spec * NdotL;
+
+    return (diffuse + specular) * u_point_light_color[i] * atten;
 }
 
 void main() {
@@ -225,35 +236,34 @@ void main() {
     }
     rough = clamp(rough, 0.04, 1.0);
 
-    vec3 F0 = mix(vec3(0.04), albedo, metal);
-    float NDF = distributionGGX(N, H, rough);
-    float G = geometrySmith(N, V, L, rough);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    // Repurposing the same metallic/roughness inputs the old PBR path
+    // used, but to drive a Phong shininess exponent and specular tint
+    // instead of a GGX/Fresnel pipeline - roughly analogous to Source's
+    // $phongexponent (tighter highlight = shinier/less rough) and a
+    // metal-tinted specular color, without claiming physical accuracy.
+    float shininess = mix(128.0, 4.0, rough);
+    vec3 specular_color = mix(vec3(0.04), albedo, metal);
 
-    vec3 specular = (NDF * G * F) / (4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001);
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metal);
     float NdotL = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), shininess);
 
     float view_depth = -(u_view_matrix * vec4(v_position, 1.0)).z;
     float shadow_attenuation = 1.0 - calculate_shadow(v_position, view_depth, N, L);
 
-    vec3 direct_light = (kD * albedo / PI + specular) * vec3(2.0) * NdotL * shadow_attenuation;
+    vec3 diffuse = albedo * NdotL;
+    vec3 specular = specular_color * spec * NdotL;
+    vec3 direct_light = (diffuse + specular) * vec3(2.0) * shadow_attenuation;
 
     vec3 point_light_sum = vec3(0.0);
     if (u_has_lightmap == 1) {
         // Lightmaps store pure incoming light (irradiance), same as
         // Source's model - they get MULTIPLIED by the surface's own
-        // albedo, not added raw. Adding the raw sampled value here was
-        // the actual bug: it painted the light's own color directly
-        // onto the pixel with zero regard for what the material
-        // actually looks like, which is exactly what produces a flat,
-        // saturated patch of color with no texture/material detail
-        // showing through it.
+        // albedo, not added raw.
         point_light_sum = texture(u_lightmap, v_lightmap_uv).rgb * albedo;
     } else {
         int num_points = min(u_num_point_lights, MAX_POINT_LIGHTS);
         for (int i = 0; i < num_points; i++) {
-            point_light_sum += calculate_point_light(i, N, V, albedo, rough, metal, F0, v_position);
+            point_light_sum += calculate_point_light(i, N, V, albedo, shininess, specular_color, v_position);
         }
     }
 

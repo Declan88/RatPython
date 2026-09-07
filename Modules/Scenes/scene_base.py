@@ -640,7 +640,7 @@ class Scene:
 
         self.ctx.depth_func = "<="
 
-        self.ctx.enable(
+        self.ctx.disable(
             moderngl.CULL_FACE
         )
 
