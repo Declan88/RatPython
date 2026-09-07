@@ -91,7 +91,14 @@ def _upload_texture(ctx, img):
     if not isinstance(img, Image.Image): img = Image.fromarray(np.asarray(img))
     img = img.convert("RGB")
     tex = ctx.texture(img.size, 3, img.tobytes())
-    tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    tex.build_mipmaps()
+    # This filter setting is immediately overwritten every frame by
+    # pbr_shader.py's _bind_material_textures (which sets .filter on
+    # every bind call) - it's set here too only so this file doesn't
+    # visually contradict what's actually in effect at runtime. If you
+    # change the filtering mode, change it in _bind_material_textures;
+    # this line won't do anything on its own.
+    tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
     tex.repeat_x = tex.repeat_y = True
     return tex
 
@@ -112,6 +119,15 @@ def _read_gltf_uv1(path):
     """
     try:
         from pygltflib import GLTF2
+    except ImportError:
+        print(
+            "[model_loader] pygltflib is not installed - lightmap UVs "
+            "can never be detected regardless of what's in the glb. "
+            "Run: pip install pygltflib"
+        )
+        return None
+
+    try:
         gltf = GLTF2().load(str(path))
         prims = [p for m in (gltf.meshes or []) for p in m.primitives]
         if len(prims) != 1: return None
@@ -126,7 +142,8 @@ def _read_gltf_uv1(path):
         offset = (view.byteOffset or 0) + (acc.byteOffset or 0)
         blob = gltf.binary_blob()
         return np.frombuffer(blob, dtype="<f4", count=acc.count * 2, offset=offset).reshape(-1, 2).copy()
-    except Exception:
+    except Exception as e:
+        print(f"[model_loader] Failed to read lightmap UV from {path}: {e}")
         return None
 
 def _read_raw_gltf_material_factors(path):

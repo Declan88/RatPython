@@ -301,7 +301,7 @@ def _bind_material_textures(prog, item_data):
         tex = item_data.get(key)
         uniform_name = f"u_{key}"
         if tex and uniform_name in prog:
-            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
             tex.use(location=unit)
             prog[uniform_name].value = unit
 

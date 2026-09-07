@@ -36,7 +36,8 @@ class TorusScene(Scene):
 
         self.add_lights_from_glb("Assets/Models/Testmap/plane.glb", cast_shadows=True, radius_multiplier=3, intensity_multiplier=.8)
 
-        
+        self.add_lights_from_glb("Assets/Models/Testmap/plane2.glb", cast_shadows=True, radius_multiplier=3, intensity_multiplier=.8)
+
 
 
         self.bake_static_lighting(lightmap_resolution=4096, point_shadow_resolution=4096)
