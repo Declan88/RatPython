@@ -66,6 +66,7 @@ uniform float u_point_radius;
 uniform int u_has_shadow;
 uniform sampler2D u_point_shadow_faces[6];
 uniform mat4 u_point_light_mvps[6];
+uniform float u_point_shadow_texel;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -90,6 +91,15 @@ int get_cube_face(vec3 dir) {
 // the acne/bleed in the first place. 0.02 is tuned for a small-scale
 // scene; widen it if thin walls still leak, narrow it if thick geometry
 // shows detachment (shadows floating slightly off their casters).
+//
+// 3x3 PCF (percentage-closer filtering): a single hard binary shadow
+// test forces every edge into a jagged staircase along shadow-map texel
+// boundaries. Averaging 9 neighboring samples turns that hard cutoff
+// into a smooth gradient instead - same technique pbr_shader.py's
+// directional calculate_shadow already uses. u_point_shadow_texel is
+// passed in from Python (1.0 / actual shadow map resolution) rather
+// than hardcoded, so raising the shadow map's resolution can't silently
+// leave the PCF step size mismatched with it.
 float calc_point_shadow(vec3 world_pos, vec3 normal) {
     vec3 offset_pos = world_pos + normal * 0.02;
     int face = get_cube_face(offset_pos - u_point_pos);
@@ -97,7 +107,18 @@ float calc_point_shadow(vec3 world_pos, vec3 normal) {
     if (ls.w <= 0.00001) return 0.0;
     vec3 c = (ls.xyz / ls.w) * 0.5 + 0.5;
     if (any(lessThan(c, vec3(0.0))) || any(greaterThan(c, vec3(1.0)))) return 0.0;
-    return (c.z > texture(u_point_shadow_faces[face], c.xy).r) ? 1.0 : 0.0;
+
+    float shadow = 0.0;
+    vec2 texel_size = vec2(u_point_shadow_texel);
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            vec2 uv = clamp(c.xy + vec2(x, y) * texel_size, vec2(0.001), vec2(0.999));
+            if (c.z > texture(u_point_shadow_faces[face], uv).r) {
+                shadow += 1.0;
+            }
+        }
+    }
+    return shadow / 9.0;
 }
 
 void main() {
@@ -178,6 +199,7 @@ def bake_point_light(ctx, bake_program, obj, model_matrix, light, shadow_map=Non
 
     if shadow_map is not None:
         bake_program["u_has_shadow"].value = 1
+        bake_program["u_point_shadow_texel"].value = 1.0 / shadow_map.resolution
         for face in range(6):
             shadow_map.live_textures[face].use(location=face)
         # Whole-array assignment, not per-index bracket names - see

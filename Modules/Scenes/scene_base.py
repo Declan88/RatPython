@@ -20,6 +20,7 @@ from Modules.Graphics.lightmap_baker import (
     bake_point_light
 )
 from Modules.Graphics.model_loader import load_glb
+from Modules.Graphics import lightmap_cache_io
 
 
 class Scene:
@@ -394,7 +395,7 @@ class Scene:
     # LIGHTMAP BAKING
     # =============================================================
 
-    def bake_static_lighting(self, lightmap_resolution=256):
+    def bake_static_lighting(self, lightmap_resolution=256, point_shadow_resolution=1024):
         """Call this once, after adding all static objects and point
         lights, to bake shadow-tested point light contributions (from
         lights added with cast_shadows=True) into each static object's
@@ -436,27 +437,51 @@ class Scene:
             return
 
         self.lightmap_dir.mkdir(parents=True, exist_ok=True)
-        cache_paths = [self.lightmap_dir / f"lightmap_{i}.npy" for i in range(len(eligible))]
+        cache_paths = [lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, i) for i in range(len(eligible))]
 
-        if not self.recalculate_shadows and all(p.exists() for p in cache_paths):
-            for obj, path in zip(eligible, cache_paths):
-                if obj.get("lightmap_texture") is not None:
-                    obj["lightmap_texture"].release()
-
-                # .astype/.tobytes() rather than relying on the loaded
-                # array's dtype directly - guards against a cache file
-                # ever ending up float32 (e.g. from a different numpy
-                # version) not matching the f2 (half-float) texture
-                # format below.
-                array = np.load(path).astype(np.float16)
-                texture = self.ctx.texture((array.shape[1], array.shape[0]), 4, array.tobytes(), dtype="f2")
-                texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                obj["lightmap_texture"] = texture
-
-            return
+        def _load_cache():
+            """Returns the loaded arrays if every cache file exists AND
+            matches the resolutions currently being requested, else None.
+            This check is what stops the cache from silently reusing
+            stale data when lightmap_resolution or point_shadow_resolution
+            change between runs."""
+            loaded = []
+            for path in cache_paths:
+                array = lightmap_cache_io.load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution)
+                if array is None:
+                    return None
+                loaded.append(array)
+            return loaded
 
         if not self.recalculate_shadows:
-            print(f"[Scene] recalculate_shadows is False but cached lightmaps are missing/incomplete in {self.lightmap_dir} - baking instead.")
+            cached_arrays = _load_cache()
+            if cached_arrays is not None:
+                for obj, array in zip(eligible, cached_arrays):
+                    if obj.get("lightmap_texture") is not None:
+                        obj["lightmap_texture"].release()
+
+                    # .astype/.tobytes() rather than relying on the loaded
+                    # array's dtype directly - guards against a cache file
+                    # ever ending up float32 (e.g. from a different numpy
+                    # version) not matching the f2 (half-float) texture
+                    # format below.
+                    #
+                    # 3 components (RGB), not 4: the RGBA requirement only
+                    # applied during baking, because GL_RGB16F isn't a
+                    # guaranteed-renderable framebuffer format. This
+                    # texture is only ever sampled at runtime, never
+                    # rendered into again, so that constraint doesn't
+                    # apply here - no reason to carry a wasted alpha
+                    # channel through disk storage and back.
+                    array = array.astype(np.float16)
+                    texture = self.ctx.texture((array.shape[1], array.shape[0]), 3, array.tobytes(), dtype="f2")
+                    texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    obj["lightmap_texture"] = texture
+
+                return
+
+        if not self.recalculate_shadows:
+            print(f"[Scene] recalculate_shadows is False but no valid cached lightmaps found in {self.lightmap_dir} - baking instead.")
 
         print(f"[Scene] Baking lighting for {len(eligible)} static object(s)...")
 
@@ -478,7 +503,7 @@ class Scene:
                 continue
 
             temp_shadow = PointShadowMap(
-                self.ctx, resolution=1024, near=0.05, far=max(light["radius"] * 2.0, 1.0)
+                self.ctx, resolution=point_shadow_resolution, near=0.05, far=max(light["radius"] * 2.0, 1.0)
             )
             temp_shadow.set_position(light["position"])
 
@@ -521,7 +546,9 @@ class Scene:
             texture = obj["lightmap_texture"]
             width, height = texture.size
             array = np.frombuffer(texture.read(), dtype=np.float16).reshape(height, width, 4)
-            np.save(path, array)
+            # Drop the alpha channel before persisting - it's unused dead
+            # weight here (see the load path above for why).
+            lightmap_cache_io.save_lightmap_cache(path, array[:, :, :3], lightmap_resolution, point_shadow_resolution)
 
         print(f"[Scene] Baked and saved {len(eligible)} lightmap(s) to {self.lightmap_dir}")
 
