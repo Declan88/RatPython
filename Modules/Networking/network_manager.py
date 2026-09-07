@@ -1,35 +1,16 @@
 import json
-import os
-import sys
-import ctypes
 import time
 
-# --- FORCE LOAD STEAM API DLL GLOBALLY FIRST ---
-def load_steam_api_dll():
-    possible_paths = [
-        os.path.join(os.path.dirname(__file__), "..", "steam_api64.dll"),
-        os.path.join(os.path.dirname(__file__), "steam_api64.dll"),
-        r"E:\Python\RatWar\steam_api64.dll"
-    ]
-
-    loaded = False
-    for path in possible_paths:
-        abs_path = os.path.abspath(path)
-        if os.path.exists(abs_path):
-            try:
-                ctypes.CDLL(abs_path, mode=ctypes.RTLD_GLOBAL)
-                print(f"Successfully pre-loaded steam_api64.dll from: {abs_path}")
-                loaded = True
-                break
-            except Exception as e:
-                print(f"Failed loading {abs_path}: {e}")
-
-    if not loaded:
-        print("CRITICAL ERROR: Could not find or load steam_api64.dll!")
-        sys.exit(1)
-
-load_steam_api_dll()
-# -----------------------------------------------
+# steam_api64.dll is already pre-loaded globally (ctypes.RTLD_GLOBAL) by
+# app.py, BEFORE this module is ever imported - app.py computes that
+# path relative to itself (the project root), so it's portable across
+# machines. This file used to duplicate that loading logic with its own
+# hardcoded path search, including a hardcoded absolute path specific to
+# one developer's machine (E:\Python\RatWar\steam_api64.dll) that
+# doesn't exist anywhere else - on any other machine, all its candidate
+# paths failed and it called sys.exit(1), crashing the whole app despite
+# app.py having already loaded the DLL correctly moments earlier. Removed
+# entirely rather than fixed, since it was never needed in the first place.
 
 import py_steam_net
 from .remote_player import RemotePlayer
