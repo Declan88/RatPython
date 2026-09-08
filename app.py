@@ -52,14 +52,12 @@ from Modules.Networking.network_manager import NetworkManager
 
 
 def main():
-    print("Welcome!")
+    print("Yo wsg")
     window = WindowManager(800, 600, "Pygame-ce Engine - Scene Switcher")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
 
     # Load initial scenes dictionary
-    scenes = {
-        "torus": TorusScene(window.ctx)
-    }
+    scenes = {"torus": TorusScene(window.ctx)}
     current_scene_key = "torus"
     current_scene = scenes[current_scene_key]
 
@@ -88,6 +86,7 @@ def main():
 
     window.quit()
     sys.exit()
+
 
 if __name__ == "__main__":
     main()
