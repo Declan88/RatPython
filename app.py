@@ -77,6 +77,7 @@ def main():
 
         # Call update to drive scene animations (like the rotating torus)
         current_scene.update(dt)
+        current_scene.update_audio(camera)
 
         net_mgr.update()
 

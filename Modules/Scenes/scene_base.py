@@ -6,18 +6,15 @@ import moderngl
 import glm
 import numpy as np
 
-from Modules.Graphics.pbr_shader import (
-    create_program,
-    bind_material,
-    bind_point_lights
-)
+from Modules.Audio.sound_manager import SoundManager
+from Modules.Graphics.pbr_shader import create_program, bind_material, bind_point_lights
 from Modules.Graphics.shadow_module import CascadedShadowMap
 from Modules.Graphics.point_shadow_module import PointShadowMap
 from Modules.Graphics.gltf_lights import extract_punctual_lights
 from Modules.Graphics.lightmap_baker import (
     create_bake_program,
     create_lightmap,
-    bake_point_light
+    bake_point_light,
 )
 from Modules.Graphics.model_loader import load_glb
 from Modules.Graphics import lightmap_cache_io
@@ -41,12 +38,9 @@ class Scene:
         self.dynamic_objects = []
 
         self.point_lights = []
+        self.sound_manager = SoundManager()
 
-        self.light_dir = glm.vec3(
-            0.5,
-            1.0,
-            0.8
-        )
+        self.light_dir = glm.vec3(0.5, 1.0, 0.8)
 
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = "<"
@@ -77,44 +71,32 @@ class Scene:
                 void main()
                 {
                 }
-            """
+            """,
         )
 
-        self.shadow_manager = CascadedShadowMap(
-            self.ctx
-        )
+        self.shadow_manager = CascadedShadowMap(self.ctx)
 
-        self.bake_program = create_bake_program(
-            self.ctx
-        )
+        self.bake_program = create_bake_program(self.ctx)
 
     # =============================================================
     # OBJECT LOADING
     # =============================================================
 
     def _load_object(self, model_path):
-        model = load_glb(
-            model_path,
-            self.ctx,
-            self.pbr_program
-        )
+        model = load_glb(model_path, self.ctx, self.pbr_program)
 
         if model is None:
             return None
 
-        shadow_model = load_glb(
-            model_path,
-            self.ctx,
-            self.shadow_program
-        )
+        shadow_model = load_glb(model_path, self.ctx, self.shadow_program)
 
         # Only bother with a bake-program VAO if the glb actually has a
         # second UV channel to bake into - otherwise this is wasted work.
-        lightmap_model = load_glb(
-            model_path,
-            self.ctx,
-            self.bake_program
-        ) if model.get("has_lightmap_uv") else None
+        lightmap_model = (
+            load_glb(model_path, self.ctx, self.bake_program)
+            if model.get("has_lightmap_uv")
+            else None
+        )
 
         if shadow_model is None:
             try:
@@ -136,9 +118,7 @@ class Scene:
                 except Exception:
                     pass
 
-            mr_texture = model.get(
-                "metallic_roughness_texture"
-            )
+            mr_texture = model.get("metallic_roughness_texture")
 
             if mr_texture is not None:
                 try:
@@ -154,39 +134,15 @@ class Scene:
             "lightmap_vao": lightmap_model["vao"] if lightmap_model else None,
             "has_lightmap_uv": model.get("has_lightmap_uv", False),
             "lightmap_texture": None,
-
             "texture": model.get("texture"),
-
-            "metallic_roughness_texture":
-                model.get(
-                    "metallic_roughness_texture"
-                ),
-
-            "metallic": model.get(
-                "metallic",
-                0.1
+            "metallic_roughness_texture": model.get("metallic_roughness_texture"),
+            "metallic": model.get("metallic", 0.1),
+            "roughness": model.get("roughness", 0.5),
+            "emissive": model.get("emissive", [0.0, 0.0, 0.0]),
+            "has_texture": model.get("has_texture", 0),
+            "has_metallic_roughness_texture": model.get(
+                "has_metallic_roughness_texture", 0
             ),
-
-            "roughness": model.get(
-                "roughness",
-                0.5
-            ),
-
-            "emissive": model.get(
-                "emissive",
-                [0.0, 0.0, 0.0]
-            ),
-
-            "has_texture": model.get(
-                "has_texture",
-                0
-            ),
-
-            "has_metallic_roughness_texture":
-                model.get(
-                    "has_metallic_roughness_texture",
-                    0
-                )
         }
 
     # =============================================================
@@ -201,11 +157,9 @@ class Scene:
         scale=None,
         transform=None,
         metallic=None,
-        roughness=None
+        roughness=None,
     ):
-        model = self._load_object(
-            model_path
-        )
+        model = self._load_object(model_path)
 
         if model is None:
             return None
@@ -217,9 +171,7 @@ class Scene:
             model["roughness"] = roughness
 
         if transform is not None:
-            model["transform"] = glm.mat4(
-                transform
-            )
+            model["transform"] = glm.mat4(transform)
         else:
             if position is None:
                 position = glm.vec3(0.0)
@@ -230,21 +182,13 @@ class Scene:
             if scale is None:
                 scale = glm.vec3(1.0)
 
-            model["position"] = glm.vec3(
-                position
-            )
+            model["position"] = glm.vec3(position)
 
-            model["rotation"] = glm.vec3(
-                rotation
-            )
+            model["rotation"] = glm.vec3(rotation)
 
-            model["scale"] = glm.vec3(
-                scale
-            )
+            model["scale"] = glm.vec3(scale)
 
-        self.static_objects.append(
-            model
-        )
+        self.static_objects.append(model)
 
         # New static geometry invalidates any cached point-light
         # shadow bakes, since they only cover static objects.
@@ -265,11 +209,9 @@ class Scene:
         rot_speed=0.0,
         transform=None,
         metallic=None,
-        roughness=None
+        roughness=None,
     ):
-        model = self._load_object(
-            model_path
-        )
+        model = self._load_object(model_path)
 
         if model is None:
             return None
@@ -281,29 +223,17 @@ class Scene:
             model["roughness"] = roughness
 
         if transform is not None:
-            model["transform"] = glm.mat4(
-                transform
-            )
+            model["transform"] = glm.mat4(transform)
         else:
-            model["position"] = glm.vec3(
-                position
-            )
+            model["position"] = glm.vec3(position)
 
-            model["rotation"] = glm.vec3(
-                rotation
-            )
+            model["rotation"] = glm.vec3(rotation)
 
-            model["scale"] = glm.vec3(
-                scale
-            )
+            model["scale"] = glm.vec3(scale)
 
-        model["rot_speed"] = float(
-            rot_speed
-        )
+        model["rot_speed"] = float(rot_speed)
 
-        self.dynamic_objects.append(
-            model
-        )
+        self.dynamic_objects.append(model)
 
         return model
 
@@ -317,7 +247,7 @@ class Scene:
         color=(1.0, 1.0, 1.0),
         intensity=1.0,
         radius=10.0,
-        cast_shadows=False
+        cast_shadows=False,
     ):
         """cast_shadows now means "shadow-test this light against static
         geometry during bake_static_lighting()", not "give it a real-time
@@ -330,12 +260,10 @@ class Scene:
             "color": glm.vec3(color),
             "intensity": float(intensity),
             "radius": float(radius),
-            "bake_shadows": bool(cast_shadows)
+            "bake_shadows": bool(cast_shadows),
         }
 
-        self.point_lights.append(
-            light
-        )
+        self.point_lights.append(light)
 
         return light
 
@@ -345,7 +273,7 @@ class Scene:
         cast_shadows=False,
         default_radius=8.0,
         intensity_multiplier=1.0,
-        radius_multiplier=1.0
+        radius_multiplier=1.0,
     ):
         """Reads KHR_lights_punctual lights out of a glb and adds any
         point lights found as real point lights in the scene.
@@ -392,10 +320,24 @@ class Scene:
         pass
 
     # =============================================================
+    # 3D SOUND
+    # =============================================================
+
+    def update_audio(self, camera):
+        """Call once per frame from your main loop. Sound emitters
+        themselves live on self.sound_manager - use
+        scene.sound_manager.add_sound(...) to add one, not a method on
+        Scene (see Modules/Audio/sound_manager.py)."""
+        # print("[Scene] update_audio() called")  # TEMP DEBUG
+        self.sound_manager.update(camera)
+
+    # =============================================================
     # LIGHTMAP BAKING
     # =============================================================
 
-    def bake_static_lighting(self, lightmap_resolution=256, point_shadow_resolution=1024):
+    def bake_static_lighting(
+        self, lightmap_resolution=256, point_shadow_resolution=1024
+    ):
         """Call this once, after adding all static objects and point
         lights, to bake shadow-tested point light contributions (from
         lights added with cast_shadows=True) into each static object's
@@ -414,7 +356,8 @@ class Scene:
         Point lights added with cast_shadows=False are not baked at all;
         they stay real-time-unshadowed only (see add_point_light)."""
         eligible = [
-            obj for obj in self.static_objects
+            obj
+            for obj in self.static_objects
             if obj.get("has_lightmap_uv") and obj.get("lightmap_vao") is not None
         ]
 
@@ -433,11 +376,16 @@ class Scene:
                 f"nothing to bake ({len(self.static_objects)} static object(s) checked)."
             )
             for i, obj in enumerate(self.static_objects):
-                print(f"  static_objects[{i}]: has_lightmap_uv={obj.get('has_lightmap_uv')}")
+                print(
+                    f"  static_objects[{i}]: has_lightmap_uv={obj.get('has_lightmap_uv')}"
+                )
             return
 
         self.lightmap_dir.mkdir(parents=True, exist_ok=True)
-        cache_paths = [lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, i) for i in range(len(eligible))]
+        cache_paths = [
+            lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, i)
+            for i in range(len(eligible))
+        ]
 
         def _load_cache():
             """Returns the loaded arrays if every cache file exists AND
@@ -447,7 +395,9 @@ class Scene:
             change between runs."""
             loaded = []
             for path in cache_paths:
-                array = lightmap_cache_io.load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution)
+                array = lightmap_cache_io.load_lightmap_cache(
+                    path, lightmap_resolution, point_shadow_resolution
+                )
                 if array is None:
                     return None
                 loaded.append(array)
@@ -474,14 +424,18 @@ class Scene:
                     # apply here - no reason to carry a wasted alpha
                     # channel through disk storage and back.
                     array = array.astype(np.float16)
-                    texture = self.ctx.texture((array.shape[1], array.shape[0]), 3, array.tobytes(), dtype="f2")
+                    texture = self.ctx.texture(
+                        (array.shape[1], array.shape[0]), 3, array.tobytes(), dtype="f2"
+                    )
                     texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
                     obj["lightmap_texture"] = texture
 
                 return
 
         if not self.recalculate_shadows:
-            print(f"[Scene] recalculate_shadows is False but no valid cached lightmaps found in {self.lightmap_dir} - baking instead.")
+            print(
+                f"[Scene] recalculate_shadows is False but no valid cached lightmaps found in {self.lightmap_dir} - baking instead."
+            )
 
         print(f"[Scene] Baking lighting for {len(eligible)} static object(s)...")
 
@@ -503,7 +457,10 @@ class Scene:
                 continue
 
             temp_shadow = PointShadowMap(
-                self.ctx, resolution=point_shadow_resolution, near=0.05, far=max(light["radius"] * 2.0, 1.0)
+                self.ctx,
+                resolution=point_shadow_resolution,
+                near=0.05,
+                far=max(light["radius"] * 2.0, 1.0),
             )
             temp_shadow.set_position(light["position"])
 
@@ -526,7 +483,12 @@ class Scene:
             for face in range(6):
                 fbo = temp_shadow.live_fbos[face]
                 fbo.use()
-                self.ctx.viewport = (0, 0, temp_shadow.resolution, temp_shadow.resolution)
+                self.ctx.viewport = (
+                    0,
+                    0,
+                    temp_shadow.resolution,
+                    temp_shadow.resolution,
+                )
                 fbo.clear(depth=1.0)
                 light_vp = temp_shadow.light_mvps[face]
                 for obj in self.static_objects:
@@ -536,8 +498,12 @@ class Scene:
 
             for obj in eligible:
                 bake_point_light(
-                    self.ctx, self.bake_program, obj, self._get_model_matrix(obj),
-                    light, temp_shadow
+                    self.ctx,
+                    self.bake_program,
+                    obj,
+                    self._get_model_matrix(obj),
+                    light,
+                    temp_shadow,
                 )
 
             temp_shadow.destroy()
@@ -545,12 +511,18 @@ class Scene:
         for obj, path in zip(eligible, cache_paths):
             texture = obj["lightmap_texture"]
             width, height = texture.size
-            array = np.frombuffer(texture.read(), dtype=np.float16).reshape(height, width, 4)
+            array = np.frombuffer(texture.read(), dtype=np.float16).reshape(
+                height, width, 4
+            )
             # Drop the alpha channel before persisting - it's unused dead
             # weight here (see the load path above for why).
-            lightmap_cache_io.save_lightmap_cache(path, array[:, :, :3], lightmap_resolution, point_shadow_resolution)
+            lightmap_cache_io.save_lightmap_cache(
+                path, array[:, :, :3], lightmap_resolution, point_shadow_resolution
+            )
 
-        print(f"[Scene] Baked and saved {len(eligible)} lightmap(s) to {self.lightmap_dir}")
+        print(
+            f"[Scene] Baked and saved {len(eligible)} lightmap(s) to {self.lightmap_dir}"
+        )
 
         self.ctx.disable(moderngl.BLEND)
         self.ctx.enable(moderngl.CULL_FACE)
@@ -565,41 +537,21 @@ class Scene:
 
     def _get_model_matrix(self, obj):
         if "transform" in obj:
-            return glm.mat4(
-                obj["transform"]
-            )
+            return glm.mat4(obj["transform"])
 
         model = glm.mat4(1.0)
 
-        model = glm.translate(
-            model,
-            obj["position"]
-        )
+        model = glm.translate(model, obj["position"])
 
         rotation = obj["rotation"]
 
-        model = glm.rotate(
-            model,
-            rotation.x,
-            glm.vec3(1.0, 0.0, 0.0)
-        )
+        model = glm.rotate(model, rotation.x, glm.vec3(1.0, 0.0, 0.0))
 
-        model = glm.rotate(
-            model,
-            rotation.y,
-            glm.vec3(0.0, 1.0, 0.0)
-        )
+        model = glm.rotate(model, rotation.y, glm.vec3(0.0, 1.0, 0.0))
 
-        model = glm.rotate(
-            model,
-            rotation.z,
-            glm.vec3(0.0, 0.0, 1.0)
-        )
+        model = glm.rotate(model, rotation.z, glm.vec3(0.0, 0.0, 1.0))
 
-        model = glm.scale(
-            model,
-            obj["scale"]
-        )
+        model = glm.scale(model, obj["scale"])
 
         return model
 
@@ -609,106 +561,57 @@ class Scene:
 
     def update(self, dt):
         for obj in self.dynamic_objects:
-            rot_speed = obj.get(
-                "rot_speed",
-                0.0
-            )
+            rot_speed = obj.get("rot_speed", 0.0)
 
             if rot_speed != 0.0:
                 if "rotation" in obj:
-                    obj["rotation"].y += (
-                        rot_speed * dt
-                    )
+                    obj["rotation"].y += rot_speed * dt
 
     # =============================================================
     # DIRECTIONAL SHADOW PASS
     # =============================================================
 
     def _render_shadows(self, camera):
-        self.shadow_manager.update(
-            camera,
-            self.light_dir
-        )
+        self.shadow_manager.update(camera, self.light_dir)
 
-        resolution = (
-            self.shadow_manager.resolution
-        )
+        resolution = self.shadow_manager.resolution
 
-        self.ctx.enable(
-            moderngl.DEPTH_TEST
-        )
+        self.ctx.enable(moderngl.DEPTH_TEST)
 
         self.ctx.depth_func = "<="
 
-        self.ctx.disable(
-            moderngl.CULL_FACE
-        )
+        self.ctx.enable(moderngl.CULL_FACE)
 
         self.ctx.cull_face = "front"
 
         old_viewport = self.ctx.viewport
 
-        for cascade in range(
-            self.shadow_manager.num_cascades
-        ):
-            framebuffer = (
-                self.shadow_manager.framebuffers[
-                    cascade
-                ]
-            )
+        for cascade in range(self.shadow_manager.num_cascades):
+            framebuffer = self.shadow_manager.framebuffers[cascade]
 
-            light_vp = (
-                self.shadow_manager.light_mvps[
-                    cascade
-                ]
-            )
+            light_vp = self.shadow_manager.light_mvps[cascade]
 
             framebuffer.use()
 
-            self.ctx.viewport = (
-                0,
-                0,
-                resolution,
-                resolution
-            )
+            self.ctx.viewport = (0, 0, resolution, resolution)
 
-            framebuffer.clear(
-                depth=1.0
-            )
+            framebuffer.clear(depth=1.0)
 
             for obj in self.static_objects:
-                model_matrix = (
-                    self._get_model_matrix(obj)
-                )
+                model_matrix = self._get_model_matrix(obj)
 
-                light_mvp = (
-                    light_vp *
-                    model_matrix
-                )
+                light_mvp = light_vp * model_matrix
 
-                self.shadow_program[
-                    "u_light_mvp"
-                ].write(
-                    light_mvp.to_bytes()
-                )
+                self.shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
 
                 obj["shadow_vao"].render()
 
             for obj in self.dynamic_objects:
-                model_matrix = (
-                    self._get_model_matrix(obj)
-                )
+                model_matrix = self._get_model_matrix(obj)
 
-                light_mvp = (
-                    light_vp *
-                    model_matrix
-                )
+                light_mvp = light_vp * model_matrix
 
-                self.shadow_program[
-                    "u_light_mvp"
-                ].write(
-                    light_mvp.to_bytes()
-                )
+                self.shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
 
                 obj["shadow_vao"].render()
 
@@ -716,15 +619,11 @@ class Scene:
 
         self.ctx.viewport = old_viewport
 
-        self.ctx.enable(
-            moderngl.DEPTH_TEST
-        )
+        self.ctx.enable(moderngl.DEPTH_TEST)
 
         self.ctx.depth_func = "<"
 
-        self.ctx.enable(
-            moderngl.CULL_FACE
-        )
+        self.ctx.enable(moderngl.CULL_FACE)
 
         self.ctx.cull_face = "back"
 
@@ -735,30 +634,21 @@ class Scene:
     def _render_scene(self, camera):
         self.ctx.screen.use()
 
-        self.ctx.enable(
-            moderngl.DEPTH_TEST
-        )
+        self.ctx.enable(moderngl.DEPTH_TEST)
 
         self.ctx.depth_func = "<"
 
-        self.ctx.enable(
-            moderngl.CULL_FACE
-        )
+        self.ctx.enable(moderngl.CULL_FACE)
 
         self.ctx.cull_face = "back"
 
         # Point-light data and shadow textures are identical for every
         # object this frame, so bind them once here rather than inside
         # the per-object loop below.
-        bind_point_lights(
-            self.pbr_program,
-            self.point_lights
-        )
+        bind_point_lights(self.pbr_program, self.point_lights)
 
         for obj in self.static_objects:
-            model_matrix = (
-                self._get_model_matrix(obj)
-            )
+            model_matrix = self._get_model_matrix(obj)
 
             bind_material(
                 self.pbr_program,
@@ -766,15 +656,13 @@ class Scene:
                 model_matrix,
                 camera,
                 self.light_dir,
-                self.shadow_manager
+                self.shadow_manager,
             )
 
             obj["vao"].render()
 
         for obj in self.dynamic_objects:
-            model_matrix = (
-                self._get_model_matrix(obj)
-            )
+            model_matrix = self._get_model_matrix(obj)
 
             bind_material(
                 self.pbr_program,
@@ -782,7 +670,7 @@ class Scene:
                 model_matrix,
                 camera,
                 self.light_dir,
-                self.shadow_manager
+                self.shadow_manager,
             )
 
             obj["vao"].render()
@@ -792,13 +680,9 @@ class Scene:
     # =============================================================
 
     def render(self, camera, prog=None):
-        self._render_shadows(
-            camera
-        )
+        self._render_shadows(camera)
 
-        self._render_scene(
-            camera
-        )
+        self._render_scene(camera)
 
     # =============================================================
     # DESTROY
@@ -812,6 +696,7 @@ class Scene:
             self._release_object(obj)
 
         self.point_lights.clear()
+        self.sound_manager.destroy()
 
         if self.shadow_manager is not None:
             try:
@@ -861,9 +746,7 @@ class Scene:
             except Exception:
                 pass
 
-        shadow_vao = obj.get(
-            "shadow_vao"
-        )
+        shadow_vao = obj.get("shadow_vao")
 
         if shadow_vao is not None:
             try:
@@ -871,9 +754,7 @@ class Scene:
             except Exception:
                 pass
 
-        lightmap_vao = obj.get(
-            "lightmap_vao"
-        )
+        lightmap_vao = obj.get("lightmap_vao")
 
         if lightmap_vao is not None:
             try:
@@ -881,9 +762,7 @@ class Scene:
             except Exception:
                 pass
 
-        lightmap_texture = obj.get(
-            "lightmap_texture"
-        )
+        lightmap_texture = obj.get("lightmap_texture")
 
         if lightmap_texture is not None:
             try:
@@ -891,9 +770,7 @@ class Scene:
             except Exception:
                 pass
 
-        texture = obj.get(
-            "texture"
-        )
+        texture = obj.get("texture")
 
         if texture is not None:
             try:
@@ -901,9 +778,7 @@ class Scene:
             except Exception:
                 pass
 
-        mr_texture = obj.get(
-            "metallic_roughness_texture"
-        )
+        mr_texture = obj.get("metallic_roughness_texture")
 
         if mr_texture is not None:
             try:
