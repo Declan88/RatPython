@@ -1,37 +1,34 @@
 """
-Skybox rendering: six independent flat quads, each with its own plain
-2D texture, arranged into a box around the camera.
+Skybox rendering. Two independent options:
 
-This replaced an earlier version built on a real GL cubemap
-(ctx.texture_cube / samplerCube). That approach was architecturally
-wrong for what Source actually does here: a hardware cubemap always
-enforces a perfect CUBE with a fixed direction-to-face mapping - there
-is no way to make GL_TEXTURE_CUBE_MAP render a SHORT, non-cubic box
-with independently-proportioned faces. Real-world observation (in-game
-in GMod) showed the actual skybox is a short box - roughly half height,
-floor sitting at the horizon - with its side textures displayed
-completely UNSTRETCHED, contradicting the earlier assumption that
-Source's $basetexturetransform "scale 1 2" was stretching a half-height
-image to fill a square cube face.
+1. Six independent flat quads, each with its own plain 2D texture,
+   arranged into a box around the camera (create_skybox_program /
+   load_skybox_textures / create_skybox_vao / render_skybox). Replaces
+   an earlier real GL cubemap (ctx.texture_cube / samplerCube) version -
+   a hardware cubemap always enforces a perfect CUBE with a fixed
+   direction-to-face mapping, which can't represent a short, non-cubic
+   skybox shape. Face order matches PointShadowMap.FACE_DIRECTIONS
+   elsewhere in this project: 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z.
 
-This also explains something that didn't make sense before: if the
-box's floor sits at the horizon, a player standing on the ground
-essentially never sees the "down" face at all - which is exactly why
-Source maps get away with a disposable low-res placeholder there.
+2. A single equirectangular HDR panorama (.exr), sampled directly by
+   direction vector (create_equirect_skybox_program /
+   load_equirect_texture / create_equirect_skybox_vao /
+   render_equirect_skybox). One continuous image, no discrete faces, so
+   the seam problem that motivated option 1's edge-fade/neighbor-blend
+   work doesn't exist here - the cleaner option when the source asset
+   is already a single panorama rather than 6 separate face images.
 
-Box shape is fully configurable (top_height, bottom_height,
-half_extent). The default (half_extent=1.0, bottom_height=0.0,
-top_height=1.0) makes each side face exactly 2:1 (width:height) in
-world-space proportions, matching the observed 1024x512 native pixel
-aspect of these particular textures with zero stretching needed - not
-independently verified pixel-exact against the original map, just the
-geometrically consistent choice given what's been confirmed so far.
+   NOTE: loading requires the OpenEXR package (pip install OpenEXR),
+   same as lightmap_cache_io.py's .exr path elsewhere in this project,
+   and hasn't been verified against a real .exr file or a live GPU in
+   this environment. The equirect UV mapping below is the standard
+   Y-up formula used across many shader references, but if a specific
+   panorama looks vertically flipped or seamed at an unexpected
+   longitude, that's worth checking for, not already confirmed correct.
 
-Face order matches the same convention used elsewhere in this project
-(PointShadowMap.FACE_DIRECTIONS): 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z.
-
-Six separate draw calls (one per face, each binding its own texture) -
-trivially cheap for something drawn once per frame regardless.
+Both options are independent - use whichever matches your actual
+source assets. Don't call both add_skybox() and an equirect setup in
+the same scene; whichever renders wouldn't be dangerous, just redundant.
 """
 
 import moderngl
@@ -51,6 +48,19 @@ _FACE_NEIGHBORS = {
     4: {"left": 0, "right": 1, "bottom": 3, "top": 2},  # +Z (front)
     5: {"left": 1, "right": 0, "bottom": 3, "top": 2},  # -Z (back)
 }
+
+# Plain position-only unit cube (36 vertices, no UVs needed) - used by
+# the equirect path, where the vertex position itself doubles directly
+# as the sampling direction vector, same technique as the original
+# cubemap-based skybox before it was replaced by the 6-flat-quad system.
+_DIRECTION_CUBE_VERTICES = np.array([
+    -1, -1, -1,  1, -1, -1,  1,  1, -1,   1,  1, -1, -1,  1, -1, -1, -1, -1,  # back
+    -1, -1,  1,  1, -1,  1,  1,  1,  1,   1,  1,  1, -1,  1,  1, -1, -1,  1,  # front
+    -1,  1,  1, -1,  1, -1, -1, -1, -1,  -1, -1, -1, -1, -1,  1, -1,  1,  1,  # left
+     1,  1,  1,  1,  1, -1,  1, -1, -1,   1, -1, -1,  1, -1,  1,  1,  1,  1,  # right
+    -1, -1, -1,  1, -1, -1,  1, -1,  1,   1, -1,  1, -1, -1,  1, -1, -1, -1,  # bottom
+    -1,  1, -1,  1,  1, -1,  1,  1,  1,   1,  1,  1, -1,  1,  1, -1,  1, -1,  # top
+], dtype="f4")
 
 
 SKYBOX_VERTEX_SHADER = """
@@ -81,26 +91,40 @@ SKYBOX_FRAGMENT_SHADER = """
 #version 330
 uniform sampler2D u_face;
 uniform float u_edge_fade;
+uniform vec3 u_neighbor_left;
+uniform vec3 u_neighbor_right;
+uniform vec3 u_neighbor_bottom;
+uniform vec3 u_neighbor_top;
 
 in vec2 v_uv;
 out vec4 fragColor;
 
 void main() {
-    vec4 texColor = texture(u_face, v_uv);
+    vec3 result = texture(u_face, v_uv).rgb;
 
-    // Fades each face toward black near its own edges - doesn't blend
-    // the actual content between two different face textures (that
-    // needs real geometry overlap across every edge, a much bigger
-    // change), but two adjacent faces both darkening toward black as
-    // they approach their shared boundary turns a hard, jarring color
-    // jump into a soft dark seam instead - much less noticeable,
-    // especially against an already-dark tinted sky. u_edge_fade is
-    // the UV-space margin (0.0 = no fade at all, e.g. 0.05 fades
-    // starting 5% of the way in from each edge).
-    float edge_dist = min(min(v_uv.x, 1.0 - v_uv.x), min(v_uv.y, 1.0 - v_uv.y));
-    float fade = u_edge_fade > 0.0 ? smoothstep(0.0, u_edge_fade, edge_dist) : 1.0;
+    // Fades each edge toward the ACTUAL average color of whatever
+    // face is really on the other side of that edge (see
+    // _FACE_NEIGHBORS), instead of fading toward black. Doesn't
+    // continue real image content (cloud shapes, detail) across the
+    // seam - true content-accurate blending needs real geometry
+    // overlap across every edge, a much bigger change - but landing on
+    // the neighbor's real color instead of black means the transition
+    // reads as "smoothly becoming the sky next to it" rather than "a
+    // dark line/wedge", which is what a hard color mismatch or a
+    // fade-to-black both looked like before this.
+    if (u_edge_fade > 0.0) {
+        float fade_left = 1.0 - smoothstep(0.0, u_edge_fade, v_uv.x);
+        float fade_right = 1.0 - smoothstep(0.0, u_edge_fade, 1.0 - v_uv.x);
+        float fade_bottom = 1.0 - smoothstep(0.0, u_edge_fade, v_uv.y);
+        float fade_top = 1.0 - smoothstep(0.0, u_edge_fade, 1.0 - v_uv.y);
 
-    fragColor = vec4(texColor.rgb * fade, 1.0);
+        result = mix(result, u_neighbor_left, fade_left);
+        result = mix(result, u_neighbor_right, fade_right);
+        result = mix(result, u_neighbor_bottom, fade_bottom);
+        result = mix(result, u_neighbor_top, fade_top);
+    }
+
+    fragColor = vec4(result, 1.0);
 }
 """
 
@@ -127,50 +151,23 @@ def _build_box_geometry(top_height, bottom_height, half_extent):
     isn't carefully verified for inside-vs-outside correctness since
     culling is disabled for the skybox draw either way - only the UV
     orientation matters for how each texture appears, and that's the
-    kind of thing that needs a visual check (use the rotate_uv helper
-    below per-face if an image looks mirrored/rotated wrong)."""
-    he = half_extent
-    b = bottom_height
-    t = top_height
-
+    kind of thing that needs a visual check (use the rotations param of
+    create_skybox_vao if an image looks mirrored/rotated wrong)."""
+    he, b, t = half_extent, bottom_height, top_height
     uv_std = [(0, 0), (1, 0), (1, 1), (0, 1)]
 
-    faces = []
-
-    # +X (right)
-    faces.append(_quad(
-        [(he, b, -he), (he, b, he), (he, t, he), (he, t, -he)],
-        uv_std
-    ))
-    # -X (left)
-    faces.append(_quad(
-        [(-he, b, he), (-he, b, -he), (-he, t, -he), (-he, t, he)],
-        uv_std
-    ))
-    # +Y (up)
-    faces.append(_quad(
-        [(-he, t, he), (he, t, he), (he, t, -he), (-he, t, -he)],
-        uv_std
-    ))
-    # -Y (down)
-    faces.append(_quad(
-        [(-he, b, -he), (he, b, -he), (he, b, he), (-he, b, he)],
-        uv_std
-    ))
-    # +Z (front)
-    faces.append(_quad(
-        [(he, b, he), (-he, b, he), (-he, t, he), (he, t, he)],
-        uv_std
-    ))
-    # -Z (back)
-    faces.append(_quad(
-        [(-he, b, -he), (he, b, -he), (he, t, -he), (-he, t, -he)],
-        uv_std
-    ))
+    face_corners = [
+        [(he, b, -he), (he, b, he), (he, t, he), (he, t, -he)],       # +X
+        [(-he, b, he), (-he, b, -he), (-he, t, -he), (-he, t, he)],   # -X
+        [(-he, t, he), (he, t, he), (he, t, -he), (-he, t, -he)],     # +Y
+        [(-he, b, -he), (he, b, -he), (he, b, he), (-he, b, he)],     # -Y
+        [(he, b, he), (-he, b, he), (-he, t, he), (he, t, he)],       # +Z
+        [(-he, b, -he), (he, b, -he), (he, t, -he), (-he, t, -he)],   # -Z
+    ]
 
     flat = []
-    for face in faces:
-        flat.extend(face)
+    for corners in face_corners:
+        flat.extend(_quad(corners, uv_std))
     return flat
 
 
@@ -181,22 +178,21 @@ def load_skybox_textures(ctx, face_paths, tint=None, padding=0):
     each is its own independent plain 2D texture, uploaded at its
     native resolution and aspect ratio.
 
-    tint: optional color correction applied to the pixel data before
-    upload - matches Source's per-material $color parameter. Pass
-    either None (no tint), a single (r,g,b) tuple (applied to all 6),
-    or a list of 6 (r,g,b) tuples (one per face, if they genuinely
-    differ - check each face's .vmt rather than assuming they match).
+    tint: optional (r,g,b) color correction applied to the pixel data
+    before upload - matches Source's per-material $color parameter.
+    Pass None (no tint), a single tuple (applied to all 6), or a list
+    of 6 (one per face, if they genuinely differ).
 
     padding: pixels of edge-replication padding added to each face
-    before upload (default 0, no padding). NOTE: since repeat_x/repeat_y
-    are already disabled below (clamp-to-edge), sampling past a face's
-    boundary already just holds that edge pixel's color - padding
-    produces the same result as clamp-to-edge already does on its own,
-    so with the current per-face UV mapping this won't visibly change
-    anything. It won't fix the harsh seam where two different,
-    unrelated face textures meet either - that's caused by zero
-    blending between separate textures, not by edge-sampling behavior,
-    and padding doesn't touch that at all."""
+    (default 0). NOTE: since repeat_x/repeat_y are already disabled
+    below (clamp-to-edge), sampling past a face's boundary already just
+    holds that edge pixel's color, so with the current per-face UV
+    mapping this won't visibly change anything.
+
+    Returns (textures, average_colors) - average_colors is a list of 6
+    (r,g,b) tuples (each 0..1), the mean color of that face's pixel
+    data post-tint, used by render_skybox to fade each edge toward its
+    actual neighboring face's color."""
     if len(face_paths) != 6:
         raise ValueError(f"Skybox needs exactly 6 face images (+X,-X,+Y,-Y,+Z,-Z), got {len(face_paths)}")
 
@@ -210,6 +206,7 @@ def load_skybox_textures(ctx, face_paths, tint=None, padding=0):
         tints = tint
 
     textures = []
+    average_colors = []
     for path, face_tint in zip(face_paths, tints):
         img = Image.open(path).convert("RGB")
 
@@ -218,6 +215,8 @@ def load_skybox_textures(ctx, face_paths, tint=None, padding=0):
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         else:
             arr = np.asarray(img)
+
+        average_colors.append(tuple((arr.astype(np.float32).mean(axis=(0, 1)) / 255.0).tolist()))
 
         if padding > 0:
             arr = np.pad(arr, ((padding, padding), (padding, padding), (0, 0)), mode="edge")
@@ -239,40 +238,34 @@ def load_skybox_textures(ctx, face_paths, tint=None, padding=0):
         tex.repeat_y = False
         textures.append(tex)
 
-    return textures
+    return textures, average_colors
 
 
-def create_skybox_vao(ctx, prog, top_height=1.0, bottom_height=-0.05, half_extent=1.0, rotations=None):
+def create_skybox_vao(ctx, prog, top_height=1.0, bottom_height=-1.0, half_extent=1.0, rotations=None):
     """Builds one VBO containing all 6 faces (6 vertices each, 36
     total) and a single VAO - render a specific face later via
     vao.render(vertices=6, first=face_index*6).
 
     top_height/bottom_height/half_extent: box shape in world units.
+    Defaults make a full symmetric cube (every face, including the top/
+    bottom caps, exactly 1:1) - the right choice when all 6 textures
+    are the same square size. For mismatched/stretched textures (e.g.
+    side faces stored at half height relative to the caps), set
+    bottom_height/top_height asymmetrically instead.
+
     IMPORTANT: since the skybox's view matrix has translation stripped,
     the camera is always effectively positioned at local origin (0,0,0)
     within this box - for every viewing direction to actually hit the
     box's geometry, the origin MUST sit strictly INSIDE the box's
-    volume, not exactly on its boundary. bottom_height=0.0 would put
-    the floor plane exactly AT the camera's position - a degenerate
-    case where looking level or downward never intersects the box at
-    all (a hollow box with a hole exactly where the camera stands),
-    which is exactly what produced a mostly-black view with only
-    strange slivers of geometry visible at steep upward angles. The
-    default -0.05 keeps the floor just barely below the camera -
-    visually close enough to "floor at the horizon" while keeping the
-    camera safely inside the box. Keep bottom_height negative (or at
-    least clearly less than 0) for the same reason if you change it.
+    volume, not exactly on its boundary. bottom_height=0.0 (or any
+    value >= 0) would put the floor plane AT or ABOVE the camera's
+    position, a degenerate case where looking level or downward never
+    intersects the box at all. The symmetric default (-1.0 to 1.0)
+    keeps the camera safely at the exact center.
 
-    The defaults otherwise make each side face's WIDTH still work out
-    to 2:1 against a *nominal* height of 1.0 (matching these textures'
-    native 1024x512 aspect) - the small negative bottom_height barely
-    changes that ratio in practice.
-
-    rotations: optional list of 6 degree values (0/90/180/270 - other
-    values aren't snapped to anything meaningful for a UV rotation),
-    rotating that face's texture coordinates - for a face whose source
-    material rotates its texture. Like the box shape, get this right by
-    checking the actual rendered result rather than assuming.
+    rotations: optional list of 6 degree values (0/90/180/270), rotating
+    that face's texture coordinates - for a face whose source material
+    rotates its texture. Verify visually rather than assuming.
 
     Returns (vao, vbo) - caller should hang onto vbo for cleanup."""
     flat = _build_box_geometry(top_height, bottom_height, half_extent)
@@ -297,18 +290,17 @@ def create_skybox_vao(ctx, prog, top_height=1.0, bottom_height=-0.05, half_exten
     return vao, vbo
 
 
-def render_skybox(ctx, prog, vao, textures, camera, edge_fade=0.05):
+def render_skybox(ctx, prog, vao, textures, average_colors, camera, edge_fade=0.05):
     """Call this AFTER rendering all other scene geometry (shadows and
     the color pass), so the skybox only shows through where nothing
-    else was drawn. textures: list of 6 (from load_skybox_textures),
+    else was drawn. textures/average_colors: from load_skybox_textures,
     in the same +X,-X,+Y,-Y,+Z,-Z face order as the vao's geometry.
 
     edge_fade: UV-space margin (0..~0.2 is reasonable) each face fades
-    toward black over, softening the seam where two different face
-    textures meet - see the fragment shader's comment for why this
-    doesn't blend actual content, just makes the boundary less harsh.
-    0.0 disables it entirely (hard, unfaded edges, matching the
-    original behavior)."""
+    toward its actual neighboring face's average color over, softening
+    the seam where two different face textures meet - see the fragment
+    shader's comment for what this does and doesn't achieve. 0.0
+    disables it entirely (hard, unfaded edges)."""
     prog["u_view"].write(camera.get_view_matrix().to_bytes())
     prog["u_projection"].write(camera.get_projection_matrix().to_bytes())
     prog["u_edge_fade"].value = edge_fade
@@ -319,10 +311,172 @@ def render_skybox(ctx, prog, vao, textures, camera, edge_fade=0.05):
     for face_index, tex in enumerate(textures):
         tex.use(location=0)
         prog["u_face"].value = 0
+
+        neighbors = _FACE_NEIGHBORS[face_index]
+        prog["u_neighbor_left"].value = average_colors[neighbors["left"]]
+        prog["u_neighbor_right"].value = average_colors[neighbors["right"]]
+        prog["u_neighbor_bottom"].value = average_colors[neighbors["bottom"]]
+        prog["u_neighbor_top"].value = average_colors[neighbors["top"]]
+
         vao.render(moderngl.TRIANGLES, vertices=6, first=face_index * 6)
 
     # ctx.depth_func is write-only in moderngl (reading it back raises
     # NotImplementedError) - hardcode the restore to "<", the normal
     # depth func used everywhere else in this project.
+    ctx.depth_func = "<"
+    ctx.enable(moderngl.CULL_FACE)
+
+
+# =================================================================
+# EQUIRECTANGULAR HDR PANORAMA (single .exr file, no discrete faces)
+# =================================================================
+
+EQUIRECT_VERTEX_SHADER = """
+#version 330
+uniform mat4 u_view;
+uniform mat4 u_projection;
+
+in vec3 in_position;
+out vec3 v_direction;
+
+void main() {
+    v_direction = in_position;
+
+    mat4 rot_view = mat4(mat3(u_view));
+    vec4 pos = u_projection * rot_view * vec4(in_position, 1.0);
+    gl_Position = pos.xyww;
+}
+"""
+
+EQUIRECT_FRAGMENT_SHADER = """
+#version 330
+uniform sampler2D u_equirect;
+uniform float u_exposure;
+uniform bool u_apply_tonemap;
+
+in vec3 v_direction;
+out vec4 fragColor;
+
+const float PI = 3.14159265359;
+
+void main() {
+    vec3 dir = normalize(v_direction);
+
+    // Standard Y-up equirectangular mapping: longitude (rotation
+    // around Y) -> u, latitude (elevation) -> v. V is flipped (0.5 -
+    // asin(...)/PI rather than 0.5 + asin(...)/PI) to correct for the
+    // standard mismatch between how image files store rows (top-to-
+    // bottom) and OpenGL's texture V-coordinate convention (bottom-to-
+    // top) - confirmed needed empirically (zenith/nadir were swapped
+    // without this).
+    float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
+    float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI;
+
+    vec3 color = texture(u_equirect, vec2(u, v)).rgb * u_exposure;
+
+    // Only for HDR (.exr) sources: raw radiance values are unbounded
+    // and need Reinhard tonemap + gamma to display sensibly, same as
+    // the main PBR shader (pbr_shader.py). An LDR (.png/.jpg) source
+    // is ALREADY normal 0..1, display-ready, sRGB-encoded data -
+    // running it through this same tonemap would incorrectly darken/
+    // wash it out (Reinhard maps an input of 1.0 down to 0.5), so it's
+    // skipped entirely for that case.
+    if (u_apply_tonemap) {
+        color = color / (color + vec3(1.0));
+        color = pow(color, vec3(1.0 / 2.2));
+    }
+
+    fragColor = vec4(color, 1.0);
+}
+"""
+
+
+def create_equirect_skybox_program(ctx):
+    return ctx.program(vertex_shader=EQUIRECT_VERTEX_SHADER, fragment_shader=EQUIRECT_FRAGMENT_SHADER)
+
+
+def load_equirect_texture(ctx, path):
+    """Loads a single equirectangular panorama as a plain 2D texture -
+    HDR (.exr, needs the OpenEXR package) or LDR (.png/.jpg/etc, via
+    PIL, no extra dependency) are both supported, auto-detected from
+    the file extension.
+
+    Returns (texture, is_hdr). is_hdr tells render_equirect_skybox
+    whether to apply HDR tonemapping - .exr's raw radiance values are
+    unbounded and need it; a normal LDR image is already display-ready
+    and would be incorrectly darkened by running it through the same
+    tonemap (see the fragment shader's comment).
+
+    Not verified against a real .exr file or a live GPU in this
+    environment - the PNG/PIL path is the same well-established loading
+    code used elsewhere in this project (e.g. model_loader.py's
+    textures), so it's on much more solid ground than the .exr path."""
+    path_str = str(path)
+
+    if path_str.lower().endswith(".exr"):
+        import OpenEXR
+        with OpenEXR.File(path_str) as infile:
+            arr = infile.channels()["RGB"].pixels.astype(np.float16)
+        height, width = arr.shape[0], arr.shape[1]
+        tex = ctx.texture((width, height), 3, arr.tobytes(), dtype="f2")
+        is_hdr = True
+    else:
+        img = Image.open(path_str).convert("RGB")
+        tex = ctx.texture(img.size, 3, img.tobytes())
+        is_hdr = False
+
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    # repeat_x=True is deliberate and correct here, unlike the 6-face
+    # system's repeat_x=False fix: this is ONE continuous panorama, and
+    # its u=0 and u=1 edges genuinely ARE the same physical seam (360
+    # degrees around) - wrapping/blending across them is the actually
+    # correct behavior, not the earlier bug where wrapping blended two
+    # UNRELATED separate face textures together. repeat_y stays off -
+    # the top/bottom (poles) shouldn't wrap into each other.
+    tex.repeat_x = True
+    tex.repeat_y = False
+
+    return tex, is_hdr
+
+
+def create_equirect_skybox_vao(ctx, prog):
+    """Position-only cube - the vertex position doubles directly as
+    the sampling direction, no UVs needed since the equirect mapping is
+    computed from the direction vector in the fragment shader.
+
+    Returns (vao, vbo) - caller should hang onto vbo for cleanup."""
+    vbo = ctx.buffer(_DIRECTION_CUBE_VERTICES.tobytes())
+    vao = ctx.vertex_array(prog, [(vbo, "3f", "in_position")])
+    return vao, vbo
+
+
+def render_equirect_skybox(ctx, prog, vao, texture, camera, exposure=1.0, apply_tonemap=True):
+    """Call this AFTER rendering all other scene geometry (shadows and
+    the color pass), so the skybox only shows through where nothing
+    else was drawn.
+
+    exposure: multiplier on the raw values before tonemapping - the
+    standard way HDRI panoramas expose a brightness control, since raw
+    radiance values don't have one inherent "correct" display
+    brightness. Still applies for LDR sources too (just a plain
+    brightness multiplier there), defaulting to 1.0 (no change).
+
+    apply_tonemap: whether to run the result through Reinhard tonemap +
+    gamma - set this to whatever load_equirect_texture's is_hdr
+    returned (True for .exr, False for .png/.jpg/etc) - see the
+    fragment shader's comment for why this matters."""
+    texture.use(location=0)
+    prog["u_equirect"].value = 0
+    prog["u_exposure"].value = exposure
+    prog["u_apply_tonemap"].value = apply_tonemap
+    prog["u_view"].write(camera.get_view_matrix().to_bytes())
+    prog["u_projection"].write(camera.get_projection_matrix().to_bytes())
+
+    ctx.disable(moderngl.CULL_FACE)
+    ctx.depth_func = "<="
+
+    vao.render(moderngl.TRIANGLES)
+
     ctx.depth_func = "<"
     ctx.enable(moderngl.CULL_FACE)

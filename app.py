@@ -2,9 +2,11 @@ import sys
 import pygame
 import os
 import ctypes
+import glm
 from Modules.Window.window import WindowManager
 from Modules.Camera.camera import Camera
 from Modules.Scenes.torus_scene import TorusScene
+from Modules.Physics.character_controller import CharacterController
 
 
 def load_steam_api_dll():
@@ -61,6 +63,12 @@ def main():
     current_scene_key = "torus"
     current_scene = scenes[current_scene_key]
 
+    # Player capsule: walks/collides against current_scene's static
+    # geometry (see torus_scene.py's collision=True statics) via the
+    # scene's own physics world. Spawned above the floor so it falls
+    # and settles on first update rather than starting embedded in it.
+    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0))
+
     net_mgr = NetworkManager(camera)
 
     running = True
@@ -73,10 +81,35 @@ def main():
             current_scene_key = "torus"
             current_scene = scenes[current_scene_key]
 
-        camera.process_keyboard(keys, dt)
+        # Ground-relative movement, driven by camera yaw (mouse-look)
+        # but ignoring pitch - walking shouldn't speed up/slow down
+        # just from looking up or down.
+        move_dir = glm.vec3(0.0)
+        if keys[pygame.K_w]:
+            move_dir += camera.get_flat_forward()
+        if keys[pygame.K_s]:
+            move_dir -= camera.get_flat_forward()
+        if keys[pygame.K_a]:
+            move_dir -= camera.get_flat_right()
+        if keys[pygame.K_d]:
+            move_dir += camera.get_flat_right()
+        player.set_move_direction(move_dir)
+        player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+        player.set_crouching(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL])
+        if keys[pygame.K_SPACE]:
+            player.jump()
+        # No player.update(dt) here - CharacterController's Source-style
+        # ground/air movement math runs once per fixed physics tick (a
+        # PhysicsWorld pre-substep callback, registered in its __init__),
+        # not once per variable-length render frame; current_scene.update()
+        # below is what actually advances physics.
 
-        # Call update to drive scene animations (like the rotating torus)
+        # Call update to drive scene animations (like the rotating
+        # torus) and step physics - camera position then follows
+        # wherever physics moved the player capsule to this frame.
         current_scene.update(dt)
+        camera.position = player.get_position() + glm.vec3(0.0, player.get_eye_offset(), 0.0)
+
         current_scene.update_audio(camera)
 
         net_mgr.update()

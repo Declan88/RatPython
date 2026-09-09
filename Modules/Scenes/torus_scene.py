@@ -10,40 +10,37 @@ class TorusScene(Scene):
         self.light_dir = glm.vec3(0.5, 1.0, 0.8)
 
         # Skybox Setup
-        self.add_skybox(
-            [
-                "Assets/Textures/Skybox/southsidert.png",  # +X
-                "Assets/Textures/Skybox/southsidelf.png",  # -X
-                "Assets/Textures/Skybox/southsideup.png",  # +Y
-                "Assets/Textures/Skybox/southsidedn.png",  # -Y
-                "Assets/Textures/Skybox/southsidebk.png",  # +Z
-                "Assets/Textures/Skybox/southsideft.png",  # -Z
-            ],
-            # tint=(0.05, 0.3, 0.35),
-            rotations=[180, 180, 0, 180, 180, 180],
-            edge_fade=0.2,
-        )
-
+        self.add_equirect_skybox("Assets/Textures/Skybox/borealis.png", exposure=1.0)
         # Scene Static Elements
 
         self.add_static(
             "Assets/Models/Testmap/plane.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
+            collision=True,
         )
 
         self.add_static(
             "Assets/Models/Testmap/plane2.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
+            collision=True,
+        )
+
+        self.add_static(
+                    "Assets/Models/Testmap/floorbase.glb",
+                    transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, 2, 0.0)),
+                    collision=True,
         )
 
         self.add_static(
             "Assets/Models/Testmap/sphere.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
+            collision=True,
         )
 
         self.add_static(
             "Assets/Models/monkey.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1, 0.0)),
+            collision=True,
         )
 
         # Scene Dynamic Elements
@@ -78,12 +75,13 @@ class TorusScene(Scene):
         # Sound
 
         self.sound_manager.add_sound(
-            "Assets/Audio/testsound.wav",
+            "Assets/Audio/crucial_urban_rooftop_ambloop01.wav",
             position=(0.0, 3.0, 0.0),
-            volume=0.8,
-            min_distance=1.0,
-            max_distance=15.0,
+            volume=0.2,
+            min_distance=0,
+            max_distance=100000,
             loop=True,
+            universal=True,
         )
 
         self.sound_manager.add_sound(

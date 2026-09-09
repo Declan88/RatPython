@@ -30,10 +30,17 @@ class SoundManager:
         min_distance=1.0,
         max_distance=20.0,
         loop=True,
+        universal=False,
     ):
         """loop=True starts it as a looping ambient sound immediately
         (e.g. a hum, a fire crackling); loop=False plays it once and
-        the emitter is automatically dropped once it finishes."""
+        the emitter is automatically dropped once it finishes.
+
+        universal=True skips distance attenuation and stereo panning
+        entirely - the sound plays at a flat `volume` in both ears
+        regardless of the listener's position/facing (e.g. music, UI
+        sounds, a global ambience bed). position is still required but
+        ignored in this mode."""
         if not pygame.mixer.get_init():
             pygame.mixer.init()
             pygame.mixer.set_num_channels(32)
@@ -53,6 +60,7 @@ class SoundManager:
             "min_distance": float(min_distance),
             "max_distance": float(max_distance),
             "loop": bool(loop),
+            "universal": bool(universal),
         }
         self.emitters.append(emitter)
         return emitter
@@ -79,19 +87,24 @@ class SoundManager:
                 # it afterward would affect that different sound).
                 continue
 
-            to_emitter = emitter["position"] - listener_pos
-            dist = glm.length(to_emitter)
-            direction = to_emitter / max(dist, 0.0001)
+            if emitter["universal"]:
+                # No distance attenuation or panning - flat volume in
+                # both ears regardless of listener position/facing.
+                left_volume = right_volume = emitter["volume"]
+            else:
+                to_emitter = emitter["position"] - listener_pos
+                dist = glm.length(to_emitter)
+                direction = to_emitter / max(dist, 0.0001)
 
-            radius = max(emitter["max_distance"], 0.01)
-            effective_dist = max(dist, emitter["min_distance"])
-            falloff = max(0.0, min(1.0, 1.0 - (effective_dist / radius) ** 4))
-            atten = falloff * falloff
+                radius = max(emitter["max_distance"], 0.01)
+                effective_dist = max(dist, emitter["min_distance"])
+                falloff = max(0.0, min(1.0, 1.0 - (effective_dist / radius) ** 4))
+                atten = falloff * falloff
 
-            pan = max(-1.0, min(1.0, glm.dot(direction, right_vec)))
-            base_volume = emitter["volume"] * atten
-            left_volume = base_volume * (1.0 - max(0.0, pan))
-            right_volume = base_volume * (1.0 + min(0.0, pan))
+                pan = max(-1.0, min(1.0, glm.dot(direction, right_vec)))
+                base_volume = emitter["volume"] * atten
+                left_volume = base_volume * (1.0 - max(0.0, pan))
+                right_volume = base_volume * (1.0 + min(0.0, pan))
 
             # print(
             #     f"[SoundManager] dist={dist:.2f} atten={atten:.3f} L={left_volume:.3f} R={right_volume:.3f}"

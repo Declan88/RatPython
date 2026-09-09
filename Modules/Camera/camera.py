@@ -22,6 +22,18 @@ class Camera:
     def get_matrix(self):
         return self.get_projection_matrix() * self.get_view_matrix()
 
+    def get_flat_forward(self):
+        """self.front flattened onto the XZ ground plane and
+        renormalized (ignores pitch) - the "forward" a walking
+        character means when the camera is looking up/down, used to
+        drive CharacterController movement from mouse-look yaw."""
+        flat = glm.vec3(self.front.x, 0.0, self.front.z)
+        length = glm.length(flat)
+        return flat / length if length > 1e-6 else glm.vec3(0.0, 0.0, -1.0)
+
+    def get_flat_right(self):
+        return glm.normalize(glm.cross(self.get_flat_forward(), self.up))
+
     def process_keyboard(self, keys, dt):
         velocity = self.speed * dt
         if keys[pygame.K_w]:
