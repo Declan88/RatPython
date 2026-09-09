@@ -115,6 +115,7 @@ uniform mat4 u_view_matrix;
 
 uniform float u_metallic;
 uniform float u_roughness;
+uniform float u_specular_strength;
 uniform vec3 u_emissive;
 
 uniform sampler2D u_texture;
@@ -213,7 +214,7 @@ vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float shininess, 
     float spec = pow(max(dot(N, H), 0.0), shininess);
 
     vec3 diffuse = albedo * NdotL;
-    vec3 specular = specular_color * spec * NdotL;
+    vec3 specular = specular_color * spec * NdotL * u_specular_strength;
 
     return (diffuse + specular) * u_point_light_color[i] * atten;
 }
@@ -241,6 +242,10 @@ void main() {
     // instead of a GGX/Fresnel pipeline - roughly analogous to Source's
     // $phongexponent (tighter highlight = shinier/less rough) and a
     // metal-tinted specular color, without claiming physical accuracy.
+    // u_specular_strength is the separate, direct intensity control -
+    // matching Source's $phongboost - since roughness/metallic alone
+    // only shape the highlight, they don't give independent control
+    // over how strong it is.
     float shininess = mix(128.0, 4.0, rough);
     vec3 specular_color = mix(vec3(0.04), albedo, metal);
 
@@ -251,7 +256,7 @@ void main() {
     float shadow_attenuation = 1.0 - calculate_shadow(v_position, view_depth, N, L);
 
     vec3 diffuse = albedo * NdotL;
-    vec3 specular = specular_color * spec * NdotL;
+    vec3 specular = specular_color * spec * NdotL * u_specular_strength;
     vec3 direct_light = (diffuse + specular) * vec3(2.0) * shadow_attenuation;
 
     vec3 point_light_sum = vec3(0.0);
@@ -359,6 +364,7 @@ def bind_material(
         "u_eye_pos": tuple(camera.position),
         "u_metallic": item_data.get("metallic", 0.0),
         "u_roughness": min(item_data.get("roughness", 1.0), 1.0),
+        "u_specular_strength": float(item_data.get("specular_strength", 1.0)),
         "u_emissive": tuple(item_data.get("emissive", (0.0, 0.0, 0.0))),
         "u_has_texture": item_data.get("has_texture", 0),
         "u_has_metallic_roughness_texture": item_data.get(
