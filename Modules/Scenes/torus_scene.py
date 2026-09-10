@@ -72,16 +72,12 @@ class TorusScene(Scene):
             "Assets/Models/Testmap/plane.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
             collision=True,
+            physical_material="concrete",
         )
         # The staircase's own flat top landing (past the last tread, local
         # z:[3.689,4.134] at a constant y=3.665) - also inside the excluded
         # bounds above, so it needs its own simple flat box to stay solid;
         # unrotated, it just butts up against the ramp's top end.
-        self.add_static(
-            "Assets/Models/Testmap/plane2.glb",
-            transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
-            collision=True,
-        )
 
         self.add_static(
             "Assets/Models/Testmap/floorbase.glb",
@@ -97,18 +93,14 @@ class TorusScene(Scene):
             # internal edges, so it sidesteps the issue entirely - and
             # is the right tool anyway for a flat rectangular slab.
             collision_shape="box",
-        )
-
-        self.add_static(
-            "Assets/Models/Testmap/sphere.glb",
-            transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
-            collision=True,
+            physical_material="wood",
         )
 
         self.add_static(
             "Assets/Models/monkey.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1, 0.0)),
             collision=True,
+            physical_material="metal",
         )
 
         # Scene Dynamic Elements
@@ -139,7 +131,6 @@ class TorusScene(Scene):
             radius_multiplier=3,
             intensity_multiplier=0.8,
         )
-
 
         # Sound
 

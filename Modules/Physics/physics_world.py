@@ -204,7 +204,7 @@ class PhysicsWorld:
 
     def add_static_mesh(self, model_path, position=None, rotation=None,
                          scale=None, collision_mask=CollisionGroup.ALL,
-                         exclude_local_bounds=None):
+                         exclude_local_bounds=None, material=None):
         """Exact per-triangle collision built by loading model_path a
         second time through trimesh (cheap - no GPU upload, independent
         of model_loader.py's render-focused load), so level geometry
@@ -258,10 +258,10 @@ class PhysicsWorld:
             )
 
         shape = BulletTriangleMeshShape(tri_mesh, dynamic=False)
-        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_mesh")
+        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_mesh", material=material)
 
     def add_static_box(self, half_extents, position=None, rotation=None,
-                        collision_mask=CollisionGroup.ALL):
+                        collision_mask=CollisionGroup.ALL, material=None):
         """Cheaper approximate collider - an oriented box. Useful for
         simple blocking volumes (invisible walls, primitive-shaped
         props) where exact per-triangle collision isn't needed.
@@ -277,31 +277,33 @@ class PhysicsWorld:
         debris left at CollisionGroup.ALL shares STATIC/DYNAMIC/PLAYER
         bits but not TRIGGER's, so (debris.mask & box.mask) == 0."""
         shape = BulletBoxShape(to_physics_extent(half_extents))
-        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_box")
+        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_box", material=material)
 
     # ---------------------------------------------------------------
     # DYNAMIC COLLIDERS (mass > 0 - pushed around by the simulation)
     # ---------------------------------------------------------------
 
     def add_dynamic_box(self, half_extents, position=None, rotation=None,
-                         mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
+                         mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                         material=None):
         shape = BulletBoxShape(to_physics_extent(half_extents))
         return self._add_body(
             shape, mass, position, rotation, collision_mask, "dynamic_box",
-            gravity=gravity, kinematic=kinematic,
+            gravity=gravity, kinematic=kinematic, material=material,
         )
 
     def add_dynamic_sphere(self, radius, position=None, mass=1.0,
-                            collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
+                            collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                            material=None):
         shape = BulletSphereShape(float(radius))
         return self._add_body(
             shape, mass, position, None, collision_mask, "dynamic_sphere",
-            gravity=gravity, kinematic=kinematic,
+            gravity=gravity, kinematic=kinematic, material=material,
         )
 
     def add_dynamic_mesh(self, model_path, position=None, rotation=None,
                           scale=None, mass=1.0, collision_mask=CollisionGroup.ALL,
-                          gravity=True, kinematic=False):
+                          gravity=True, kinematic=False, material=None):
         """Convex-hull collision built from model_path's vertices -
         Bullet doesn't allow exact triangle-mesh shapes on moving
         bodies, so this is the closest a dynamic prop can get to its
@@ -314,7 +316,7 @@ class PhysicsWorld:
 
         return self._add_body(
             shape, mass, position, rotation, collision_mask, "dynamic_mesh",
-            gravity=gravity, kinematic=kinematic,
+            gravity=gravity, kinematic=kinematic, material=material,
         )
 
     # ---------------------------------------------------------------
@@ -335,25 +337,29 @@ class PhysicsWorld:
         return world_center, half_extents
 
     def add_static_box_from_bounds(self, model_path, position=None, rotation=None,
-                                    scale=None, collision_mask=CollisionGroup.ALL):
+                                    scale=None, collision_mask=CollisionGroup.ALL, material=None):
         """Like add_static_box, but derives half_extents (and re-centers
         for an off-origin mesh) automatically from model_path's own
         vertex bounds."""
         center, half_extents = self._bounds_center_and_half_extents(model_path, position, rotation, scale)
-        return self.add_static_box(half_extents, position=center, rotation=rotation, collision_mask=collision_mask)
+        return self.add_static_box(
+            half_extents, position=center, rotation=rotation, collision_mask=collision_mask, material=material,
+        )
 
     def add_dynamic_box_from_bounds(self, model_path, position=None, rotation=None, scale=None,
-                                     mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
+                                     mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                                     material=None):
         """Like add_dynamic_box, but derives half_extents automatically
         from model_path's own vertex bounds."""
         center, half_extents = self._bounds_center_and_half_extents(model_path, position, rotation, scale)
         return self.add_dynamic_box(
             half_extents, position=center, rotation=rotation, mass=mass,
-            collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
+            collision_mask=collision_mask, gravity=gravity, kinematic=kinematic, material=material,
         )
 
     def add_dynamic_sphere_from_bounds(self, model_path, position=None, scale=None,
-                                        mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
+                                        mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                                        material=None):
         """Like add_dynamic_sphere, but derives a radius automatically
         from model_path's own vertex bounds (the largest half-extent
         across the 3 axes - errs on the side of a slightly-too-big
@@ -362,14 +368,24 @@ class PhysicsWorld:
         radius = max(half_extents.x, half_extents.y, half_extents.z)
         return self.add_dynamic_sphere(
             radius, position=center, mass=mass, collision_mask=collision_mask,
-            gravity=gravity, kinematic=kinematic,
+            gravity=gravity, kinematic=kinematic, material=material,
         )
 
     # ---------------------------------------------------------------
 
-    def _add_body(self, shape, mass, position, rotation, collision_mask, name, gravity=True, kinematic=False):
+    def _add_body(self, shape, mass, position, rotation, collision_mask, name, gravity=True, kinematic=False,
+                   material=None):
         node = BulletRigidBodyNode(name)
         node.addShape(shape)
+
+        if material is not None:
+            # Read back by CharacterController._categorize_position()
+            # off whatever body the player's ground trace hits, so
+            # footstep sounds (see footstep_materials.py) can vary per
+            # surface without the movement code needing any notion of
+            # "which object is this" beyond the Bullet node it already
+            # traces against.
+            node.setPythonTag("physical_material", material)
 
         if kinematic:
             # A kinematic body is immovable by any physical force or

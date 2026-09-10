@@ -80,6 +80,7 @@ from panda3d.bullet import BulletBoxShape, BulletGhostNode
 from Modules.Physics.physics_world import (
     CollisionGroup, to_physics_pos, to_render_pos, to_physics_extent, to_render_vec,
 )
+from Modules.Audio.footstep_materials import get_footstep_volume
 
 # Time constant (seconds) for the vertical-only low-pass filter in
 # _on_pre_substep - see its comment. Short enough that stairs/slopes
@@ -115,6 +116,33 @@ _SURFACE_PUSHBACK = 0.001
 # Up to 4 distinct planes per tick before giving up and treating the
 # player as fully stuck (matches Source's TryPlayerMove numbumps).
 _MAX_BUMPS = 4
+
+# Direct port of the constants in Source SDK 2013's
+# CBasePlayer::UpdateStepSound / GetStepSoundVelocities /
+# SetStepSoundTime (game/shared/baseplayer_shared.cpp) - confirmed by
+# reading that file directly, not guessed. Source's footstep cadence is
+# a FIXED TIME interval between steps (a countdown timer, reset only
+# when a step actually fires), NOT distance-based - counterintuitive
+# for a "footstep" but that's genuinely how it works: speed only
+# affects which of two fixed intervals applies (walk vs run), not a
+# continuously-scaling rate. All speed values are Source's own
+# (velwalk/velrun in Source units/s = inches/s) converted to meters via
+# *0.0254, matching every other Source-unit conversion in this file.
+_STEP_MIN_SPEED_STAND = 90.0 * 0.0254   # velwalk - below this, no footsteps at all
+_STEP_RUN_SPEED_STAND = 220.0 * 0.0254  # velrun - bWalking = speed < velrun
+_STEP_MIN_SPEED_CROUCH = 60.0 * 0.0254
+_STEP_RUN_SPEED_CROUCH = 80.0 * 0.0254
+
+_STEP_INTERVAL_WALK = 0.4   # STEPSOUNDTIME_NORMAL, bWalking ? 400 : 300 (ms -> s)
+_STEP_INTERVAL_RUN = 0.3
+_STEP_INTERVAL_CROUCH_EXTRA = 0.1  # SetStepSoundTime's "+= 100" while FL_DUCKING
+
+# Per-surface walk/run volumes now come from footstep_materials.
+# get_footstep_volume (Source's own psurface->game.material switch in
+# UpdateStepSound), not a flat constant here. Ducking multiplies
+# whatever that returns by 0.65, exactly like UpdateStepSound's own
+# "if (FL_DUCKING) fvol *= 0.65".
+_STEP_VOLUME_DUCK_MULT = 0.65
 
 
 class CharacterController:
@@ -251,6 +279,14 @@ class CharacterController:
         self._crouch_amount = 0.0  # 0 = standing, 1 = fully crouched (eased, see get_eye_offset)
         self._grounded = False
         self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
+        self._ground_material = None
+
+        # Footstep cadence bookkeeping - see _update_footsteps and
+        # pop_footstep(). Mirrors Source's m_flStepSoundTime: counts
+        # down to 0, a step can only fire once it reaches 0, then it's
+        # reset to the next interval.
+        self._step_sound_timer = 0.0
+        self._pending_footstep = None
 
         # Last completed substep's (smoothed - see _on_pre_substep)
         # render-space position, for get_position() to interpolate
@@ -280,7 +316,35 @@ class CharacterController:
         """Source's CGameMovement::CategorizePosition: a short, fixed-
         distance downward trace (independent of velocity) to determine
         ground contact and the ground normal, run BEFORE movement each
-        tick using last tick's settled position."""
+        tick using last tick's settled position.
+
+        Skips the trace entirely (unconditionally airborne) whenever
+        velocity.y is positive - confirmed as a real, reproducible bug
+        without this: a single tick's rise (jump_speed * dt) can be
+        smaller than _GROUND_TRACE_DISTANCE, so the very next tick's
+        trace re-detects the floor and sets grounded back to True
+        immediately after a jump. Since the landing-velocity-reset in
+        _on_pre_substep only clears NEGATIVE velocity, that leaves the
+        hull re-grounded while still nominally carrying jump_speed -
+        and because _step_slide_move's grounded branch re-settles the
+        hull onto the floor every tick regardless of velocity's sign,
+        the jump silently goes nowhere: velocity is genuinely
+        jump_speed the whole time, but the hull never actually leaves
+        the ground. Rising can only ever mean "airborne, most likely
+        mid-jump" in this system in the first place - grounded movement
+        always holds velocity.y at exactly 0 or lets gravity pull it
+        negative, nothing here ever produces an ambiguous small
+        positive value the way a real trace-based engine occasionally
+        does from ramps/bumps - so there's no real ambiguity being
+        papered over by skipping the trace here. This mirrors Source's
+        own CategorizePosition, which skips ground detection outright
+        above NON_JUMP_VELOCITY for exactly this reason."""
+        if self.velocity.y > 0.0:
+            self._grounded = False
+            self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
+            self._ground_material = None
+            return
+
         pos = to_render_pos(self.node_path.getPos())
         probe_to = glm.vec3(pos.x, pos.y - _GROUND_TRACE_DISTANCE, pos.z)
         result = self._sweep(self._current_shape, pos, probe_to)
@@ -289,9 +353,21 @@ class CharacterController:
             if normal.y >= self._max_slope_cos:
                 self._grounded = True
                 self._ground_normal = normal
+                # Read back whatever material the hit body was tagged
+                # with (see PhysicsWorld._add_body's material param) so
+                # footstep sounds can vary per surface - None (untagged,
+                # or no hit body for some reason) falls back to
+                # footstep_materials.DEFAULT_FOOTSTEP_MATERIAL.
+                hit_node = result.getNode()
+                self._ground_material = (
+                    hit_node.getPythonTag("physical_material")
+                    if hit_node is not None and hit_node.hasPythonTag("physical_material")
+                    else None
+                )
                 return
         self._grounded = False
         self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
+        self._ground_material = None
 
     @staticmethod
     def _clip_velocity(vel, normal, overbounce=1.0):
@@ -749,6 +825,53 @@ class CharacterController:
             self._air_accelerate(wishdir, wishspeed, self.air_accel, dt)
 
         self._step_slide_move(dt)
+
+        self._update_footsteps(dt)
+
+    def _update_footsteps(self, dt):
+        """Direct port of Source's CBasePlayer::UpdateStepSound (see the
+        module-level constants above for exactly where these numbers
+        come from). The timer counts down every tick regardless of
+        movement state (matching UpdateStepSound running unconditionally
+        at the top before any of its early-outs); a step can only fire
+        once it reaches 0, is gated by a separate minimum-speed check
+        (moving_fast_enough in the original), and resets the timer to
+        the next interval - it does NOT reset just because the player
+        stopped or went airborne, matching Source exactly (there's no
+        such reset in UpdateStepSound either)."""
+        if self._step_sound_timer > 0.0:
+            self._step_sound_timer = max(self._step_sound_timer - dt, 0.0)
+
+        if not self._grounded:
+            return
+
+        horiz_speed = math.hypot(self.velocity.x, self.velocity.z)
+        min_speed = _STEP_MIN_SPEED_CROUCH if self._is_crouched else _STEP_MIN_SPEED_STAND
+        run_speed = _STEP_RUN_SPEED_CROUCH if self._is_crouched else _STEP_RUN_SPEED_STAND
+
+        if self._step_sound_timer > 0.0 or horiz_speed < min_speed:
+            return
+
+        walking = horiz_speed < run_speed
+        interval = _STEP_INTERVAL_WALK if walking else _STEP_INTERVAL_RUN
+        volume = get_footstep_volume(self._ground_material, walking)
+        if self._is_crouched:
+            interval += _STEP_INTERVAL_CROUCH_EXTRA
+            volume *= _STEP_VOLUME_DUCK_MULT
+
+        self._step_sound_timer = interval
+        self._pending_footstep = (self._ground_material, volume)
+
+    def pop_footstep(self):
+        """Returns (material, volume) for a footstep that fired since
+        the last call, or None if none did - call once per frame (see
+        app.py) and forward to Scene.play_footstep_sound. Consumes the
+        event (returns None until the next one fires) so the same
+        footstep is never played twice even if this is polled more than
+        once before the next physics tick runs."""
+        event = self._pending_footstep
+        self._pending_footstep = None
+        return event
 
     def get_position(self):
         """Render-space glm.vec3 - the hull's current center position

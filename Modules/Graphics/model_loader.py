@@ -118,21 +118,42 @@ def _upload_texture(ctx, img):
     tex.repeat_x = tex.repeat_y = True
     return tex
 
-def _read_gltf_uv1(path):
-    """Reads the TEXCOORD_1 (lightmap UV) accessor from the first mesh
-    primitive in the glb - trimesh only exposes TEXCOORD_0, so this
-    goes straight to the raw glTF data via pygltflib instead.
+def _read_gltf_uv1(path, node_order):
+    """Reads the TEXCOORD_1 (lightmap UV) accessor from each node in
+    node_order and concatenates them in that same order - trimesh only
+    exposes TEXCOORD_0, so this goes straight to the raw glTF data via
+    pygltflib instead.
 
-    Scoped to the common case: a single mesh, single primitive, with a
-    plain non-sparse VEC2 float accessor (what Blender's glTF exporter
-    produces for a second UV map). Multi-node/multi-primitive scenes
-    aren't handled - matching trimesh's flattened geometry order against
-    pygltflib's raw mesh/primitive order isn't a relationship that can
-    be trusted to line up, so this returns None rather than guessing.
-    Also requires the lightmap UV to actually be the *second* UV map in
+    node_order MUST be the exact same node-name sequence
+    _flatten_scene concatenated vertices in (see load_glb, which
+    threads it through from there) - matching pygltflib's raw node/
+    mesh data against trimesh's flattened vertex order isn't a
+    relationship that could be trusted to line up by re-deriving it
+    independently here, so this only ever consumes an order someone
+    else already established, rather than guessing at one. Originally
+    this only handled a single-mesh, single-primitive glb at all
+    (bailing out on anything else) - confirmed as the reason a model
+    like plane.glb (a real floor mesh plus 2 collision-only helper
+    meshes _flatten_scene already excludes from rendering - see
+    COLLISION_ONLY_PREFIX) silently lost its lightmap: the file has 3
+    primitives in total, so the old blanket "exactly 1 primitive or
+    bail" check rejected it outright even though the ONE node that
+    actually gets rendered has perfectly good TEXCOORD_1 data. Per-node
+    lookup by name sidesteps that - a node not being rendered was never
+    actually a reason to doubt the rendered one's own UVs.
+
+    Each node must still resolve to a single-primitive mesh with a
+    plain non-sparse VEC2 float TEXCOORD_1 accessor (what Blender's
+    glTF exporter produces for a second UV map) - multiple primitives
+    under one node still isn't handled, same "don't guess" reasoning as
+    before, just correctly scoped to nodes that matter now. Also still
+    requires the lightmap UV to actually be the *second* UV map in
     Blender (TEXCOORD_1 is whichever UV map is second in the mesh's UV
-    map list at export time, not anything named-based).
-    """
+    map list at export time, not anything named-based). Returns None -
+    caller falls back to "no lightmap UV" - the moment ANY node in
+    node_order fails this, since a partial lightmap UV set covering
+    only some of the rendered geometry would misalign texture coords
+    across the rest."""
     try:
         from pygltflib import GLTF2
     except ImportError:
@@ -145,19 +166,28 @@ def _read_gltf_uv1(path):
 
     try:
         gltf = GLTF2().load(str(path))
-        prims = [p for m in (gltf.meshes or []) for p in m.primitives]
-        if len(prims) != 1: return None
-
-        idx = getattr(prims[0].attributes, "TEXCOORD_1", None)
-        if idx is None: return None
-
-        acc = gltf.accessors[idx]
-        if acc.sparse or acc.componentType != 5126 or acc.type != "VEC2": return None
-
-        view = gltf.bufferViews[acc.bufferView]
-        offset = (view.byteOffset or 0) + (acc.byteOffset or 0)
+        nodes_by_name = {n.name: n for n in (gltf.nodes or []) if n.name}
         blob = gltf.binary_blob()
-        return np.frombuffer(blob, dtype="<f4", count=acc.count * 2, offset=offset).reshape(-1, 2).copy()
+
+        all_uv1 = []
+        for name in node_order:
+            node = nodes_by_name.get(name)
+            if node is None or node.mesh is None: return None
+
+            mesh = gltf.meshes[node.mesh]
+            if len(mesh.primitives) != 1: return None
+
+            idx = getattr(mesh.primitives[0].attributes, "TEXCOORD_1", None)
+            if idx is None: return None
+
+            acc = gltf.accessors[idx]
+            if acc.sparse or acc.componentType != 5126 or acc.type != "VEC2": return None
+
+            view = gltf.bufferViews[acc.bufferView]
+            offset = (view.byteOffset or 0) + (acc.byteOffset or 0)
+            all_uv1.append(np.frombuffer(blob, dtype="<f4", count=acc.count * 2, offset=offset).reshape(-1, 2).copy())
+
+        return np.concatenate(all_uv1, axis=0) if all_uv1 else None
     except Exception as e:
         print(f"[model_loader] Failed to read lightmap UV from {path}: {e}")
         return None
@@ -223,8 +253,16 @@ def _get_vertex_normals(mesh, vertices, faces, recompute_normals, crease_angle_d
     return _compute_vertex_normals(vertices, faces, crease_angle_deg)
 
 def _flatten_scene(scene):
-    if not isinstance(scene, trimesh.Scene): return scene
+    """Returns (mesh_or_scene, node_order): node_order is the exact
+    sequence of node names actually concatenated into the combined mesh
+    (collision-only nodes excluded), so callers needing to re-derive
+    per-vertex data from the raw glTF (e.g. lightmap TEXCOORD_1, which
+    trimesh itself doesn't expose) can look nodes up by name in that
+    same order. For a non-Scene input there's no per-node breakdown, so
+    node_order comes back empty."""
+    if not isinstance(scene, trimesh.Scene): return scene, []
     all_vertices, all_faces, all_normals, all_uvs, representative, vertex_offset = [], [], [], [], None, 0
+    used_node_names = []
     for node_name in scene.graph.nodes_geometry:
         if _is_collision_only_node(node_name): continue
         transform, geom_name = scene.graph[node_name]
@@ -242,14 +280,15 @@ def _flatten_scene(scene):
 
         if representative is None: representative = geom
         vertex_offset += len(geom.vertices)
+        used_node_names.append(node_name)
 
-    if not all_vertices: return None
+    if not all_vertices: return None, []
     combined = trimesh.Trimesh(vertices=np.concatenate(all_vertices), faces=np.concatenate(all_faces), process=False)
     if all(n is not None for n in all_normals): combined.vertex_normals = np.concatenate(all_normals, axis=0)
     if representative is not None:
         combined.visual = representative.visual
         if all(u is not None for u in all_uvs): combined.visual.uv = np.concatenate(all_uvs, axis=0)
-    return combined
+    return combined, used_node_names
 
 def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG):
     path = Path(filepath)
@@ -257,14 +296,14 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
     buffers, vao, tex_obj, mr_tex_obj = [], None, None, None
     try:
         scene = trimesh.load(str(path), process=False)
-        mesh = _flatten_scene(scene)
+        mesh, node_order = _flatten_scene(scene)
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0: raise RuntimeError("Invalid or empty mesh.")
 
         vertices, faces = np.asarray(mesh.vertices, dtype="f4"), np.asarray(mesh.faces, dtype="i4")
         normals = _get_vertex_normals(mesh, vertices, faces, recompute_normals, crease_angle_deg)
         uvs = _compute_uvs(mesh, len(vertices))
 
-        lightmap_uvs = _read_gltf_uv1(path)
+        lightmap_uvs = _read_gltf_uv1(path, node_order) if node_order else None
         has_lightmap_uv = lightmap_uvs is not None and len(lightmap_uvs) == len(vertices)
         if not has_lightmap_uv: lightmap_uvs = np.zeros((len(vertices), 2), dtype="f4")
 

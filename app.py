@@ -3,6 +3,100 @@ import pygame
 import os
 import ctypes
 import glm
+
+
+def _chdir_for_frozen_build():
+    """PyInstaller's --onefile mode extracts --add-data bundles (this
+    project's Assets folder included) to a temporary directory at
+    startup, exposed as sys._MEIPASS - NOT the working directory the
+    exe was launched from, and NOT the exe's own folder either. Every
+    asset path in this codebase (torus_scene.py's model/texture/audio
+    paths, etc.) is a plain relative string like "Assets/Models/...",
+    which only resolves correctly if the process's current working
+    directory happens to BE that extraction folder. Since none of
+    those call sites can be reached before this runs (they're all
+    behind imports/calls below), chdir'ing here once, before anything
+    else executes, makes every existing relative path keep working
+    unmodified instead of touching dozens of individual asset-loading
+    call sites. Below Assets: this exists only for the lifetime of the
+    process, so anything that writes there at runtime (e.g.
+    bake_static_lighting's lightmap cache) won't persist between runs
+    of a --onefile exe - that's a separate, real limitation of
+    --onefile for a cache that's meant to survive across runs, not
+    something this chdir fixes or is trying to fix."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        os.chdir(sys._MEIPASS)
+
+
+_chdir_for_frozen_build()
+
+
+def _request_high_performance_gpu():
+    """Nvidia Optimus / AMD dynamic-switchable-graphics laptops default
+    an arbitrary .exe to the low-power integrated GPU. This registry
+    key is a real, documented, vendor-neutral mechanism (Windows 10
+    Creators Update+) - the exact one Settings > System > Display >
+    Graphics writes when a user manually sets an app to "High
+    performance" - but confirmed in practice that it's specifically
+    designed for/reliably honored by DXGI (Direct3D) applications, NOT
+    a raw OpenGL context created via WGL (which is what this project's
+    moderngl/pygame-ce rendering does) - see _load_gpu_hint_dll below
+    for the mechanism that actually works for OpenGL. Kept here anyway
+    as a harmless belt-and-suspenders extra: costs nothing, and covers
+    any future D3D-based rendering path or driver version where it
+    does get honored.
+
+    Keyed by the exact exe PATH (sys.executable - still the actual
+    launched exe even under --onefile, not the temporary _MEIPASS
+    extraction folder), so this only ever affects this one built exe,
+    never other unrelated programs. Only runs for a frozen/built exe,
+    not a dev `python app.py` run - a dev run's sys.executable is
+    python.exe itself, and forcing a GPU preference there would apply
+    to every OTHER Python script run through that same interpreter
+    too, not just this project."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import winreg
+        exe_path = os.path.abspath(sys.executable)
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\DirectX\UserGpuPreference",
+            0, winreg.KEY_SET_VALUE,
+        )
+        with key:
+            # "GpuPreference=2;" is Windows' own literal value format
+            # for this key (2 = high performance, 1 = power saving, 0 =
+            # let the system/driver decide) - exactly what the
+            # Settings UI itself writes when a user picks "High
+            # performance" by hand.
+            winreg.SetValueEx(key, exe_path, 0, winreg.REG_SZ, "GpuPreference=2;")
+    except OSError as e:
+        print(f"Warning: couldn't set GPU preference in registry: {e}")
+
+
+_request_high_performance_gpu()
+
+# NOTE on Optimus/switchable-graphics GPU selection for OpenGL: the
+# registry hint above isn't reliably honored for a raw OpenGL context
+# (moderngl/pygame-ce, via WGL) the way it is for Direct3D/DXGI apps.
+# The mechanism that DOES work is exporting two symbols -
+# NvOptimusEnablement and AmdPowerXpressRequestHighPerformance - but
+# confirmed (see build_tools/pyinstaller_bootloader/README.md) that
+# these MUST be in the actual .exe's own PE export table specifically;
+# a DLL loaded at runtime does nothing, regardless of how early it's
+# loaded here - an earlier version of this file tried exactly that
+# (a companion gpu_hint.dll) and it had no effect. Since PyInstaller's
+# stock bootloader is what becomes app.exe and has no exports of its
+# own, the actual fix lives one level down the toolchain: a patched
+# bootloader with those two symbols added to its source and rebuilt,
+# installed into the local PyInstaller package - see
+# build_tools/pyinstaller_bootloader/README.md for what was changed
+# and how to reproduce it (e.g. after reinstalling/upgrading
+# PyInstaller, which would silently restore the stock, unpatched
+# bootloader). Nothing in this Python file can express that fix -
+# there is no per-build-invocation flag or Python-level hook for it.
+
 from Modules.Window.window import WindowManager
 from Modules.Camera.camera import Camera
 from Modules.Scenes.torus_scene import TorusScene
@@ -10,20 +104,23 @@ from Modules.Physics.character_controller import CharacterController
 
 
 def load_steam_api_dll():
-    """Finds and pre-loads steam_api64.dll globally (RTLD_GLOBAL) before
-    any module imports py_steam_net, which links against it. No
-    hardcoded machine-specific paths - just sensible, portable
-    candidate locations, plus an environment variable escape hatch for
-    anything unusual (a packaged build laying it out differently, etc.)."""
     if sys.platform != "win32":
         return
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    candidates = [
-        os.path.join(script_dir, "steam_api64.dll"),
-        os.path.join(os.getcwd(), "steam_api64.dll"),
-    ]
+    candidates = []
+
+    # Check PyInstaller's temporary extraction folder first if frozen
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(sys._MEIPASS, "steam_api64.dll"))
+
+    candidates.extend(
+        [
+            os.path.join(script_dir, "steam_api64.dll"),
+            os.path.join(os.getcwd(), "steam_api64.dll"),
+        ]
+    )
 
     env_override = os.environ.get("STEAM_API_DLL_PATH")
     if env_override:
@@ -33,18 +130,14 @@ def load_steam_api_dll():
         if os.path.exists(path):
             try:
                 ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-                os.add_dll_directory(os.path.dirname(path))
+                if hasattr(os, "add_dll_directory"):
+                    os.add_dll_directory(os.path.dirname(path))
                 print(f"Pre-loaded steam_api64.dll from: {path}")
                 return
             except Exception as e:
                 print(f"Found steam_api64.dll at {path} but failed to load it: {e}")
 
-    print(
-        "Warning: steam_api64.dll not found next to app.py or in the "
-        "current working directory. Networking will likely fail to "
-        "import py_steam_net. Set the STEAM_API_DLL_PATH environment "
-        "variable to point at it directly if it's somewhere else."
-    )
+    print("Warning: steam_api64.dll not found.")
 
 
 # Pre-load steam_api64.dll globally before any modules import py_steam_net
@@ -55,7 +148,7 @@ from Modules.Networking.network_manager import NetworkManager
 
 def main():
     print("Yo wsg")
-    window = WindowManager(800, 600, "Pygame-ce Engine - Scene Switcher")
+    window = WindowManager(800, 600, "RatWar")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
 
     # Load initial scenes dictionary
@@ -72,7 +165,12 @@ def main():
     # ~46.3 degrees, fit to the actual tread-nosing line rather than a
     # shallower approximation, so it needs a hair more headroom to count
     # as walkable floor instead of a wall.
-    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0), height=1.5, max_slope_degrees=47.0)
+    player = CharacterController(
+        current_scene.physics,
+        position=(0.0, 2.0, 3.0),
+        height=1.5,
+        max_slope_degrees=47.0,
+    )
 
     net_mgr = NetworkManager(camera)
 
@@ -113,7 +211,14 @@ def main():
         # torus) and step physics - camera position then follows
         # wherever physics moved the player capsule to this frame.
         current_scene.update(dt)
-        camera.position = player.get_position() + glm.vec3(0.0, player.get_eye_offset(), 0.0)
+        camera.position = player.get_position() + glm.vec3(
+            0.0, player.get_eye_offset(), 0.0
+        )
+
+        footstep = player.pop_footstep()
+        if footstep is not None:
+            material, volume = footstep
+            current_scene.play_footstep_sound(material, player.get_position(), volume=volume)
 
         current_scene.update_audio(camera)
 

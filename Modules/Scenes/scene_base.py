@@ -7,6 +7,7 @@ import glm
 import numpy as np
 
 from Modules.Audio.sound_manager import SoundManager
+from Modules.Audio.footstep_materials import get_footstep_sound
 from Modules.Physics.physics_world import PhysicsWorld, CollisionGroup, to_physics_vec
 from Modules.Graphics.pbr_shader import (
     create_program,
@@ -190,7 +191,7 @@ class Scene:
     def add_static(self, model_path, position=None, rotation=None, scale=None,
                     transform=None, metallic=None, roughness=None,
                     collision=False, collision_shape="mesh", collision_mask=CollisionGroup.ALL,
-                    collision_exclude_local_bounds=None):
+                    collision_exclude_local_bounds=None, physical_material=None):
         """collision=True registers a collider for this object in
         self.physics, so a CharacterController (or a dynamic object
         with its own collision=True) can stand/collide on it.
@@ -205,7 +206,14 @@ class Scene:
         collision_shape="mesh" - see PhysicsWorld.add_static_mesh's
         exclude_local_bounds docstring; carves a region out of the mesh
         collision (e.g. one being replaced by a separate simplified
-        collider added alongside this call)."""
+        collider added alongside this call). physical_material: a name
+        like "dirt"/"concrete"/"wood" (see Modules/Audio/
+        footstep_materials.py for the full set, derived from Assets/
+        Audio/footsteps' filenames) - tags this object's collider so
+        CharacterController's footstep sounds pick the right sample set
+        while standing on it. None falls back to
+        footstep_materials.DEFAULT_FOOTSTEP_MATERIAL. Only meaningful
+        alongside collision=True."""
         model = self._load_object(model_path)
         if model is None:
             return None
@@ -229,19 +237,26 @@ class Scene:
         self.mark_static_dirty()
 
         if collision:
-            self._add_static_collision(model_path, model, collision_shape, collision_mask, collision_exclude_local_bounds)
+            self._add_static_collision(
+                model_path, model, collision_shape, collision_mask,
+                collision_exclude_local_bounds, physical_material,
+            )
 
         return model
 
-    def _add_static_collision(self, model_path, model, collision_shape, collision_mask, exclude_local_bounds=None):
+    def _add_static_collision(self, model_path, model, collision_shape, collision_mask,
+                               exclude_local_bounds=None, physical_material=None):
         pos, rot, scl = self._collision_transform_args(model)
         if collision_shape == "mesh":
             self.physics.add_static_mesh(
                 model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
-                exclude_local_bounds=exclude_local_bounds,
+                exclude_local_bounds=exclude_local_bounds, material=physical_material,
             )
         elif collision_shape == "box":
-            self.physics.add_static_box_from_bounds(model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask)
+            self.physics.add_static_box_from_bounds(
+                model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
+                material=physical_material,
+            )
         else:
             raise ValueError(f"Unknown collision_shape {collision_shape!r} for add_static - use 'mesh' or 'box'.")
 
@@ -268,7 +283,8 @@ class Scene:
                      scale=glm.vec3(1.0), rot_speed=0.0, transform=None,
                      metallic=None, roughness=None,
                      collision=False, collision_shape="box", mass=1.0,
-                     collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
+                     collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                     physical_material=None):
         """collision=True hands this object over to self.physics as a
         rigid body (mass, in kg-equivalent units) - from then on its
         position/rotation are driven by the physics simulation every
@@ -324,12 +340,14 @@ class Scene:
         self.dynamic_objects.append(model)
 
         if collision:
-            self._add_dynamic_collision(model_path, model, collision_shape, mass, collision_mask, gravity, kinematic)
+            self._add_dynamic_collision(
+                model_path, model, collision_shape, mass, collision_mask, gravity, kinematic, physical_material,
+            )
 
         return model
 
     def _add_dynamic_collision(self, model_path, model, collision_shape, mass, collision_mask,
-                                gravity=True, kinematic=False):
+                                gravity=True, kinematic=False, physical_material=None):
         pos, rot, scl = self._collision_transform_args(model)
         rot_speed = model.get("rot_speed", 0.0)
 
@@ -361,16 +379,19 @@ class Scene:
             body = self.physics.add_dynamic_box_from_bounds(
                 model_path, position=pos, rotation=rot, scale=scl, mass=mass,
                 collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
+                material=physical_material,
             )
         elif collision_shape == "sphere":
             body = self.physics.add_dynamic_sphere_from_bounds(
                 model_path, position=pos, scale=scl, mass=mass,
                 collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
+                material=physical_material,
             )
         elif collision_shape == "mesh":
             body = self.physics.add_dynamic_mesh(
                 model_path, position=pos, rotation=rot, scale=scl, mass=mass,
                 collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
+                material=physical_material,
             )
         else:
             raise ValueError(f"Unknown collision_shape {collision_shape!r} for add_dynamic - use 'box', 'sphere', or 'mesh'.")
@@ -675,6 +696,29 @@ class Scene:
         scene.sound_manager.add_sound(...) to add one, not a method on
         Scene (see Modules/Audio/sound_manager.py)."""
         self.sound_manager.update(camera)
+
+    def play_footstep_sound(self, material, position, volume=1.0):
+        """One-shot footstep sample for `material` (see Modules/Audio/
+        footstep_materials.py - falls back to
+        footstep_materials.DEFAULT_FOOTSTEP_MATERIAL if material is
+        None or unrecognized), played as a normal positional emitter
+        through self.sound_manager - same distance falloff/panning
+        every other 3D sound in the scene gets (see SoundManager.update),
+        so footsteps attenuate with distance exactly like everything
+        else rather than needing separate logic here.
+
+        Intended to be driven by CharacterController.pop_footstep() -
+        see app.py's main loop - once per footstep, not once per frame.
+        loop=False means SoundManager.update automatically drops the
+        emitter once playback finishes, so nothing here needs to track
+        or manually destroy the sound afterward."""
+        sound_path = get_footstep_sound(material)
+        if sound_path is None:
+            return None
+        return self.sound_manager.add_sound(
+            sound_path, position, volume=volume,
+            min_distance=1.0, max_distance=12.0, loop=False,
+        )
 
     # =============================================================
     # LIGHTMAP BAKING

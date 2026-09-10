@@ -1,0 +1,1 @@
+python -m PyInstaller --noconsole --onefile --name "RatWar" --icon "Assets\icon\icon.ico" --add-binary "steam_api64.dll;." --add-data "Assets;Assets" app.py
