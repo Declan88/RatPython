@@ -189,7 +189,8 @@ class Scene:
 
     def add_static(self, model_path, position=None, rotation=None, scale=None,
                     transform=None, metallic=None, roughness=None,
-                    collision=False, collision_shape="mesh", collision_mask=CollisionGroup.ALL):
+                    collision=False, collision_shape="mesh", collision_mask=CollisionGroup.ALL,
+                    collision_exclude_local_bounds=None):
         """collision=True registers a collider for this object in
         self.physics, so a CharacterController (or a dynamic object
         with its own collision=True) can stand/collide on it.
@@ -200,7 +201,11 @@ class Scene:
         bounds - fine for simple blocking volumes. collision_mask: see
         CollisionGroup / physics_world.py's module docstring for the
         collision-filtering model - the default (ALL) collides with
-        everything."""
+        everything. collision_exclude_local_bounds: only for
+        collision_shape="mesh" - see PhysicsWorld.add_static_mesh's
+        exclude_local_bounds docstring; carves a region out of the mesh
+        collision (e.g. one being replaced by a separate simplified
+        collider added alongside this call)."""
         model = self._load_object(model_path)
         if model is None:
             return None
@@ -224,14 +229,17 @@ class Scene:
         self.mark_static_dirty()
 
         if collision:
-            self._add_static_collision(model_path, model, collision_shape, collision_mask)
+            self._add_static_collision(model_path, model, collision_shape, collision_mask, collision_exclude_local_bounds)
 
         return model
 
-    def _add_static_collision(self, model_path, model, collision_shape, collision_mask):
+    def _add_static_collision(self, model_path, model, collision_shape, collision_mask, exclude_local_bounds=None):
         pos, rot, scl = self._collision_transform_args(model)
         if collision_shape == "mesh":
-            self.physics.add_static_mesh(model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask)
+            self.physics.add_static_mesh(
+                model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
+                exclude_local_bounds=exclude_local_bounds,
+            )
         elif collision_shape == "box":
             self.physics.add_static_box_from_bounds(model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask)
         else:

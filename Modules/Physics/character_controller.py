@@ -119,12 +119,12 @@ _MAX_BUMPS = 4
 
 class CharacterController:
     def __init__(self, physics_world, position=(0.0, 2.0, 0.0), radius=0.4,
-                 height=1.8, step_height=0.4, ground_speed=4.0, sprint_speed=7.0,
+                 height=1.8, step_height=.5, ground_speed=4.0, sprint_speed=7.0,
                  ground_accel=10.0, air_accel=10.0, friction=4.0, stop_speed=1.0,
                  jump_speed=6.0, collision_mask=CollisionGroup.ALL,
                  crouch_height_ratio=0.5, crouch_speed_multiplier=0.34,
                  crouch_transition_time=0.25, eye_height=None, crouch_eye_height=None,
-                 max_slope_degrees=45.57, gravity=None):
+                 max_slope_degrees=75, gravity=None):
         """ground_speed/sprint_speed: target ground move speed (m/s),
         walk vs. sprint (see set_sprinting). ground_accel/air_accel:
         sv_accelerate/sv_airaccelerate-equivalent - higher snaps to
@@ -165,6 +165,11 @@ class CharacterController:
         self.collision_mask = collision_mask
         self.gravity = float(gravity) if gravity is not None else physics_world.world.getGravity().length()
         self._max_slope_cos = math.cos(math.radians(max_slope_degrees))
+        # Worst-case rise-per-run of any surface still classified as
+        # walkable floor - see _step_slide_move's settle_distance, which
+        # scales with this so a fast-moving tick's settle sweep can
+        # still reach a steep-but-walkable ramp below.
+        self._max_slope_tan = math.tan(math.radians(max_slope_degrees))
         self._physics_world = physics_world
 
         # sweepTestClosest() takes a bare shape + transform, not a body
@@ -369,26 +374,97 @@ class CharacterController:
         if self._grounded:
             up_target = glm.vec3(start_pos.x, start_pos.y + self.step_height, start_pos.z)
             up_result = self._sweep(self._current_shape, start_pos, up_target)
-            if up_result.hasHit():
+            # Only a genuine ceiling overhead (a surface actually facing
+            # DOWN into the sweep, normal.y meaningfully negative) should
+            # clamp the step height - a normal near/above 0 means the
+            # sweep grazed a wall the hull is already pressed against
+            # sideways (e.g. a stair riser the flat move above just got
+            # blocked by, leaving the hull touching it within Bullet's
+            # collision margin). That's not something purely vertical
+            # motion actually runs into, but Bullet's sweep test can
+            # still report a spurious near-zero-fraction hit against it
+            # from an already-touching start (the same class of phantom
+            # contact __init__'s _sweep_mask comment describes for the
+            # player's own ghost) - treating every such hit as a real
+            # ceiling collapsed raised_pos back to start_pos every tick,
+            # permanently refusing to step up anything the player was
+            # already flush against, stairs included.
+            if up_result.hasHit() and to_render_vec(up_result.getHitNormal()).y < -0.1:
                 raised_pos = start_pos + glm.vec3(0.0, self.step_height, 0.0) * max(up_result.getHitFraction() - 0.01, 0.0)
             else:
                 raised_pos = up_target
 
             step_pos, step_vel = self._try_move(self._current_shape, raised_pos, start_vel, dt)
 
-            settle_distance = self.step_height + 0.05
+            # A fixed settle_distance (just step_height + a small pad)
+            # is enough to reach back down to a walkable ramp/stairs
+            # surface at ordinary walking speed, but not necessarily at
+            # sprint: the horizontal distance _try_move just covered
+            # (raised_pos -> step_pos) needs a proportionally bigger
+            # vertical reach to re-find a STEEP walkable surface the
+            # faster that horizontal distance is, since a steep ramp
+            # drops height fast per unit of forward travel. Undershoot
+            # this and the down-sweep below finds nothing on a perfectly
+            # fine descending ramp/staircase purely because the player
+            # is moving fast enough that a single tick's forward stride
+            # outruns the fixed reach - confirmed as exactly why running
+            # down stairs/ramps (but not walking down them) fell off
+            # instead of following the slope down. Scaling by the
+            # steepest slope this controller still considers walkable
+            # (_max_slope_tan) covers any legitimate floor, however
+            # steep, regardless of how far a single tick's stride is.
+            horiz_dx = step_pos.x - raised_pos.x
+            horiz_dz = step_pos.z - raised_pos.z
+            horiz_dist = math.sqrt(horiz_dx * horiz_dx + horiz_dz * horiz_dz)
+            settle_distance = self.step_height + horiz_dist * self._max_slope_tan + 0.05
             down_target = glm.vec3(step_pos.x, step_pos.y - settle_distance, step_pos.z)
             down_result = self._sweep(self._current_shape, step_pos, down_target)
-            if down_result.hasHit():
+            # A step is only valid if it actually lands back on walkable
+            # ground - without this, sliding past a wall above
+            # step_height's reach (grazing a corner, or a wall shorter
+            # than the player but taller than step_height) leaves
+            # settled_pos floating at the raised height with no floor
+            # under it at all, which still "covers more ground" than the
+            # correctly-blocked flat attempt and gets picked - reading as
+            # the player boosting up onto/over solid walls.
+            if down_result.hasHit() and to_render_vec(down_result.getHitNormal()).y >= self._max_slope_cos:
                 settled_pos = step_pos + glm.vec3(0.0, -settle_distance, 0.0) * down_result.getHitFraction()
-            else:
-                settled_pos = step_pos
 
-            flat_dist_sq = (flat_pos.x - start_pos.x) ** 2 + (flat_pos.z - start_pos.z) ** 2
-            step_dist_sq = (settled_pos.x - start_pos.x) ** 2 + (settled_pos.z - start_pos.z) ** 2
+                flat_dist_sq = (flat_pos.x - start_pos.x) ** 2 + (flat_pos.z - start_pos.z) ** 2
+                step_dist_sq = (settled_pos.x - start_pos.x) ** 2 + (settled_pos.z - start_pos.z) ** 2
 
-            if step_dist_sq > flat_dist_sq + 1e-9:
-                final_pos, final_vel = settled_pos, step_vel
+                # flat_pos comes from a pure-velocity sweep with no
+                # vertical component (vel.y is 0 while grounded - see
+                # _on_pre_substep's landed/gravity handling just before
+                # this runs). Whenever NEITHER attempt is obstructed -
+                # the overwhelmingly common case while walking - flat and
+                # stepped cover essentially the SAME horizontal distance
+                # (the horizontal half of _try_move doesn't care whether
+                # it started raised or not), so step_dist_sq is a tie
+                # with flat_dist_sq, not strictly greater. A strict ">"
+                # comparison breaks that tie in flat's favor - which,
+                # on any downslope steeper than one tick's horizontal
+                # travel, means picking the candidate that stayed at the
+                # OLD height and sailed clean through the open air past
+                # the edge of the floor, unobstructed (nothing there to
+                # clip _try_move's sweep against), instead of the one
+                # that actually settled onto the real ground below. That
+                # then only gets caught by luck (_categorize_position's
+                # short ground probe still happening to graze something)
+                # for as many ticks as the gap stays within its reach,
+                # widening a little further each time flat wins the tie
+                # again, until it finally misses outright and the player
+                # drops like a stone - exactly the "doesn't stay on the
+                # stairs going down" symptom. Since a settled_pos here
+                # has already been confirmed to land on real walkable
+                # ground (the hasHit + slope check above), it should win
+                # every tie - flat only wins when it's UNAMBIGUOUSLY
+                # better (e.g. stepping got blocked by something flat
+                # could slide past).
+                if flat_dist_sq > step_dist_sq + 1e-9:
+                    final_pos, final_vel = flat_pos, flat_vel
+                else:
+                    final_pos, final_vel = settled_pos, step_vel
             else:
                 final_pos, final_vel = flat_pos, flat_vel
         else:

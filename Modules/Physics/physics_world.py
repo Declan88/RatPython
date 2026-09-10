@@ -203,20 +203,58 @@ class PhysicsWorld:
     # ---------------------------------------------------------------
 
     def add_static_mesh(self, model_path, position=None, rotation=None,
-                         scale=None, collision_mask=CollisionGroup.ALL):
+                         scale=None, collision_mask=CollisionGroup.ALL,
+                         exclude_local_bounds=None):
         """Exact per-triangle collision built by loading model_path a
         second time through trimesh (cheap - no GPU upload, independent
         of model_loader.py's render-focused load), so level geometry
         collides exactly like it looks. Only valid for STATIC bodies -
-        Bullet requires convex shapes for anything that moves."""
+        Bullet requires convex shapes for anything that moves.
+
+        exclude_local_bounds: optional ((min_x,min_y,min_z), (max_x,
+        max_y,max_z)) in the model's own untransformed vertex space -
+        any triangle whose centroid falls inside this box is left out
+        of the collision mesh entirely. For carving out a region that's
+        getting its own simplified collider instead (e.g. a sloped
+        add_static_box standing in for a staircase too fine-grained for
+        the player hull to climb step-by-step - see torus_scene.py).
+        Leaving the fine mesh triangles in there TOO, underneath/around
+        that simplified collider, was confirmed to cause erratic
+        movement (a step-up/settle sweep landing on whichever of the two
+        overlapping surfaces happens to be closest that tick, flipping
+        surface normal and update-direction mid-slide) - this excludes
+        them at the source instead of trying to make two independent
+        colliders agree."""
         vertices, faces = _load_mesh(model_path, scale)
 
+        if exclude_local_bounds is not None:
+            mins, maxs = np.asarray(exclude_local_bounds[0]), np.asarray(exclude_local_bounds[1])
+            centroids = vertices[faces].mean(axis=1)
+            inside = np.all((centroids >= mins) & (centroids <= maxs), axis=1)
+            faces = faces[~inside]
+
         tri_mesh = BulletTriangleMesh()
+        # glTF exports (especially flat-shaded ones) commonly duplicate a
+        # vertex's POSITION once per adjacent face so each triangle can
+        # carry its own normal - so two triangles that are visually
+        # coplanar and share an edge often don't share a vertex index at
+        # all in the raw buffer trimesh hands back. Without welding here,
+        # Bullet has no way to know those triangles are connected, so it
+        # treats their shared edge as an "internal edge" a sweep can snag
+        # on (spurious edge/vertex normal instead of the flat face normal)
+        # - confirmed as the cause of walking jitter on flat multi-
+        # triangle surfaces (see this module's docstring, and torus_
+        # scene.py's plane.glb/floorbase.glb comments). remove_duplicate_
+        # vertices=True + a tiny welding distance merges any positions
+        # that coincide to within floating-point noise back into shared
+        # indices, restoring the adjacency info Bullet needs.
+        tri_mesh.setWeldingDistance(1e-8)
         for a, b, c in faces:
             tri_mesh.addTriangle(
                 to_physics_pos(vertices[a]),
                 to_physics_pos(vertices[b]),
                 to_physics_pos(vertices[c]),
+                True,
             )
 
         shape = BulletTriangleMeshShape(tri_mesh, dynamic=False)

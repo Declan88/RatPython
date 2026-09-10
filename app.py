@@ -67,7 +67,12 @@ def main():
     # geometry (see torus_scene.py's collision=True statics) via the
     # scene's own physics world. Spawned above the floor so it falls
     # and settles on first update rather than starting embedded in it.
-    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0))
+    # max_slope_degrees raised slightly past Source's 45.57 default - the
+    # TorusScene staircase's clip-brush ramp (see torus_scene.py) sits at
+    # ~46.3 degrees, fit to the actual tread-nosing line rather than a
+    # shallower approximation, so it needs a hair more headroom to count
+    # as walkable floor instead of a wall.
+    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0), max_slope_degrees=47.0)
 
     net_mgr = NetworkManager(camera)
 

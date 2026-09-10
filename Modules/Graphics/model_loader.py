@@ -6,6 +6,22 @@ import trimesh
 
 DEFAULT_CREASE_ANGLE_DEG = 30.0
 
+# An object named (or prefixed) this way in the authoring tool (e.g.
+# Blender's outliner) never gets drawn - see _flatten_scene. It still
+# comes through untouched on the PhysicsWorld.add_static_mesh side
+# (physics_world.py's _load_mesh loads the whole glTF unfiltered), so
+# naming a piece of geometry this way turns it into exactly the
+# invisible-but-solid "clip brush" Source-family mapping uses for things
+# like a smooth ramp collider over decorative stairs - model it as its
+# own object in the same file, prefix its name, done. Matched against
+# the object's name (what you rename in Blender's outliner), not the
+# mesh data-block name, case-insensitively.
+COLLISION_ONLY_PREFIX = "collision_"
+
+
+def _is_collision_only_node(node_name):
+    return node_name.lower().startswith(COLLISION_ONLY_PREFIX)
+
 def _has_attribute(prog, name):
     try: return prog[name] is not None
     except Exception: return False
@@ -210,6 +226,7 @@ def _flatten_scene(scene):
     if not isinstance(scene, trimesh.Scene): return scene
     all_vertices, all_faces, all_normals, all_uvs, representative, vertex_offset = [], [], [], [], None, 0
     for node_name in scene.graph.nodes_geometry:
+        if _is_collision_only_node(node_name): continue
         transform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)
         if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0: continue
