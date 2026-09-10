@@ -40,13 +40,15 @@ except ImportError:
 import numpy as np
 
 
-def lightmap_cache_path(lightmap_dir, index):
-    """The primary cache file path for a given lightmap index. Callers
-    should treat this as the one path to check for existence/mtime
-    purposes; the .exr format's sidecar .json is an implementation
-    detail handled internally by save/load below."""
+def lightmap_cache_path(lightmap_dir, name):
+    """The primary cache file path for a given object name (e.g.
+    "floorbase" for a static object loaded from floorbase.glb - see
+    Scene._load_object). Callers should treat this as the one path to
+    check for existence/mtime purposes; the .exr format's sidecar
+    .json is an implementation detail handled internally by save/load
+    below."""
     ext = "exr" if HAS_OPENEXR else "npz"
-    return lightmap_dir / f"lightmap_{index}.{ext}"
+    return lightmap_dir / f"{name}.{ext}"
 
 
 def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolution):

@@ -7,11 +7,12 @@ import glm
 import numpy as np
 
 from Modules.Audio.sound_manager import SoundManager
-from Modules.Physics.physics_world import PhysicsWorld, CollisionGroup
+from Modules.Physics.physics_world import PhysicsWorld, CollisionGroup, to_physics_vec
 from Modules.Graphics.pbr_shader import (
     create_program,
     bind_material,
-    bind_point_lights
+    bind_point_lights,
+    bind_environment
 )
 from Modules.Graphics.shadow_module import CascadedShadowMap
 from Modules.Graphics.point_shadow_module import PointShadowMap
@@ -74,6 +75,16 @@ class Scene:
 
         self.light_dir = glm.vec3(0.5, 1.0, 0.8)
 
+        # The directional (sun) light's own color and brightness -
+        # separate from light_dir, which only ever controlled its
+        # direction (its vector's magnitude does nothing; the shader
+        # normalizes it). Defaults match the shader's old hardcoded
+        # behavior exactly (implicitly white at a fixed 2.0 multiplier)
+        # so existing scenes look unchanged unless a scene overrides
+        # these, same pattern as light_dir itself.
+        self.light_color = glm.vec3(1.0, 1.0, 1.0)
+        self.light_intensity = 2.0
+
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = "<"
         self.ctx.enable(moderngl.CULL_FACE)
@@ -122,6 +133,14 @@ class Scene:
         self.equirect_exposure = 1.0
         self.equirect_is_hdr = True
 
+        # Hemisphere ("skylight"-style) ambient term derived from
+        # whichever skybox is loaded (see add_skybox/add_equirect_skybox
+        # and pbr_shader.py's u_sky_color/u_ground_color) - dim neutral
+        # gray until a skybox actually sets these, close to the flat
+        # ambient constant this replaced.
+        self.environment_sky_color = (0.025, 0.025, 0.025)
+        self.environment_ground_color = (0.025, 0.025, 0.025)
+
     # =============================================================
     # OBJECT LOADING
     # =============================================================
@@ -149,6 +168,7 @@ class Scene:
             return None
 
         return {
+            "name": Path(model_path).stem,
             "vao": model["vao"],
             "shadow_vao": shadow_model["vao"],
             "lightmap_vao": lightmap_model["vao"] if lightmap_model else None,
@@ -240,17 +260,40 @@ class Scene:
                      scale=glm.vec3(1.0), rot_speed=0.0, transform=None,
                      metallic=None, roughness=None,
                      collision=False, collision_shape="box", mass=1.0,
-                     collision_mask=CollisionGroup.ALL):
+                     collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
         """collision=True hands this object over to self.physics as a
         rigid body (mass, in kg-equivalent units) - from then on its
         position/rotation are driven by the physics simulation every
-        frame (see Scene.update), not by rot_speed, which is ignored
-        once collision is enabled. collision_shape: "box" (default) or
+        frame (see Scene.update). collision_shape: "box" (default) or
         "sphere" are cheap primitives sized from the mesh's own
         bounds; "mesh" is a convex hull built from the mesh's actual
         vertices (Bullet requires a convex shape for anything that
         moves, so this is as exact as a dynamic body can get - use it
         for oddly-shaped props where a box/sphere would clip visibly).
+
+        gravity=False (only meaningful alongside collision=True,
+        ignored if kinematic=True) keeps full collision response -
+        other bodies can still push it and it can still push them -
+        but exempts just this body from falling, via a per-body
+        gravity override rather than the world's own gravity. Still a
+        normal DYNAMIC body otherwise, so any collision impulse (the
+        player walking into it, another prop landing on it) is free to
+        knock it around - fine for a floating-but-shovable obstacle,
+        wrong for something that should hold a fixed path (see
+        kinematic below for that case).
+
+        kinematic=True (also only meaningful alongside collision=True)
+        makes this body immovable by any physical force or collision
+        impulse whatsoever - other things still collide against it
+        solidly, but nothing can ever push, knock, or otherwise budge
+        IT. rot_speed keeps working normally for a kinematic object
+        (driving its actual transform every frame, same as with no
+        collision at all) rather than being replaced by a real angular
+        velocity the way it is for a plain dynamic body - use this for
+        a spinning/moving obstacle that must follow an exact path
+        regardless of what bumps into it. gravity is meaningless here
+        (a kinematic body is never affected by it either way).
+
         See CollisionGroup / physics_world.py's module docstring for
         collision_mask."""
         model = self._load_object(model_path)
@@ -273,40 +316,71 @@ class Scene:
         self.dynamic_objects.append(model)
 
         if collision:
-            self._add_dynamic_collision(model_path, model, collision_shape, mass, collision_mask)
+            self._add_dynamic_collision(model_path, model, collision_shape, mass, collision_mask, gravity, kinematic)
 
         return model
 
-    def _add_dynamic_collision(self, model_path, model, collision_shape, mass, collision_mask):
+    def _add_dynamic_collision(self, model_path, model, collision_shape, mass, collision_mask,
+                                gravity=True, kinematic=False):
         pos, rot, scl = self._collision_transform_args(model)
+        rot_speed = model.get("rot_speed", 0.0)
 
-        # Physics owns position/rotation from here on - replace any
-        # transform-matrix override with the equivalent decomposed
-        # fields so _get_model_matrix keeps following it every frame,
-        # and drop rot_speed since it'd otherwise fight the physics
-        # rotation Scene.update() applies each frame.
+        # Physics (or, for a kinematic body, THIS method's own caller -
+        # see Scene.update) owns position/rotation from here on -
+        # replace any transform-matrix override with the equivalent
+        # decomposed fields so _get_model_matrix keeps following it
+        # every frame. For a plain dynamic body, rot_speed itself is
+        # zeroed here (Scene.update() ignores it entirely for anything
+        # with a _physics_body that isn't _kinematic - it'd otherwise
+        # fight the physics rotation applied each frame) but its VALUE
+        # is kept above and re-applied below as a real angular velocity
+        # on the rigid body instead, so a spinning prop keeps spinning
+        # through actual physics rather than silently stopping the
+        # moment collision is turned on. A kinematic body keeps
+        # rot_speed working exactly as it always did (Scene.update
+        # applies it directly to model["rotation"] every frame, same
+        # as a non-colliding object) since IT drives the transform,
+        # not the other way around.
         model.pop("transform", None)
         model["position"] = pos
         model["rotation"] = rot
         model["scale"] = scl
-        model["rot_speed"] = 0.0
+        if not kinematic:
+            model["rot_speed"] = 0.0
+        model["_kinematic"] = kinematic
 
         if collision_shape == "box":
             body = self.physics.add_dynamic_box_from_bounds(
-                model_path, position=pos, rotation=rot, scale=scl, mass=mass, collision_mask=collision_mask
+                model_path, position=pos, rotation=rot, scale=scl, mass=mass,
+                collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
             )
         elif collision_shape == "sphere":
             body = self.physics.add_dynamic_sphere_from_bounds(
-                model_path, position=pos, scale=scl, mass=mass, collision_mask=collision_mask
+                model_path, position=pos, scale=scl, mass=mass,
+                collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
             )
         elif collision_shape == "mesh":
             body = self.physics.add_dynamic_mesh(
-                model_path, position=pos, rotation=rot, scale=scl, mass=mass, collision_mask=collision_mask
+                model_path, position=pos, rotation=rot, scale=scl, mass=mass,
+                collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
             )
         else:
             raise ValueError(f"Unknown collision_shape {collision_shape!r} for add_dynamic - use 'box', 'sphere', or 'mesh'.")
 
         model["_physics_body"] = body
+
+        if rot_speed != 0.0 and not kinematic:
+            # Real angular velocity (render Y axis - vertical spin,
+            # the same axis rot_speed always meant) rather than the
+            # dead rot_speed field, so this keeps spinning through
+            # actual physics and still fully participates in collision
+            # (something bumping into it interacts with its real,
+            # continuously-changing orientation). Not applicable to a
+            # kinematic body - it ignores velocity-based integration
+            # entirely by design, which is exactly what makes it
+            # immovable; rot_speed drives it directly instead, pushed
+            # into the physics transform each frame by Scene.update.
+            body.node().setAngularVelocity(to_physics_vec(glm.vec3(0.0, rot_speed, 0.0)))
 
     # =============================================================
     # SKELETAL (ANIMATED) OBJECTS
@@ -464,6 +538,18 @@ class Scene:
         )
         self.skybox_edge_fade = edge_fade
 
+        # Approximate hemisphere ambient from the +Y/-Y face averages
+        # (face order is +X,-X,+Y,-Y,+Z,-Z - see load_skybox_textures)
+        # - see environment_sky_color's definition in __init__. These
+        # average_colors are gamma-encoded display values (they're only
+        # otherwise used for on-screen edge-fade blending), not
+        # gamma-decoded to linear the way add_equirect_skybox's are, so
+        # this is a cruder approximation than that path - acceptable
+        # for a subtle ambient term on a shader that's already not
+        # claiming photometric accuracy (see pbr_shader.py's docstring).
+        self.environment_sky_color = self.skybox_average_colors[2]
+        self.environment_ground_color = self.skybox_average_colors[3]
+
     def add_equirect_skybox(self, path, exposure=1.0):
         """Loads a single equirectangular panorama as the skybox, sampled
         directly by direction vector - no discrete faces, so none of
@@ -490,11 +576,21 @@ class Scene:
         if self.equirect_skybox_vbo is not None:
             self.equirect_skybox_vbo.release()
 
-        self.equirect_skybox_texture, self.equirect_is_hdr = load_equirect_texture(self.ctx, path)
+        self.equirect_skybox_texture, self.equirect_is_hdr, sky_color, ground_color = load_equirect_texture(
+            self.ctx, path
+        )
         self.equirect_skybox_vao, self.equirect_skybox_vbo = create_equirect_skybox_vao(
             self.ctx, self.equirect_skybox_program
         )
         self.equirect_exposure = exposure
+
+        # See environment_sky_color's definition in __init__ - already
+        # linear (load_equirect_texture handles LDR gamma-decoding), so
+        # just apply the same exposure multiplier the skybox itself
+        # renders with, for a consistent look between the visible sky
+        # and its ambient contribution.
+        self.environment_sky_color = tuple(c * exposure for c in sky_color)
+        self.environment_ground_color = tuple(c * exposure for c in ground_color)
 
     # =============================================================
     # POINT LIGHTS
@@ -618,9 +714,24 @@ class Scene:
             return
 
         self.lightmap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Named after the object (its model file's stem - see
+        # _load_object) rather than a bare index, so cache files are
+        # identifiable on disk (e.g. floorbase.exr instead of
+        # lightmap_0.exr) - disambiguated with a _2, _3, ... suffix on
+        # any repeat, since two static objects loaded from the same
+        # model (or coincidentally sharing a stem) would otherwise
+        # collide on the same cache file.
+        seen_name_counts = {}
+        cache_names = []
+        for obj in eligible:
+            name = obj["name"]
+            seen_name_counts[name] = seen_name_counts.get(name, 0) + 1
+            count = seen_name_counts[name]
+            cache_names.append(name if count == 1 else f"{name}_{count}")
         cache_paths = [
-            lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, i)
-            for i in range(len(eligible))
+            lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, name)
+            for name in cache_names
         ]
 
         def _load_cache():
@@ -783,7 +894,18 @@ class Scene:
         for obj in self.dynamic_objects:
             physics_body = obj.get("_physics_body")
             if physics_body is not None:
-                obj["position"], obj["rotation"] = self.physics.get_transform(physics_body)
+                if obj.get("_kinematic"):
+                    # WE drive a kinematic body's transform, not the
+                    # other way around (see add_dynamic's docstring) -
+                    # apply rot_speed exactly like a non-colliding
+                    # object below, then push the result onto the
+                    # physics node so Bullet uses it for collision.
+                    rot_speed = obj.get("rot_speed", 0.0)
+                    if rot_speed != 0.0 and "rotation" in obj:
+                        obj["rotation"].y += rot_speed * dt
+                    self.physics.set_transform(physics_body, obj["position"], obj["rotation"])
+                else:
+                    obj["position"], obj["rotation"] = self.physics.get_transform(physics_body)
                 continue
 
             rot_speed = obj.get("rot_speed", 0.0)
@@ -867,12 +989,15 @@ class Scene:
         # affect the other even though the uniform names match.
         bind_point_lights(self.pbr_program, self.point_lights)
         bind_point_lights(self.skeletal_program, self.point_lights)
+        bind_environment(self.pbr_program, self.environment_sky_color, self.environment_ground_color)
+        bind_environment(self.skeletal_program, self.environment_sky_color, self.environment_ground_color)
 
         for obj in (*self.static_objects, *self.dynamic_objects):
             model_matrix = self._get_model_matrix(obj)
             bind_material(
                 self.pbr_program, obj, model_matrix, camera,
-                self.light_dir, self.shadow_manager
+                self.light_dir, self.shadow_manager,
+                light_color=self.light_color, light_intensity=self.light_intensity
             )
             obj["vao"].render()
 
@@ -886,7 +1011,8 @@ class Scene:
             # skeletal_shader.py's docstring), so this works unmodified.
             bind_material(
                 self.skeletal_program, obj, model_matrix, camera,
-                self.light_dir, self.shadow_manager
+                self.light_dir, self.shadow_manager,
+                light_color=self.light_color, light_intensity=self.light_intensity
             )
             bind_bone_matrices(self.skeletal_program, obj["bone_matrices"])
             obj["vao"].render()

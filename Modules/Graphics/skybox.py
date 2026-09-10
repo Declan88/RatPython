@@ -395,17 +395,51 @@ def create_equirect_skybox_program(ctx):
     return ctx.program(vertex_shader=EQUIRECT_VERTEX_SHADER, fragment_shader=EQUIRECT_FRAGMENT_SHADER)
 
 
+def _hemisphere_colors_from_equirect(linear_arr):
+    """linear_arr: (H, W, 3) float array already in LINEAR color space
+    (see load_equirect_texture - HDR sources already are, LDR sources
+    need gamma-decoding first). Returns (sky_color, ground_color), each
+    an (r, g, b) tuple - solid-angle-weighted averages of the upper
+    (dir.y > 0) and lower (dir.y < 0) hemispheres, for use as a
+    hemisphere/"skylight"-style ambient term (Scene.add_equirect_skybox
+    stores these; pbr_shader.py blends between them by the surface
+    normal's up-component).
+
+    Matches the same Y-up equirect convention EQUIRECT_FRAGMENT_SHADER's
+    dir->uv mapping uses: row v=0 is the +Y zenith, row v=1 is the -Y
+    nadir. Weighted by sin(theta) per row (theta = polar angle from +Y,
+    so theta=0 at the zenith row and theta=PI at the nadir row) rather
+    than a flat average, since equirect rows near the poles cover far
+    less real solid angle than rows near the equator - a flat average
+    would let a handful of zenith/nadir pixels dominate the result."""
+    height = linear_arr.shape[0]
+    row_v = (np.arange(height, dtype=np.float64) + 0.5) / height
+    weights = np.sin(np.pi * row_v)  # zero at the poles, peaks at the equator
+
+    row_means = linear_arr.mean(axis=1).astype(np.float64)  # (H, 3) - flat per-row average across longitude
+
+    half = height // 2
+    sky_color = np.average(row_means[:half], axis=0, weights=weights[:half])
+    ground_color = np.average(row_means[half:], axis=0, weights=weights[half:])
+
+    return tuple(sky_color.tolist()), tuple(ground_color.tolist())
+
+
 def load_equirect_texture(ctx, path):
     """Loads a single equirectangular panorama as a plain 2D texture -
     HDR (.exr, needs the OpenEXR package) or LDR (.png/.jpg/etc, via
     PIL, no extra dependency) are both supported, auto-detected from
     the file extension.
 
-    Returns (texture, is_hdr). is_hdr tells render_equirect_skybox
-    whether to apply HDR tonemapping - .exr's raw radiance values are
-    unbounded and need it; a normal LDR image is already display-ready
-    and would be incorrectly darkened by running it through the same
-    tonemap (see the fragment shader's comment).
+    Returns (texture, is_hdr, sky_color, ground_color). is_hdr tells
+    render_equirect_skybox whether to apply HDR tonemapping - .exr's
+    raw radiance values are unbounded and need it; a normal LDR image
+    is already display-ready and would be incorrectly darkened by
+    running it through the same tonemap (see the fragment shader's
+    comment). sky_color/ground_color: see
+    _hemisphere_colors_from_equirect - both already in LINEAR space,
+    ready to feed straight into the (also-linear) lighting math in
+    pbr_shader.py, with no further gamma handling needed by the caller.
 
     Not verified against a real .exr file or a live GPU in this
     environment - the PNG/PIL path is the same well-established loading
@@ -420,10 +454,16 @@ def load_equirect_texture(ctx, path):
         height, width = arr.shape[0], arr.shape[1]
         tex = ctx.texture((width, height), 3, arr.tobytes(), dtype="f2")
         is_hdr = True
+        # Raw HDR radiance is already linear - no gamma decode needed.
+        linear_arr = arr.astype(np.float32)
     else:
         img = Image.open(path_str).convert("RGB")
         tex = ctx.texture(img.size, 3, img.tobytes())
         is_hdr = False
+        # LDR pixels are sRGB-encoded, display-ready data - decode to
+        # linear the same way the main shader decodes albedo textures
+        # (pow(x, 2.2)) before using them in lighting math.
+        linear_arr = np.power(np.asarray(img, dtype=np.float32) / 255.0, 2.2)
 
     tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
@@ -437,7 +477,9 @@ def load_equirect_texture(ctx, path):
     tex.repeat_x = True
     tex.repeat_y = False
 
-    return tex, is_hdr
+    sky_color, ground_color = _hemisphere_colors_from_equirect(linear_arr)
+
+    return tex, is_hdr, sky_color, ground_color
 
 
 def create_equirect_skybox_vao(ctx, prog):

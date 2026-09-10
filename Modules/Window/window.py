@@ -26,6 +26,16 @@ class WindowManager:
 
         pygame.mouse.set_visible(False)
         pygame.event.set_grab(True)
+        # Grabbing input warps the OS cursor to the window center, which
+        # SDL can report back as a large synthetic MOUSEMOTION event (as
+        # if the mouse had been yanked) - without this, that one event
+        # feeds straight into Camera.process_mouse() as a real look
+        # input, snapping pitch/yaw hard on the very first frame.
+        # Clearing it here (and resetting the relative-motion
+        # accumulator via get_rel()) discards it before the game loop
+        # ever sees it.
+        pygame.event.clear(pygame.MOUSEMOTION)
+        pygame.mouse.get_rel()
 
         # No moderngl.MULTISAMPLE flag exists - GL_MULTISAMPLE is enabled
         # by default in a core profile context once the framebuffer

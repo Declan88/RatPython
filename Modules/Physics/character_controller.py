@@ -1,56 +1,67 @@
 """
-Player capsule: gravity, walking, sprinting, crouching, jumping, with
-Source-engine-style (Half-Life 2 / GMod) movement feel, built on
-Panda3D's BulletCharacterControllerNode for collision/step/slope
-resolution (see physics_world.py's module docstring for the Z-up/Y-up
-coordinate bridge and why a hand-rolled character controller isn't
-needed just for that part).
+Player hull: gravity, walking, sprinting, crouching, jumping, and
+collision resolution, all built as a direct, from-scratch port of
+Source's public SDK player movement (game/shared/gamemovement.cpp -
+CGameMovement) rather than on top of any vendor "kinematic character
+controller" black box.
 
-The horizontal movement model below is a direct port of the algorithm
-in Source's public SDK (game/shared/gamemovement.cpp - CGameMovement::
-WalkMove/AirMove/Friction/Accelerate/AirAccelerate), not Bullet's own
-walk handling: BulletCharacterControllerNode's setLinearMovement()
-snaps straight to a target speed every tick, which feels nothing like
-Source/Quake movement. Ground movement here instead:
+WHY NOT BulletCharacterControllerNode: an earlier version of this file
+used Panda3D's BulletCharacterControllerNode, which handles gravity,
+jumping, ground detection and step/slope resolution internally. That
+works, but two things about it fundamentally conflict with "as close to
+Source as possible":
 
-  1. Applies FRICTION to the player's own persistent velocity (decayed
-     by sv_friction-equivalent, with a stop_speed floor so slow motion
-     doesn't asymptote forever - same shape as Source's Friction()).
-  2. ACCELERATES that velocity toward the wish direction/speed, capped
-     by how much speed is still missing (sv_accelerate-equivalent) -
-     this is why starting to move ramps up instead of snapping to max
-     speed, and why turning while moving carries momentum instead of
-     instantly redirecting.
+  1. Its internal vertical fall-speed is completely opaque - Panda3D's
+     bindings expose no getter or setter for it at all. Since Bullet's
+     kinematic controller also has no runtime shape-resize (needed for
+     crouching), the old code had to destroy and recreate the whole
+     node every time the player crouched or stood up, which silently
+     reset that hidden fall-speed to zero - a fall in progress would
+     slow to a crawl, a jump's rise would flatten out. Real Source
+     ducking never touches velocity at all, because Source's movement
+     was never tied to the hull object to begin with (see below). A
+     workable patch existed (re-priming the fresh node's fall-speed via
+     a deliberately tiny extra physics step with temporarily-boosted
+     gravity), but it was still working around a black box rather than
+     actually owning the state.
+  2. setLinearMovement() snaps straight to a target speed every tick,
+     which is nothing like Source/Quake's momentum-carrying movement -
+     the previous version already had to bolt Source's own Friction/
+     Accelerate/AirAccelerate math on top of it for ground movement.
 
-Airborne movement uses Source's AirAccelerate instead: the ADD-SPEED
-check is capped at ~30 Source units/s (0.762m, the exact unit
-conversion - 1 Source unit = 1 inch), but the accel-speed applied per
-tick still uses the UNCAPPED wishspeed. That asymmetry is deliberate
-and is exactly the mechanism behind Source/Quake air-strafing and
-bunny-hop acceleration - reproduced faithfully here, not accidentally.
+Real Source movement has neither of these problems because it was
+never built on a packaged character controller in the first place:
+CGameMovement stores the player's full velocity itself (mv->
+m_vecVelocity, one vector, gravity and jumping and walking all just
+adjusting the SAME vector), and figures out the ground and resolves
+collisions with its own TracePlayerBBox sweep-and-slide, run against
+the game's collision world. Crouching there just changes the hull's
+mins/maxs; the velocity vector was never part of the hull object, so
+there's nothing to lose.
 
-CROUCHING (Source/GMod-style, default bind CTRL): two things happen,
-mostly independently:
-  - The collision capsule swaps to a shorter one INSTANTLY the moment
-    crouch is pressed, so the player can duck under a low obstacle
-    right away rather than waiting on an animation - this is genuinely
-    how Source's hitbox works too (the view height is what's animated,
-    not the hitbox). Bullet's character controller node has no runtime
-    "resize", so this rebuilds the node with a second pre-built capsule
-    shape, preserving position (feet planted - see _swap_to_shape) and
-    velocity.
-  - Standing back up is refused if a BulletGhostNode positioned where
-    the standing capsule would go detects any overlap (a low ceiling,
-    a shelf) - same "don't pop through geometry" rule Source enforces -
-    so releasing crouch under something low just keeps you crouched
-    until you move clear, checked every tick.
-  - The camera's eye height (get_eye_offset()) eases smoothly toward
-    the crouched value over crouch_transition_time instead of popping,
-    computed from the FEET position (invariant across the instant hull
-    swap) so the transition reads as smooth despite the hull itself
-    changing in one step.
-  - Move speed is scaled by crouch_speed_multiplier while crouched
-    (Source/CS-style ducking is slow, not just shorter).
+This file follows that shape directly, using Bullet only for its
+raw collision primitives (a BulletGhostNode's box shape for the hull,
+and BulletWorld.sweepTestClosest for the actual trace) rather than its
+higher-level character controller:
+
+  - self.velocity is the single source of truth for all motion,
+    horizontal AND vertical (Source's mv->m_vecVelocity) - a plain
+    Python attribute, never reset by anything else in this file.
+  - _categorize_position() (Source's CGameMovement::CategorizePosition)
+    sweeps the hull down a short fixed distance each tick to determine
+    ground contact and the ground normal, independent of velocity.
+  - _try_move()/_step_slide_move() (Source's TryPlayerMove/StepMove)
+    sweep the hull along the velocity, clip against whatever it hits
+    (sliding along walls, or along the crease where two hit planes
+    meet, up to 4 bumps per tick) and - while grounded - separately try
+    stepping up over the obstacle first, keeping whichever attempt
+    covers more ground, same as Source's dual flat-vs-stepped attempt.
+  - Friction/Accelerate/AirAccelerate are unchanged from the previous
+    version (already a faithful port - see their docstrings).
+  - Crouching swaps the hull's BulletShape via BulletGhostNode's own
+    addShape/removeShape (confirmed to work on a live node, unlike
+    BulletCharacterControllerNode) - the SAME ghost node the whole
+    time, so self.velocity is simply never touched by it.
 
 Because all of this needs to run at a fixed tick rate (friction/
 acceleration math, and the crouch/eye lerp, are only frame-rate
@@ -60,11 +71,22 @@ PhysicsWorld pre-substep callback rather than being driven from
 Scene/app.py's per-render-frame update.
 """
 
-import glm
-from panda3d.core import Point3
-from panda3d.bullet import BulletCapsuleShape, BulletBoxShape, BulletCharacterControllerNode, BulletGhostNode, ZUp
+import math
 
-from Modules.Physics.physics_world import CollisionGroup, to_physics_pos, to_physics_vec, to_physics_extent, to_render_pos
+import glm
+from panda3d.core import Point3, TransformState
+from panda3d.bullet import BulletBoxShape, BulletGhostNode
+
+from Modules.Physics.physics_world import (
+    CollisionGroup, to_physics_pos, to_render_pos, to_physics_extent, to_render_vec,
+)
+
+# Time constant (seconds) for the vertical-only low-pass filter in
+# _on_pre_substep - see its comment. Short enough that stairs/slopes
+# still feel immediate (reaches ~95% of a step change in about 3*tau =
+# 0.15s), long enough to average out any residual per-tick sweep-test
+# noise while walking.
+_EYE_SMOOTH_TAU = 0.05
 
 # Source's AirAccelerate add-speed cap is 30 units/s; 1 Source unit is
 # 1 inch (0.0254m), so 30 * 0.0254 = 0.762 m/s - the exact conversion,
@@ -74,31 +96,53 @@ _AIR_SPEED_CAP = 30.0 * 0.0254
 # Ratio of eye_height/crouch_eye_height to height/crouch_height when
 # not given explicitly - matches this project's original hardcoded
 # PLAYER_EYE_HEIGHT=0.7 default for height=1.8 (eyes a bit below the
-# top of the capsule), kept as a ratio so crouch_eye_height scales
+# top of the hull), kept as a ratio so crouch_eye_height scales
 # sensibly with whatever height/crouch_height_ratio are passed.
 _DEFAULT_EYE_RATIO = 0.7 / 1.8
+
+# Source's CategorizePosition ground trace is a fixed 2 (Source) units
+# regardless of velocity - 2 * 0.0254 = 0.0508m, the exact conversion.
+_GROUND_TRACE_DISTANCE = 2.0 * 0.0254
+
+# A small pushback applied along a hit surface's normal after each
+# sweep-test collision in _try_move, so the NEXT sweep in the same call
+# (or next tick) starts already clear of the surface instead of
+# exactly touching/embedded in it - without this, a sweep that starts
+# exactly at a touching point can behave inconsistently right at the
+# boundary. Small enough to be visually and physically meaningless.
+_SURFACE_PUSHBACK = 0.001
+
+# Up to 4 distinct planes per tick before giving up and treating the
+# player as fully stuck (matches Source's TryPlayerMove numbumps).
+_MAX_BUMPS = 4
 
 
 class CharacterController:
     def __init__(self, physics_world, position=(0.0, 2.0, 0.0), radius=0.4,
                  height=1.8, step_height=0.4, ground_speed=4.0, sprint_speed=7.0,
                  ground_accel=10.0, air_accel=10.0, friction=4.0, stop_speed=1.0,
-                 jump_height=1.2, jump_speed=6.0, collision_mask=CollisionGroup.ALL,
+                 jump_speed=6.0, collision_mask=CollisionGroup.ALL,
                  crouch_height_ratio=0.5, crouch_speed_multiplier=0.34,
-                 crouch_transition_time=0.25, eye_height=None, crouch_eye_height=None):
+                 crouch_transition_time=0.25, eye_height=None, crouch_eye_height=None,
+                 max_slope_degrees=45.57, gravity=None):
         """ground_speed/sprint_speed: target ground move speed (m/s),
         walk vs. sprint (see set_sprinting). ground_accel/air_accel:
         sv_accelerate/sv_airaccelerate-equivalent - higher snaps to
         target speed faster. friction/stop_speed: sv_friction/
-        sv_stopspeed-equivalent ground deceleration. height is the
-        player's total STANDING capsule height including both
-        hemispherical caps; crouch_height_ratio scales that down for
-        the crouched capsule (0.5 matches Source's 36/72 duck-hull
-        ratio). crouch_speed_multiplier is approximate - Source-family
-        games commonly use ~0.34, but the exact HL2 constant isn't
-        something this port claims to reproduce byte-for-byte; tune to
-        taste. eye_height/crouch_eye_height default to a fixed ratio of
-        height/crouch height if not given (see get_eye_offset)."""
+        sv_stopspeed-equivalent ground deceleration. radius/height
+        define an axis-aligned BOX hull (Source's player hull is
+        literally an AABB, not a capsule - radius is half the box's
+        X/Z footprint). crouch_height_ratio scales height down for the
+        crouched hull (0.5 matches Source's 36/72 duck-hull ratio).
+        crouch_speed_multiplier is approximate - Source-family games
+        commonly use ~0.34, but the exact HL2 constant isn't something
+        this port claims to reproduce byte-for-byte; tune to taste.
+        eye_height/crouch_eye_height default to a fixed ratio of
+        height/crouch height if not given (see get_eye_offset).
+        max_slope_degrees: a ground contact steeper than this counts as
+        a wall, not floor (Source's default is 45.57 degrees, i.e. a
+        ground-normal.y cutoff of ~0.7). gravity defaults to matching
+        physics_world's own gravity if not given."""
         self.radius = float(radius)
         self.height = float(height)
         self.ground_speed = float(ground_speed)
@@ -111,57 +155,88 @@ class CharacterController:
         self.crouch_transition_time = float(crouch_transition_time)
         self.eye_height = float(eye_height) if eye_height is not None else self.height * _DEFAULT_EYE_RATIO
 
-        crouch_height = self.height * float(crouch_height_ratio)
+        self._crouch_height = self.height * float(crouch_height_ratio)
         self.crouch_eye_height = (
-            float(crouch_eye_height) if crouch_eye_height is not None else crouch_height * _DEFAULT_EYE_RATIO
+            float(crouch_eye_height) if crouch_eye_height is not None else self._crouch_height * _DEFAULT_EYE_RATIO
         )
 
         self.step_height = float(step_height)
-        self.jump_height = float(jump_height)
         self.jump_speed = float(jump_speed)
         self.collision_mask = collision_mask
+        self.gravity = float(gravity) if gravity is not None else physics_world.world.getGravity().length()
+        self._max_slope_cos = math.cos(math.radians(max_slope_degrees))
         self._physics_world = physics_world
 
-        self._standing_cylinder_height = max(self.height - 2.0 * self.radius, 0.01)
-        self._crouch_cylinder_height = max(crouch_height - 2.0 * self.radius, 0.01)
-        self._standing_shape = BulletCapsuleShape(self.radius, self._standing_cylinder_height, ZUp)
-        self._crouch_shape = BulletCapsuleShape(self.radius, self._crouch_cylinder_height, ZUp)
-        self._current_cylinder_height = self._standing_cylinder_height
+        # sweepTestClosest() takes a bare shape + transform, not a body
+        # reference, so Bullet has no way to know "don't count the body
+        # this shape happens to belong to" - confirmed empirically that
+        # it reports a same-position, zero-fraction hit against our OWN
+        # ghost when nothing else is around to compete for "closest".
+        # That phantom hit's near-zero-but-nonzero normal (floating-
+        # point noise in the exactly-touching case) was getting run
+        # through ClipVelocity every tick, which is exactly why gravity
+        # alone was leaking into a slow horizontal drift with no input
+        # and nothing else in the world at all. Fixed by giving the
+        # player's own ghost a dedicated identity bit that every
+        # outgoing sweep explicitly excludes from its query mask - the
+        # ghost can still be hit by OTHER systems querying for ALL/
+        # PLAYER (contactTest's exclusion-by-identity-check, for
+        # instance, is unaffected), it just can never satisfy our own
+        # movement sweeps' mask.
+        self._sweep_mask = self.collision_mask & ~CollisionGroup.PLAYER
 
-        self.node = self._make_node(self._standing_shape)
+        self._standing_shape = BulletBoxShape(to_physics_extent((self.radius, self.height / 2.0, self.radius)))
+        self._crouch_shape = BulletBoxShape(to_physics_extent((self.radius, self._crouch_height / 2.0, self.radius)))
+        self._current_shape = self._standing_shape
+        self._current_height = self.height
+
+        # A single persistent BulletGhostNode for the whole lifetime of
+        # the controller - crouching swaps its shape in place (see
+        # _swap_to_shape) via addShape/removeShape, confirmed to work
+        # on a live node, so unlike BulletCharacterControllerNode this
+        # never needs to be destroyed/recreated and self.velocity is
+        # simply never disturbed by crouching.
+        self.node = BulletGhostNode("player")
+        self.node.addShape(self._standing_shape)
+        self.node.setIntoCollideMask(CollisionGroup.PLAYER)
         self.node_path = physics_world._root.attachNewNode(self.node)
         self.node_path.setPos(to_physics_pos(position))
-        physics_world.world.attachCharacter(self.node)
+        physics_world.world.attachGhost(self.node)
 
         # "Can I stand up" probe: a flat-topped/bottomed box covering
         # only the HEADROOM slice standing would newly occupy (crouch-
-        # top to stand-top), not the full standing capsule re-tested
-        # from the floor up. Re-testing the full capsule from the floor
-        # would always register an overlap with the floor itself (a
-        # grounded body always rests with a hair of contact
-        # penetration), permanently refusing to stand up anywhere -
-        # confirmed by hitting exactly that bug during testing. A probe
-        # that only spans the newly-needed headroom sidesteps the floor
-        # entirely by construction, no epsilon-tuning required.
-        headroom = (
-            self._capsule_total_height(self._standing_cylinder_height)
-            - self._capsule_total_height(self._crouch_cylinder_height)
-        )
+        # top to stand-top), not the full standing hull re-tested from
+        # the floor up. Re-testing the full hull from the floor up
+        # would always register an overlap with the floor itself,
+        # permanently refusing to stand up anywhere. A probe that only
+        # spans the newly-needed headroom sidesteps the floor entirely
+        # by construction, no epsilon-tuning required.
+        headroom = self.height - self._crouch_height
         self._stand_check_shape = BulletBoxShape(to_physics_extent((self.radius, headroom / 2.0, self.radius)))
-
-        # Kept alive for the controller's whole lifetime and just
-        # repositioned each crouched tick, rather than attaching/
-        # detaching a temporary node every check.
         self._stand_check_ghost = BulletGhostNode("stand_check")
         self._stand_check_ghost.addShape(self._stand_check_shape)
-        self._stand_check_ghost.setIntoCollideMask(collision_mask)
+        # Same dedicated PLAYER-only identity as self.node (see the
+        # comment by _sweep_mask above) - this ghost sits at the
+        # NodePath default position (physics origin) until the first
+        # crouch ever repositions it, and with a normal ALL into-mask
+        # it would silently block the player's own ground/movement
+        # sweeps the moment they passed near that spot (confirmed:
+        # this is exactly what stopped free-fall early in testing).
+        # Bullet's own group/mask filtering only requires ONE bit to
+        # match in each direction, so narrowing this to PLAYER doesn't
+        # stop it from detecting real ceilings/obstacles (which keep
+        # their normal ALL into-mask on the other side of the pairing,
+        # and their default from-mask already covers ALL too) - it
+        # only stops OUR OWN outgoing sweeps (whose mask explicitly
+        # excludes PLAYER) from matching it.
+        self._stand_check_ghost.setIntoCollideMask(CollisionGroup.PLAYER)
         self._stand_check_ghost_np = physics_world._root.attachNewNode(self._stand_check_ghost)
         physics_world.world.attachGhost(self._stand_check_ghost)
 
-        # Persistent ground-plane velocity (render-space, Y always 0) -
-        # this is what makes movement feel like Source instead of
-        # snapping to speed: it's built up/decayed tick over tick by
-        # _on_pre_substep, never reset to a target value directly.
+        # The single source of truth for all motion - horizontal AND
+        # vertical, render-space (Source's mv->m_vecVelocity). Built
+        # up/decayed tick over tick, never reset to a target value
+        # directly, and never disturbed by crouching (see above).
         self.velocity = glm.vec3(0.0)
         self._move_direction = glm.vec3(0.0)
         self._sprinting = False
@@ -169,18 +244,162 @@ class CharacterController:
         self._crouch_input = False
         self._is_crouched = False
         self._crouch_amount = 0.0  # 0 = standing, 1 = fully crouched (eased, see get_eye_offset)
+        self._grounded = False
+        self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
+
+        # Last completed substep's (smoothed - see _on_pre_substep)
+        # render-space position, for get_position() to interpolate
+        # from - see PhysicsWorld.get_interpolation_alpha()'s
+        # docstring.
+        self._prev_position = to_render_pos(self.node_path.getPos())
+        self._smoothed_position = glm.vec3(self._prev_position)
 
         physics_world.add_pre_substep_callback(self._on_pre_substep)
 
-    def _make_node(self, shape):
-        node = BulletCharacterControllerNode(shape, self.step_height, "player")
-        node.setIntoCollideMask(self.collision_mask)
-        node.setMaxJumpHeight(self.jump_height)
-        node.setJumpSpeed(self.jump_speed)
-        return node
+    # -----------------------------------------------------------------
+    # Low-level collision helpers (Source's trace-* equivalents)
+    # -----------------------------------------------------------------
 
-    def _capsule_total_height(self, cylinder_height):
-        return cylinder_height + 2.0 * self.radius
+    def _sweep(self, shape, from_render_pos, to_render_pos_):
+        """Sweeps shape from from_render_pos to to_render_pos_ (both
+        render-space glm.vec3) against the world, returning Panda3D's
+        BulletClosestHitSweepResult directly (see callers for what
+        they read off it). Confirmed empirically that a sweep never
+        reports a hit against our OWN ghost node, so no self-exclusion
+        handling is needed here."""
+        from_ts = TransformState.makePos(to_physics_pos(from_render_pos))
+        to_ts = TransformState.makePos(to_physics_pos(to_render_pos_))
+        return self._physics_world.world.sweepTestClosest(shape, from_ts, to_ts, self._sweep_mask, 0.0)
+
+    def _categorize_position(self):
+        """Source's CGameMovement::CategorizePosition: a short, fixed-
+        distance downward trace (independent of velocity) to determine
+        ground contact and the ground normal, run BEFORE movement each
+        tick using last tick's settled position."""
+        pos = to_render_pos(self.node_path.getPos())
+        probe_to = glm.vec3(pos.x, pos.y - _GROUND_TRACE_DISTANCE, pos.z)
+        result = self._sweep(self._current_shape, pos, probe_to)
+        if result.hasHit():
+            normal = to_render_vec(result.getHitNormal())
+            if normal.y >= self._max_slope_cos:
+                self._grounded = True
+                self._ground_normal = normal
+                return
+        self._grounded = False
+        self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
+
+    @staticmethod
+    def _clip_velocity(vel, normal, overbounce=1.0):
+        """Source's CGameMovement::ClipVelocity - projects vel onto the
+        plane defined by normal, removing the component driving INTO
+        the surface (a "slide along the wall" reflection, not a
+        bounce)."""
+        backoff = glm.dot(vel, normal) * overbounce
+        return vel - normal * backoff
+
+    def _try_move(self, shape, start_pos, start_vel, dt):
+        """Source's CGameMovement::TryPlayerMove: sweeps shape along
+        vel for up to _MAX_BUMPS planes, clipping velocity against
+        whatever it hits each time (sliding along walls), and sliding
+        along the CREASE where two hit planes meet this call rather
+        than getting stuck if the clipped velocity would drive back
+        into an earlier plane. Pure function - does not touch self.*,
+        just returns the resulting (pos, vel) so callers (see
+        _step_slide_move) can try more than one candidate move and
+        keep whichever is better."""
+        pos = glm.vec3(start_pos)
+        vel = glm.vec3(start_vel)
+        time_left = dt
+        hit_normals = []
+
+        for _ in range(_MAX_BUMPS):
+            if time_left <= 1e-9 or glm.length(vel) < 1e-6:
+                break
+
+            target = pos + vel * time_left
+            result = self._sweep(shape, pos, target)
+            if not result.hasHit():
+                pos = target
+                break
+
+            fraction = result.getHitFraction()
+            pos = pos + vel * time_left * fraction
+            time_left *= (1.0 - fraction)
+
+            normal = to_render_vec(result.getHitNormal())
+            pos = pos + normal * _SURFACE_PUSHBACK
+            hit_normals.append(normal)
+
+            new_vel = self._clip_velocity(vel, normal)
+            for other in hit_normals[:-1]:
+                if glm.dot(new_vel, other) < 0.0:
+                    # The plane we just clipped against would send us
+                    # back into an EARLIER plane this call already hit -
+                    # slide along the crease (the line where the two
+                    # planes meet) instead of stalling here, same as
+                    # Source's multi-plane handling in TryPlayerMove.
+                    crease = glm.cross(normal, other)
+                    crease_len_sq = glm.dot(crease, crease)
+                    if crease_len_sq > 1e-9:
+                        new_vel = crease * (glm.dot(vel, crease) / crease_len_sq)
+                    else:
+                        new_vel = glm.vec3(0.0)
+                    break
+            vel = new_vel
+
+        return pos, vel
+
+    def _step_slide_move(self, dt):
+        """Source's CGameMovement::StepMove: while grounded, tries the
+        move both flat (_try_move directly) and "stepped" (raise by up
+        to step_height, run the same horizontal move from there, then
+        settle back down onto the ground - handles both stepping UP
+        onto a small obstacle and conforming DOWN a slope or small
+        ledge within step_height in one mechanism), and keeps whichever
+        covers more horizontal ground - exactly Source's dual-attempt
+        approach, which is what makes small steps/slopes invisible to
+        the player while a genuine wall still stops them. Airborne,
+        there's no stepping at all (matches Source - AirMove never
+        steps), just the flat attempt."""
+        start_pos = to_render_pos(self.node_path.getPos())
+        start_vel = glm.vec3(self.velocity)
+
+        flat_pos, flat_vel = self._try_move(self._current_shape, start_pos, start_vel, dt)
+
+        if self._grounded:
+            up_target = glm.vec3(start_pos.x, start_pos.y + self.step_height, start_pos.z)
+            up_result = self._sweep(self._current_shape, start_pos, up_target)
+            if up_result.hasHit():
+                raised_pos = start_pos + glm.vec3(0.0, self.step_height, 0.0) * max(up_result.getHitFraction() - 0.01, 0.0)
+            else:
+                raised_pos = up_target
+
+            step_pos, step_vel = self._try_move(self._current_shape, raised_pos, start_vel, dt)
+
+            settle_distance = self.step_height + 0.05
+            down_target = glm.vec3(step_pos.x, step_pos.y - settle_distance, step_pos.z)
+            down_result = self._sweep(self._current_shape, step_pos, down_target)
+            if down_result.hasHit():
+                settled_pos = step_pos + glm.vec3(0.0, -settle_distance, 0.0) * down_result.getHitFraction()
+            else:
+                settled_pos = step_pos
+
+            flat_dist_sq = (flat_pos.x - start_pos.x) ** 2 + (flat_pos.z - start_pos.z) ** 2
+            step_dist_sq = (settled_pos.x - start_pos.x) ** 2 + (settled_pos.z - start_pos.z) ** 2
+
+            if step_dist_sq > flat_dist_sq + 1e-9:
+                final_pos, final_vel = settled_pos, step_vel
+            else:
+                final_pos, final_vel = flat_pos, flat_vel
+        else:
+            final_pos, final_vel = flat_pos, flat_vel
+
+        self.node_path.setPos(to_physics_pos(final_pos))
+        self.velocity = final_vel
+
+    # -----------------------------------------------------------------
+    # Public control surface (unchanged from the previous version)
+    # -----------------------------------------------------------------
 
     def set_move_direction(self, direction):
         """direction: glm.vec3 (or anything glm.vec3() accepts) on the
@@ -198,7 +417,7 @@ class CharacterController:
         self._sprinting = bool(sprinting)
 
     def set_crouching(self, crouching):
-        """crouching=True shrinks the collision capsule immediately and
+        """crouching=True shrinks the collision hull immediately and
         starts easing the camera toward crouch_eye_height.
         crouching=False requests standing back up, but is refused (and
         silently retried every tick) while something overhead blocks
@@ -207,17 +426,22 @@ class CharacterController:
         self._crouch_input = bool(crouching)
 
     def jump(self):
-        """Queues a jump for the next physics tick this capsule is on
-        the ground - safe to call every frame while the jump key is
-        held (matches Source: holding jump auto-hops on landing rather
-        than requiring a fresh press each time)."""
+        """Queues a jump for the next physics tick this hull is on the
+        ground - safe to call every frame while the jump key is held
+        (matches Source: holding jump auto-hops on landing rather than
+        requiring a fresh press each time)."""
         self._jump_requested = True
 
     def is_on_ground(self):
-        return self.node.isOnGround()
+        return self._grounded
 
     def is_crouched(self):
         return self._is_crouched
+
+    # -----------------------------------------------------------------
+    # Ground/air movement math (unchanged from the previous version -
+    # a direct port of Source's Friction/Accelerate/AirAccelerate)
+    # -----------------------------------------------------------------
 
     def _wish(self):
         length = glm.length(self._move_direction)
@@ -230,22 +454,28 @@ class CharacterController:
         return wishdir, wishspeed
 
     def _apply_friction(self, dt):
-        speed = glm.length(self.velocity)
+        horiz = glm.vec3(self.velocity.x, 0.0, self.velocity.z)
+        speed = glm.length(horiz)
         if speed < 1e-6:
-            self.velocity = glm.vec3(0.0)
+            self.velocity.x = 0.0
+            self.velocity.z = 0.0
             return
         control = max(speed, self.stop_speed)
         drop = control * self.friction * dt
         new_speed = max(speed - drop, 0.0)
-        self.velocity *= new_speed / speed
+        scale = new_speed / speed
+        self.velocity.x *= scale
+        self.velocity.z *= scale
 
     def _accelerate(self, wishdir, wishspeed, accel, dt):
-        current_speed = glm.dot(self.velocity, wishdir)
+        horiz = glm.vec3(self.velocity.x, 0.0, self.velocity.z)
+        current_speed = glm.dot(horiz, wishdir)
         add_speed = wishspeed - current_speed
         if add_speed <= 0.0:
             return
         accel_speed = min(accel * dt * wishspeed, add_speed)
-        self.velocity += accel_speed * wishdir
+        self.velocity.x += accel_speed * wishdir.x
+        self.velocity.z += accel_speed * wishdir.z
 
     def _air_accelerate(self, wishdir, wishspeed, accel, dt):
         # The add-speed check uses the CAPPED wishspeed (limits how much
@@ -254,129 +484,245 @@ class CharacterController:
         # wishspeed - see the module docstring for why this asymmetry
         # is intentional, not a typo.
         capped_wishspeed = min(wishspeed, _AIR_SPEED_CAP)
-        current_speed = glm.dot(self.velocity, wishdir)
+        horiz = glm.vec3(self.velocity.x, 0.0, self.velocity.z)
+        current_speed = glm.dot(horiz, wishdir)
         add_speed = capped_wishspeed - current_speed
         if add_speed <= 0.0:
             return
         accel_speed = min(accel * dt * wishspeed, add_speed)
-        self.velocity += accel_speed * wishdir
+        self.velocity.x += accel_speed * wishdir.x
+        self.velocity.z += accel_speed * wishdir.z
+
+    # -----------------------------------------------------------------
+    # Crouching (shape swap is now trivial - see the module docstring)
+    # -----------------------------------------------------------------
 
     def _can_stand(self):
         # Ignore self.node itself - the ghost is positioned right where
-        # the player's own capsule roughly is, so it would otherwise
+        # the player's own hull roughly is, so it would otherwise
         # always "detect" the player as blocking its own stand-up.
-        for node in self._stand_check_ghost.getOverlappingNodes():
-            if node != self.node:
+        #
+        # Uses BulletWorld.contactTest() - an immediate, on-demand
+        # narrow-phase query against the ghost's CURRENT transform -
+        # rather than BulletGhostNode.getOverlappingNodes(), which reads
+        # Bullet's cached broadphase pair list and can stay stale
+        # ("overlapping") for several ticks after the shapes have
+        # actually separated (confirmed empirically during development).
+        result = self._physics_world.world.contactTest(self._stand_check_ghost)
+        for i in range(result.getNumContacts()):
+            contact = result.getContact(i)
+            other = contact.getNode1() if contact.getNode0() == self._stand_check_ghost else contact.getNode0()
+            if other != self.node:
                 return False
         return True
 
     def _position_stand_check_ghost(self):
         # Centers the headroom-slice probe (see __init__) directly
         # above the player's current top, spanning up to where the
-        # standing capsule's top would be - never reaching down toward
-        # the floor at all, by construction. current_top is the current
-        # (crouched) capsule's TOP, not its center - the probe's center
-        # is current_top plus half the headroom slice above it.
+        # standing hull's top would be - never reaching down toward the
+        # floor at all, by construction. current_top is the current
+        # (crouched) hull's TOP, not its center - the probe's center is
+        # current_top plus half the headroom slice above it.
         current_pos = self.node_path.getPos()
-        standing_total = self._capsule_total_height(self._standing_cylinder_height)
-        current_total = self._capsule_total_height(self._current_cylinder_height)
-        headroom = standing_total - current_total
-        current_top = current_pos.z + current_total / 2.0
+        headroom = self.height - self._current_height
+        current_top = current_pos.z + self._current_height / 2.0
         candidate_pos = Point3(current_pos.x, current_pos.y, current_top + headroom / 2.0)
         self._stand_check_ghost_np.setPos(candidate_pos)
 
-    def _swap_to_shape(self, shape, cylinder_height):
-        # Keeps the capsule's BOTTOM (feet) fixed across the swap by
-        # shifting the center by half the total-height difference,
-        # rather than leaving the center in place - crouching should
-        # lower the head, not lift the feet off the ground.
-        old_total = self._capsule_total_height(self._current_cylinder_height)
-        new_total = self._capsule_total_height(cylinder_height)
+    def _swap_to_shape(self, shape, total_height, target_crouch_amount):
+        # Swaps the shape on the SAME persistent ghost node
+        # (addShape/removeShape, confirmed to work on a live node)
+        # rather than replacing the node itself, so self.velocity is
+        # never touched by this at all - unlike
+        # BulletCharacterControllerNode, there's no hidden internal
+        # state here that recreating a node would lose.
         old_pos = self.node_path.getPos()
-        new_pos = Point3(old_pos.x, old_pos.y, old_pos.z + (new_total - old_total) / 2.0)
 
-        self._physics_world.world.removeCharacter(self.node)
-        self.node_path.removeNode()
+        if self._grounded:
+            # Keeps the hull's BOTTOM (feet) fixed across the swap by
+            # shifting the center by half the total-height difference,
+            # rather than leaving the center in place - crouching
+            # should lower the head, not lift the feet off (or sink
+            # them into) the ground.
+            new_pos = Point3(old_pos.x, old_pos.y, old_pos.z + (total_height - self._current_height) / 2.0)
+        else:
+            # Airborne, there's no floor to plant feet against, so
+            # "feet stay fixed" is an arbitrary reference with nothing
+            # to do with what the player is actually looking at -
+            # anchoring on it mid-air just pops the CAMERA around for
+            # no physical reason. Anchor on the EYE position instead:
+            # shift the hull so the eye position ends up EXACTLY where
+            # it was before the swap - the view doesn't move at all,
+            # only the hitbox repositions around it. Uses
+            # target_crouch_amount rather than self._crouch_amount
+            # because _update_crouch's airborne eye-offset snap hasn't
+            # run yet this tick - this computes what the eye offset
+            # WILL be right after it does, so the two stay in sync.
+            old_eye_offset = self._eye_offset_for(self._current_height, self._crouch_amount)
+            new_eye_offset = self._eye_offset_for(total_height, target_crouch_amount)
+            new_pos = Point3(old_pos.x, old_pos.y, old_pos.z + (old_eye_offset - new_eye_offset))
 
-        new_node = self._make_node(shape)
-        new_node_path = self._physics_world._root.attachNewNode(new_node)
-        new_node_path.setPos(new_pos)
-        self._physics_world.world.attachCharacter(new_node)
+        self.node.removeShape(self._current_shape)
+        self.node.addShape(shape)
+        self.node_path.setPos(new_pos)
 
-        self.node = new_node
-        self.node_path = new_node_path
-        self._current_cylinder_height = cylinder_height
+        self._current_shape = shape
+        self._current_height = total_height
+
+        # This recenter is an intentional, instant repositioning - not
+        # per-tick sweep-test noise, so it must bypass get_position()'s
+        # vertical smoothing filter rather than being caught by it.
+        # Without this reset, the filter (see _on_pre_substep) treats
+        # the jump in raw Y as a new target to ease toward over its
+        # ~150ms window, which reads as the camera slowly drifting down
+        # over several frames instead of popping to the new height
+        # immediately - resetting both tracked points to the new
+        # position now makes this swap pass through instantly.
+        new_render_pos = to_render_pos(new_pos)
+        self._prev_position = new_render_pos
+        self._smoothed_position = glm.vec3(new_render_pos)
 
     def _update_crouch(self, dt):
         if self._crouch_input:
             if not self._is_crouched:
-                self._swap_to_shape(self._crouch_shape, self._crouch_cylinder_height)
+                self._swap_to_shape(self._crouch_shape, self._crouch_height, target_crouch_amount=1.0)
                 self._is_crouched = True
-        elif self._is_crouched and self._can_stand():
-            self._swap_to_shape(self._standing_shape, self._standing_cylinder_height)
-            self._is_crouched = False
-
-        if self._is_crouched:
-            # Positions the ghost for the NEXT tick's _can_stand() read -
-            # BulletGhostNode overlap results only refresh after a
-            # doPhysics() call, so this tick's query above reflects
-            # wherever the ghost was left last tick, a ~1/120s-old
-            # result. Imperceptible at that rate.
+        elif self._is_crouched:
+            # Position the probe at today's position, THEN check it -
+            # contactTest() (see _can_stand) queries fresh, so there's
+            # no need to check against yesterday's position anymore.
             self._position_stand_check_ghost()
+            if self._can_stand():
+                self._swap_to_shape(self._standing_shape, self.height, target_crouch_amount=0.0)
+                self._is_crouched = False
 
         target = 1.0 if self._is_crouched else 0.0
-        rate = dt / max(self.crouch_transition_time, 1e-6)
-        if self._crouch_amount < target:
-            self._crouch_amount = min(self._crouch_amount + rate, target)
+        if self._grounded:
+            # Ease over crouch_transition_time, same as always.
+            rate = dt / max(self.crouch_transition_time, 1e-6)
+            if self._crouch_amount < target:
+                self._crouch_amount = min(self._crouch_amount + rate, target)
+            else:
+                self._crouch_amount = max(self._crouch_amount - rate, target)
         else:
-            self._crouch_amount = max(self._crouch_amount - rate, target)
+            # Airborne: snap the EYE offset straight to the target
+            # instead of easing it. The hull itself already swaps
+            # instantly regardless of ground state (matches Source's
+            # duck-jump - crouching mid-air changes your hitbox right
+            # away for tech like fitting through gaps), but easing the
+            # CAMERA over crouch_transition_time on top of an
+            # independently-falling capsule reads as the view doing its
+            # own thing while also plummeting - confusing rather than
+            # smooth. On the ground there's no such competing motion,
+            # so the eased transition there still reads fine.
+            self._crouch_amount = target
+
+    # -----------------------------------------------------------------
+    # Main per-tick update (Source's CGameMovement::PlayerMove, in the
+    # same order: categorize ground, handle jump/gravity, apply
+    # friction+accel, then resolve the actual move)
+    # -----------------------------------------------------------------
 
     def _on_pre_substep(self, dt):
+        raw = to_render_pos(self.node_path.getPos())
+
+        # Only while grounded - airborne there's no ground-contact
+        # sweep to be noisy about (free-fall is already perfectly
+        # smooth with no filtering at all), and this filter's lag is
+        # proportional to velocity * tau, which is negligible at
+        # walking speed but becomes a real, visible trailing offset at
+        # jump/fall speed - filtering that away would just make the
+        # camera noticeably lag behind where the hull actually is for
+        # the whole arc of every jump.
+        if self._grounded:
+            alpha_smooth = 1.0 - math.exp(-dt / _EYE_SMOOTH_TAU)
+        else:
+            alpha_smooth = 1.0
+        smoothed_y = self._smoothed_position.y + (raw.y - self._smoothed_position.y) * alpha_smooth
+
+        self._prev_position = self._smoothed_position
+        self._smoothed_position = glm.vec3(raw.x, smoothed_y, raw.z)
+
         self._update_crouch(dt)
 
-        grounded = self.is_on_ground()
-        wishdir, wishspeed = self._wish()
+        # Ground state uses last tick's settled position, BEFORE this
+        # tick's movement - matches Source's CategorizePosition, which
+        # runs at the start of PlayerMove using the position left over
+        # from the previous frame.
+        self._categorize_position()
 
-        if grounded:
+        if self._grounded and self.velocity.y < 0.0:
+            # Landed (or resting) - clear any residual downward
+            # velocity so it doesn't accumulate call after call; actual
+            # ground-conforming (slopes, small ledges) is handled by
+            # _step_slide_move's position-based settle, not by feeding
+            # it a persistent downward speed.
+            self.velocity.y = 0.0
+
+        if self._jump_requested and self._grounded:
+            self.velocity.y = self.jump_speed
+            self._grounded = False
+        self._jump_requested = False
+
+        wishdir, wishspeed = self._wish()
+        if self._grounded:
             self._apply_friction(dt)
             self._accelerate(wishdir, wishspeed, self.ground_accel, dt)
         else:
+            self.velocity.y -= self.gravity * dt
             self._air_accelerate(wishdir, wishspeed, self.air_accel, dt)
 
-        if self._jump_requested and grounded:
-            self.node.doJump()
-        self._jump_requested = False
-
-        self.node.setLinearMovement(to_physics_vec(self.velocity), True)
+        self._step_slide_move(dt)
 
     def get_position(self):
-        """Render-space glm.vec3 - the capsule's current center
-        position (its height above this changes when crouched - see
-        get_eye_offset for a camera offset that accounts for that)."""
-        return to_render_pos(self.node_path.getPos())
+        """Render-space glm.vec3 - the hull's current center position
+        (its height above this changes when crouched - see
+        get_eye_offset for a camera offset that accounts for that).
+
+        Interpolated between the last two completed physics substeps
+        (see PhysicsWorld.get_interpolation_alpha()) rather than
+        returning the raw physics position directly - physics runs at a
+        fixed 120Hz while rendering runs at whatever the display does,
+        so without this a render frame that lands between two substeps
+        would see the same position repeat and then jump, reading as
+        jitter (worst at low speed, where each tick's actual movement
+        is small next to that jump). The Y axis is additionally
+        low-pass filtered while grounded (see _on_pre_substep) to
+        smooth out any residual per-tick sweep-test noise while
+        walking; X/Z are exact, unfiltered physics positions."""
+        alpha = self._physics_world.get_interpolation_alpha()
+        return glm.mix(self._prev_position, self._smoothed_position, alpha)
+
+    def _eye_offset_for(self, current_height, crouch_amount):
+        """Render-space Y offset from a hull center to where the camera
+        should sit, for an arbitrary (current_height, crouch_amount)
+        pair rather than necessarily the controller's own current
+        state - factored out so _swap_to_shape can compute this for
+        the state BEFORE and the state AFTER a hull swap (see its
+        eye-anchored branch) without duplicating the formula."""
+        standing_feet_to_eye = self.height / 2.0 + self.eye_height
+        crouch_feet_to_eye = self._crouch_height / 2.0 + self.crouch_eye_height
+        feet_to_eye = standing_feet_to_eye + (crouch_feet_to_eye - standing_feet_to_eye) * crouch_amount
+
+        feet_offset_from_center = -current_height / 2.0
+        return feet_offset_from_center + feet_to_eye
 
     def get_eye_offset(self):
         """Render-space Y offset from get_position() a first-person
-        camera should sit at. Computed from the FEET position (which
-        _swap_to_shape keeps invariant across the standing/crouch hull
-        swap) rather than get_position() directly, so this eases
-        smoothly across crouch_transition_time even though the
-        collision hull itself resizes in one instant - see the module
-        docstring's CROUCHING section."""
-        standing_total = self._capsule_total_height(self._standing_cylinder_height)
-        crouch_total = self._capsule_total_height(self._crouch_cylinder_height)
-        current_total = self._capsule_total_height(self._current_cylinder_height)
-
-        standing_feet_to_eye = standing_total / 2.0 + self.eye_height
-        crouch_feet_to_eye = crouch_total / 2.0 + self.crouch_eye_height
-        feet_to_eye = standing_feet_to_eye + (crouch_feet_to_eye - standing_feet_to_eye) * self._crouch_amount
-
-        feet_offset_from_center = -current_total / 2.0
-        return feet_offset_from_center + feet_to_eye
+        camera should sit at. When grounded, this eases smoothly across
+        crouch_transition_time even though the collision hull itself
+        resizes in one instant, because _swap_to_shape keeps the FEET
+        position invariant across that resize - see the module
+        docstring's CROUCHING section. Airborne, _swap_to_shape instead
+        keeps the EYE position itself invariant (see its comment for
+        why "feet planted" doesn't mean anything with no floor to plant
+        against), so this doesn't need to smooth anything there - the
+        camera was never moved by the swap in the first place."""
+        return self._eye_offset_for(self._current_height, self._crouch_amount)
 
     def destroy(self):
         self._physics_world.remove_pre_substep_callback(self._on_pre_substep)
         self._physics_world.world.removeGhost(self._stand_check_ghost)
         self._stand_check_ghost_np.removeNode()
-        self._physics_world.world.removeCharacter(self.node)
+        self._physics_world.world.removeGhost(self.node)
         self.node_path.removeNode()

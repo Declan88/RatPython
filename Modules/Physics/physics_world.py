@@ -183,6 +183,21 @@ class PhysicsWorld:
             self.world.doPhysics(_PHYSICS_FIXED_TIMESTEP, 1, _PHYSICS_FIXED_TIMESTEP)
             self._accumulator -= _PHYSICS_FIXED_TIMESTEP
 
+    def get_interpolation_alpha(self):
+        """Fraction (0-1) of a fixed timestep that's elapsed since the
+        last completed substep - i.e. how far real time has crept into
+        the NEXT tick that hasn't been simulated yet. Above ~120fps
+        (see step()'s docstring), most render frames land between two
+        physics substeps, so anything reading a raw physics position
+        every render frame sees it hold still for a frame or two and
+        then jump - most visible at low speed, where each tick's actual
+        movement is small next to that jump. CharacterController.
+        get_position() blends between last tick's and this tick's
+        position by this fraction to smooth that out (the standard
+        fixed-timestep-with-interpolation fix - see e.g. Glenn
+        Fiedler's "Fix Your Timestep!")."""
+        return self._accumulator / _PHYSICS_FIXED_TIMESTEP
+
     # ---------------------------------------------------------------
     # STATIC COLLIDERS (mass = 0, never move - level geometry)
     # ---------------------------------------------------------------
@@ -231,17 +246,24 @@ class PhysicsWorld:
     # ---------------------------------------------------------------
 
     def add_dynamic_box(self, half_extents, position=None, rotation=None,
-                         mass=1.0, collision_mask=CollisionGroup.ALL):
+                         mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
         shape = BulletBoxShape(to_physics_extent(half_extents))
-        return self._add_body(shape, mass, position, rotation, collision_mask, "dynamic_box")
+        return self._add_body(
+            shape, mass, position, rotation, collision_mask, "dynamic_box",
+            gravity=gravity, kinematic=kinematic,
+        )
 
     def add_dynamic_sphere(self, radius, position=None, mass=1.0,
-                            collision_mask=CollisionGroup.ALL):
+                            collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
         shape = BulletSphereShape(float(radius))
-        return self._add_body(shape, mass, position, None, collision_mask, "dynamic_sphere")
+        return self._add_body(
+            shape, mass, position, None, collision_mask, "dynamic_sphere",
+            gravity=gravity, kinematic=kinematic,
+        )
 
     def add_dynamic_mesh(self, model_path, position=None, rotation=None,
-                          scale=None, mass=1.0, collision_mask=CollisionGroup.ALL):
+                          scale=None, mass=1.0, collision_mask=CollisionGroup.ALL,
+                          gravity=True, kinematic=False):
         """Convex-hull collision built from model_path's vertices -
         Bullet doesn't allow exact triangle-mesh shapes on moving
         bodies, so this is the closest a dynamic prop can get to its
@@ -252,7 +274,10 @@ class PhysicsWorld:
         for v in vertices:
             shape.addPoint(to_physics_pos(v))
 
-        return self._add_body(shape, mass, position, rotation, collision_mask, "dynamic_mesh")
+        return self._add_body(
+            shape, mass, position, rotation, collision_mask, "dynamic_mesh",
+            gravity=gravity, kinematic=kinematic,
+        )
 
     # ---------------------------------------------------------------
     # BOUNDS-DERIVED COLLIDERS (box/sphere sized automatically from a
@@ -280,33 +305,59 @@ class PhysicsWorld:
         return self.add_static_box(half_extents, position=center, rotation=rotation, collision_mask=collision_mask)
 
     def add_dynamic_box_from_bounds(self, model_path, position=None, rotation=None, scale=None,
-                                     mass=1.0, collision_mask=CollisionGroup.ALL):
+                                     mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
         """Like add_dynamic_box, but derives half_extents automatically
         from model_path's own vertex bounds."""
         center, half_extents = self._bounds_center_and_half_extents(model_path, position, rotation, scale)
-        return self.add_dynamic_box(half_extents, position=center, rotation=rotation, mass=mass, collision_mask=collision_mask)
+        return self.add_dynamic_box(
+            half_extents, position=center, rotation=rotation, mass=mass,
+            collision_mask=collision_mask, gravity=gravity, kinematic=kinematic,
+        )
 
     def add_dynamic_sphere_from_bounds(self, model_path, position=None, scale=None,
-                                        mass=1.0, collision_mask=CollisionGroup.ALL):
+                                        mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False):
         """Like add_dynamic_sphere, but derives a radius automatically
         from model_path's own vertex bounds (the largest half-extent
         across the 3 axes - errs on the side of a slightly-too-big
         sphere for a non-cubic mesh rather than clipping through it)."""
         center, half_extents = self._bounds_center_and_half_extents(model_path, position, None, scale)
         radius = max(half_extents.x, half_extents.y, half_extents.z)
-        return self.add_dynamic_sphere(radius, position=center, mass=mass, collision_mask=collision_mask)
+        return self.add_dynamic_sphere(
+            radius, position=center, mass=mass, collision_mask=collision_mask,
+            gravity=gravity, kinematic=kinematic,
+        )
 
     # ---------------------------------------------------------------
 
-    def _add_body(self, shape, mass, position, rotation, collision_mask, name):
+    def _add_body(self, shape, mass, position, rotation, collision_mask, name, gravity=True, kinematic=False):
         node = BulletRigidBodyNode(name)
         node.addShape(shape)
-        node.setMass(mass)
-        if mass > 0.0:
-            # Dynamic bodies here are typically just a handful of
-            # props, not enough to need sleep/wake bookkeeping - always
-            # simulating avoids "why did that stop responding" surprises.
+
+        if kinematic:
+            # A kinematic body is immovable by any physical force or
+            # collision impulse - completely unlike gravity=False
+            # (still a normal mass-having dynamic body that anything
+            # can shove around, which is exactly why a "spin in place"
+            # object built that way flew off the moment it touched
+            # anything). Its transform is instead driven entirely by
+            # the application every frame (see PhysicsWorld.
+            # set_transform / Scene.update's handling of a _kinematic
+            # object) - Bullet reads that transform for collision
+            # purposes but never writes to it. Conventionally mass=0,
+            # same as a static body, but flagged kinematic so Bullet
+            # still treats it as capable of moving (a mass=0 body
+            # without this flag is assumed permanently fixed).
+            node.setMass(0.0)
+            node.setKinematic(True)
             node.setDeactivationEnabled(False)
+        else:
+            node.setMass(mass)
+            if mass > 0.0:
+                # Dynamic bodies here are typically just a handful of
+                # props, not enough to need sleep/wake bookkeeping -
+                # always simulating avoids "why did that stop
+                # responding" surprises.
+                node.setDeactivationEnabled(False)
         node.setIntoCollideMask(collision_mask)
 
         node_path = self._root.attachNewNode(node)
@@ -315,6 +366,19 @@ class PhysicsWorld:
             node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
 
         self.world.attachRigidBody(node)
+
+        if not kinematic and mass > 0.0 and not gravity:
+            # A per-body override (BulletRigidBodyNode.setGravity), not
+            # the world's own gravity - this body still has mass and
+            # full contact response (things can push it, it can push
+            # them), it just isn't pulled down by gravity. Meaningless
+            # for mass=0 (static/kinematic) bodies, which gravity never
+            # affects anyway. Set AFTER attachRigidBody, not before -
+            # confirmed empirically that attachRigidBody overwrites any
+            # gravity set beforehand with the world's own, silently
+            # discarding a pre-attach override.
+            node.setGravity(Vec3(0, 0, 0))
+
         self._node_paths.append(node_path)
         return node_path
 
@@ -324,6 +388,21 @@ class PhysicsWorld:
         sync a dynamic Scene object's transform to wherever physics
         moved it (see Scene.update)."""
         return to_render_pos(node_path.getPos()), glm.eulerAngles(to_render_quat(node_path.getQuat()))
+
+    def set_transform(self, node_path, position, rotation):
+        """The inverse of get_transform() - pushes a render-space
+        position/rotation (glm.vec3 position, glm.vec3 XYZ-radians
+        rotation) ONTO a physics node_path, rather than reading physics
+        state off of it. For a KINEMATIC body (see add_dynamic_box's
+        kinematic parameter): unlike a normal dynamic body, whose
+        transform the simulation itself owns and Scene.update() reads
+        FROM every frame, a kinematic body's transform is driven by the
+        application - Bullet reads it back out each step to know where
+        the body is for collision purposes, but never writes to it
+        itself. Call this every frame for a kinematic body instead of
+        get_transform()."""
+        node_path.setPos(to_physics_pos(position))
+        node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
 
     def destroy(self):
         for node_path in self._node_paths:

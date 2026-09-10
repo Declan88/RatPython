@@ -110,6 +110,8 @@ void main() {
 
 FRAGMENT_SHADER_BODY = """
 uniform vec3 u_light_dir;
+uniform vec3 u_light_color;
+uniform float u_light_intensity;
 uniform vec3 u_eye_pos;
 uniform mat4 u_view_matrix;
 
@@ -136,6 +138,11 @@ uniform float u_point_light_radius[MAX_POINT_LIGHTS];
 
 uniform sampler2D u_lightmap;
 uniform int u_has_lightmap;
+
+// Hemisphere ("skylight"-style) ambient - see bind_environment() and
+// Scene.add_equirect_skybox/add_skybox for where these come from.
+uniform vec3 u_sky_color;
+uniform vec3 u_ground_color;
 
 in vec3 v_position;
 in vec3 v_normal;
@@ -257,7 +264,7 @@ void main() {
 
     vec3 diffuse = albedo * NdotL;
     vec3 specular = specular_color * spec * NdotL * u_specular_strength;
-    vec3 direct_light = (diffuse + specular) * vec3(2.0) * shadow_attenuation;
+    vec3 direct_light = (diffuse + specular) * u_light_color * u_light_intensity * shadow_attenuation;
 
     vec3 point_light_sum = vec3(0.0);
     if (u_has_lightmap == 1) {
@@ -272,7 +279,16 @@ void main() {
         }
     }
 
-    vec3 ambient = vec3(0.025) * albedo;
+    // Hemisphere ambient (a simplified, 2-term stand-in for a full
+    // spherical-harmonics "skylight"): blends between the sky and
+    // ground colors by how much the surface faces up vs down, rather
+    // than a single flat ambient constant - an upward-facing floor
+    // picks up the sky's color/brightness, a downward-facing ceiling
+    // the ground's, and a vertical wall gets an even mix. N.y is in
+    // WORLD space here (v_normal is transformed by u_model, not view),
+    // so this stays correct regardless of camera orientation.
+    vec3 hemisphere_ambient = mix(u_ground_color, u_sky_color, N.y * 0.5 + 0.5);
+    vec3 ambient = hemisphere_ambient * albedo;
     vec3 color = direct_light + point_light_sum + ambient + u_emissive;
 
     color = color / (color + vec3(1.0));
@@ -351,8 +367,14 @@ def _bind_lightmap(prog, item_data):
 
 
 def bind_material(
-    prog, item_data, model_matrix, camera, light_dir, shadow_manager=None
+    prog, item_data, model_matrix, camera, light_dir, shadow_manager=None,
+    light_color=(1.0, 1.0, 1.0), light_intensity=2.0
 ):
+    """light_color/light_intensity: the directional (sun) light's own
+    color and brightness multiplier - see Scene.light_color/
+    Scene.light_intensity. Defaults match this shader's previous
+    hardcoded behavior (implicitly white at a fixed 2.0 multiplier)
+    exactly, for any caller that doesn't pass them."""
     view = camera.get_view_matrix()
     mvp = camera.get_projection_matrix() * view * model_matrix
 
@@ -361,6 +383,8 @@ def bind_material(
         "u_model": model_matrix.to_bytes(),
         "u_view_matrix": view.to_bytes(),
         "u_light_dir": tuple(light_dir),
+        "u_light_color": tuple(light_color),
+        "u_light_intensity": float(light_intensity),
         "u_eye_pos": tuple(camera.position),
         "u_metallic": item_data.get("metallic", 0.0),
         "u_roughness": min(item_data.get("roughness", 1.0), 1.0),
@@ -378,6 +402,16 @@ def bind_material(
     _bind_material_textures(prog, item_data)
     _bind_shadow_uniforms(prog, shadow_manager)
     _bind_lightmap(prog, item_data)
+
+
+def bind_environment(prog, sky_color, ground_color):
+    """Binds the hemisphere ambient uniforms - see Scene.
+    environment_sky_color/environment_ground_color (set by
+    add_equirect_skybox/add_skybox) and the fragment shader's
+    hemisphere_ambient computation. Call this once per frame, same as
+    bind_point_lights - this doesn't vary between objects."""
+    _write_uniform(prog, "u_sky_color", tuple(sky_color))
+    _write_uniform(prog, "u_ground_color", tuple(ground_color))
 
 
 def bind_point_lights(prog, point_lights):
