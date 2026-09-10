@@ -72,22 +72,11 @@ class TorusScene(Scene):
             "Assets/Models/Testmap/plane.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),
             collision=True,
-            collision_exclude_local_bounds=((4.0, -0.2, 0.1), (6.6, 3.8, 4.2)),
-        )
-        self.physics.add_static_box(
-            (1.1413, 0.2, 2.5155),
-            position=(5.3074, 0.8458, 1.9520),
-            rotation=(-0.8086, 0.0, 0.0),
         )
         # The staircase's own flat top landing (past the last tread, local
         # z:[3.689,4.134] at a constant y=3.665) - also inside the excluded
         # bounds above, so it needs its own simple flat box to stay solid;
         # unrotated, it just butts up against the ramp's top end.
-        self.physics.add_static_box(
-            (1.1413, 0.1, 0.2224),
-            position=(5.3074, 2.665, 3.9114),
-        )
-
         self.add_static(
             "Assets/Models/Testmap/plane2.glb",
             transform=glm.translate(glm.mat4(1.0), glm.vec3(0.0, -1.0, 0.0)),

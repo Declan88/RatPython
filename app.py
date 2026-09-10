@@ -72,7 +72,7 @@ def main():
     # ~46.3 degrees, fit to the actual tread-nosing line rather than a
     # shallower approximation, so it needs a hair more headroom to count
     # as walkable floor instead of a wall.
-    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0), max_slope_degrees=47.0)
+    player = CharacterController(current_scene.physics, position=(0.0, 2.0, 3.0), height=1.5, max_slope_degrees=47.0)
 
     net_mgr = NetworkManager(camera)
 
