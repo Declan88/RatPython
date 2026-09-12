@@ -216,19 +216,32 @@ class Skeleton:
         self.joints = joints  # list[Joint], in skin.joints order
         self.animations = animations  # dict[name -> AnimationClip]
 
-    def compute_bone_matrices(self, animation_name, time):
-        """Returns a list of glm.mat4, one per joint (same order as
-        self.joints), ready to upload as the GPU skinning palette."""
-        clip = self.animations.get(animation_name)
+    def _empty_pose(self):
         joint_count = len(self.joints)
+        return [None] * joint_count, [None] * joint_count, [None] * joint_count
 
-        if clip is not None:
-            translations, rotations, scales = clip.sample_pose(joint_count, time)
-        else:
-            translations = [None] * joint_count
-            rotations = [None] * joint_count
-            scales = [None] * joint_count
+    def _sample_clip(self, animation_name, time):
+        """(translations, rotations, scales) - one list of length
+        len(self.joints) each, per-joint None where neither this clip
+        nor (below) the caller has anything for that joint - see
+        AnimationClip.sample_pose. animation_name=None (or unknown)
+        returns all-None, meaning "use bind pose" once _world_matrices
+        below falls through to joint.local_bind_matrix."""
+        clip = self.animations.get(animation_name)
+        if clip is None:
+            return self._empty_pose()
+        return clip.sample_pose(len(self.joints), time)
 
+    def _world_matrices(self, translations, rotations, scales):
+        """Shared hierarchy walk: given a per-joint local pose (any
+        entry may be None, meaning "use this joint's bind-pose local
+        transform instead" - see AnimationClip.sample_pose), returns the
+        final list of glm.mat4 skinning matrices (world * inverse_bind),
+        one per joint, ready to upload as the GPU skinning palette. Used
+        by both compute_bone_matrices (single clip) and
+        compute_blended_bone_matrices (two clips, picked per joint by a
+        mask) - the walk itself doesn't care where each joint's local
+        pose came from."""
         world_cache = {}
 
         def world_matrix(i):
@@ -253,7 +266,76 @@ class Skeleton:
             world_cache[i] = world
             return world
 
-        return [world_matrix(i) * self.joints[i].inverse_bind_matrix for i in range(joint_count)]
+        return [world_matrix(i) * self.joints[i].inverse_bind_matrix for i in range(len(self.joints))]
+
+    def compute_bone_matrices(self, animation_name, time):
+        """Returns a list of glm.mat4, one per joint (same order as
+        self.joints), ready to upload as the GPU skinning palette."""
+        translations, rotations, scales = self._sample_clip(animation_name, time)
+        return self._world_matrices(translations, rotations, scales)
+
+    def compute_joint_mask(self, root_joint_names):
+        """Returns a list[bool] of length len(self.joints): True for
+        every joint whose name is in root_joint_names, OR that is a
+        transitive descendant (via parent_joint_index) of one that is.
+
+        A list rather than a single root is deliberate, not just for
+        flexibility: some rigs don't have one continuous "upper body"
+        branch. rat.glb's Source/Valve Biped rig, for instance, parents
+        its shoulder/arm/neck/head chain ("Spine4" and everything under
+        it) directly to the PELVIS, as a sibling of the spine twist
+        bones ("Spine"/"Spine1"/"Spine2") rather than a descendant of
+        the last one - so "upper body" there is the union of two
+        separate subtrees (["...Spine", "...Spine4"]), not one pivot
+        joint's descendants. Unknown names in root_joint_names are
+        silently ignored (contribute nothing to the mask) rather than
+        raising, so a caller can pass a name list that's a superset of
+        what a specific model's rig actually has."""
+        name_to_index = {joint.name: i for i, joint in enumerate(self.joints)}
+        root_indices = {name_to_index[name] for name in root_joint_names if name in name_to_index}
+
+        mask = [False] * len(self.joints)
+        for i, joint in enumerate(self.joints):
+            # Walk up this joint's own parent chain - True if it passes
+            # through any root index (including being one itself).
+            j = i
+            while j != -1:
+                if j in root_indices:
+                    mask[i] = True
+                    break
+                j = self.joints[j].parent_joint_index
+        return mask
+
+    def compute_blended_bone_matrices(self, lower_animation, lower_time,
+                                       upper_animation, upper_time, upper_joint_mask):
+        """Like compute_bone_matrices, but each joint's LOCAL pose comes
+        from upper_animation (sampled at upper_time) where
+        upper_joint_mask[joint_index] is True, and from lower_animation
+        (sampled at lower_time) everywhere else - e.g. lower_animation
+        driving legs/hips (idle/walk/run/jump/crouch) while
+        upper_animation independently drives spine/arms/neck/head (a gun-
+        holding pose), composited into one skeleton per frame. The
+        hierarchy walk (world = parent_world * local) is unchanged and
+        uniform - a joint's WORLD transform still depends on its
+        parent's world transform regardless of which clip sourced its
+        own local one, which is exactly how this kind of partial-body
+        blend is supposed to work (an upper-body arm bone still follows
+        the lower-body pelvis/spine root motion underneath it).
+
+        upper_animation=None (no upper clip configured/playing yet)
+        makes every joint fall back to lower_animation, matching
+        compute_bone_matrices(lower_animation, lower_time) exactly -
+        callers don't need a separate "no blending" code path."""
+        lower_t, lower_r, lower_s = self._sample_clip(lower_animation, lower_time)
+        if upper_animation is None:
+            return self._world_matrices(lower_t, lower_r, lower_s)
+
+        upper_t, upper_r, upper_s = self._sample_clip(upper_animation, upper_time)
+
+        translations = [upper_t[i] if upper_joint_mask[i] else lower_t[i] for i in range(len(self.joints))]
+        rotations = [upper_r[i] if upper_joint_mask[i] else lower_r[i] for i in range(len(self.joints))]
+        scales = [upper_s[i] if upper_joint_mask[i] else lower_s[i] for i in range(len(self.joints))]
+        return self._world_matrices(translations, rotations, scales)
 
 
 def _extract_material(ctx, gltf, blob, material_index, glb_dir):

@@ -417,7 +417,9 @@ class Scene:
 
     def add_skeletal(self, model_path, position=None, rotation=None, scale=None,
                       transform=None, animation=None, metallic=None, roughness=None,
-                      emissive=None, texture_path=None):
+                      emissive=None, texture_path=None,
+                      visible_in_color=True, cast_shadow=True,
+                      upper_body_root_joints=None, upper_animation=None):
         """Loads a skinned/animated glb - see skeletal_loader.py for
         format constraints (one skin, one mesh primitive, LINEAR/STEP
         interpolation only).
@@ -432,6 +434,29 @@ class Scene:
         automatically once it reaches the end). Pass None to start in the
         bind/rest pose with nothing playing yet - use
         set_skeletal_animation() later to start one.
+
+        visible_in_color/cast_shadow: both default True (existing
+        behavior, unchanged for every current caller). Set
+        visible_in_color=False to still cast a shadow every frame (see
+        _render_shadows) without ever being drawn in the normal color
+        pass - built for a first-person player's own body model, which
+        should shadow the ground but never actually be seen by its own
+        camera. cast_shadow=False is the inverse (visible, no shadow).
+        Bone matrices are still recomputed every frame in Scene.update()
+        regardless of either flag, since a shadow-only object still
+        needs correct bones for its shadow draw.
+
+        upper_body_root_joints: optional list of joint names (see
+        Skeleton.compute_joint_mask - a list, not a single pivot joint,
+        since some rigs split into more than one subtree there). When
+        given, `animation`/set_skeletal_animation drive every OTHER
+        joint (the "lower body") while a second, independently-timed
+        clip - set via upper_animation here or set_skeletal_upper_
+        animation() later - drives just the masked joints, composited
+        into one skeleton each frame (Skeleton.
+        compute_blended_bone_matrices). Leave this None (the default)
+        for the existing single-clip behavior - untouched for every
+        current caller.
 
         Skeletal objects are always real-time only, never lightmap-baked
         - they're inherently dynamic (animated), so
@@ -461,10 +486,19 @@ class Scene:
         final_emissive = emissive if emissive is not None else data.get("emissive", [0.0, 0.0, 0.0])
 
         skeleton = data["skeleton"]
-        initial_bones = (
-            skeleton.compute_bone_matrices(animation, 0.0) if animation is not None
-            else [glm.mat4(1.0) for _ in skeleton.joints]
+        upper_joint_mask = (
+            skeleton.compute_joint_mask(upper_body_root_joints)
+            if upper_body_root_joints is not None else None
         )
+
+        if upper_joint_mask is not None:
+            initial_bones = skeleton.compute_blended_bone_matrices(
+                animation, 0.0, upper_animation, 0.0, upper_joint_mask
+            )
+        elif animation is not None:
+            initial_bones = skeleton.compute_bone_matrices(animation, 0.0)
+        else:
+            initial_bones = [glm.mat4(1.0) for _ in skeleton.joints]
 
         obj = {
             "vao": render_vao_info["vao"],
@@ -476,6 +510,9 @@ class Scene:
             "skeleton": skeleton,
             "animation": animation,
             "anim_time": 0.0,
+            "upper_joint_mask": upper_joint_mask,
+            "upper_animation": upper_animation,
+            "upper_anim_time": 0.0,
             "bone_matrices": initial_bones,
             "texture": texture,
             "metallic_roughness_texture": mr_texture,
@@ -486,6 +523,8 @@ class Scene:
             "has_metallic_roughness_texture": 1 if mr_texture else 0,
             "has_lightmap_uv": False,
             "lightmap_texture": None,
+            "visible_in_color": bool(visible_in_color),
+            "cast_shadow": bool(cast_shadow),
         }
 
         if transform is not None:
@@ -505,6 +544,18 @@ class Scene:
         glb actually has)."""
         obj["animation"] = animation_name
         obj["anim_time"] = 0.0
+
+    def set_skeletal_upper_animation(self, obj, animation_name):
+        """The upper-body equivalent of set_skeletal_animation - only
+        meaningful for an obj created with upper_body_root_joints set
+        (see add_skeletal); switches just the masked joints' clip,
+        restarting THEIR time from 0 independently of the lower-body
+        anim_time. Calling this on an obj without a mask configured is
+        harmless (the fields get set but nothing ever reads them, since
+        Scene.update()'s bone recompute only takes the blended path when
+        obj["upper_joint_mask"] is not None)."""
+        obj["upper_animation"] = animation_name
+        obj["upper_anim_time"] = 0.0
 
     # =============================================================
     # SKYBOX
@@ -965,17 +1016,41 @@ class Scene:
                 obj["rotation"].y += rot_speed * dt
 
         for obj in self.skeletal_objects:
+            skeleton = obj["skeleton"]
+            upper_mask = obj.get("upper_joint_mask")
+
+            # Lower-body (or, with no upper_joint_mask, the object's only)
+            # clip time advance - unchanged from before per-object.
+            if obj["animation"] is not None:
+                clip = skeleton.animations.get(obj["animation"])
+                obj["anim_time"] = (
+                    (obj["anim_time"] + dt) % clip.duration if clip is not None and clip.duration > 0.0 else 0.0
+                )
+
+            if upper_mask is not None:
+                # Upper-body clip advances independently of the lower
+                # one - see add_skeletal's upper_body_root_joints and
+                # Skeleton.compute_blended_bone_matrices. Runs even if
+                # obj["animation"] is None (lower body just sits in bind
+                # pose while the upper body still plays) and even if
+                # obj["upper_animation"] is None (compute_blended_bone_
+                # matrices then falls back to the lower clip for every
+                # joint, matching the single-clip behavior exactly).
+                if obj["upper_animation"] is not None:
+                    upper_clip = skeleton.animations.get(obj["upper_animation"])
+                    obj["upper_anim_time"] = (
+                        (obj["upper_anim_time"] + dt) % upper_clip.duration
+                        if upper_clip is not None and upper_clip.duration > 0.0 else 0.0
+                    )
+                obj["bone_matrices"] = skeleton.compute_blended_bone_matrices(
+                    obj["animation"], obj["anim_time"],
+                    obj["upper_animation"], obj["upper_anim_time"],
+                    upper_mask,
+                )
+                continue
+
             if obj["animation"] is None:
                 continue
-
-            skeleton = obj["skeleton"]
-            clip = skeleton.animations.get(obj["animation"])
-
-            if clip is None or clip.duration <= 0.0:
-                obj["bone_matrices"] = skeleton.compute_bone_matrices(obj["animation"], 0.0)
-                continue
-
-            obj["anim_time"] = (obj["anim_time"] + dt) % clip.duration
             obj["bone_matrices"] = skeleton.compute_bone_matrices(obj["animation"], obj["anim_time"])
 
     # =============================================================
@@ -1009,6 +1084,8 @@ class Scene:
                 obj["shadow_vao"].render()
 
             for obj in self.skeletal_objects:
+                if not obj.get("cast_shadow", True):
+                    continue
                 light_mvp = light_vp * self._get_model_matrix(obj)
                 self.skeletal_shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
                 bind_bone_matrices(self.skeletal_shadow_program, obj["bone_matrices"])
@@ -1054,6 +1131,8 @@ class Scene:
             obj["vao"].render()
 
         for obj in self.skeletal_objects:
+            if not obj.get("visible_in_color", True):
+                continue
             model_matrix = self._get_model_matrix(obj)
 
             # bind_material is fully generic on prog - reused as-is here

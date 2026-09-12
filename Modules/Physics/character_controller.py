@@ -137,6 +137,14 @@ _STEP_INTERVAL_WALK = 0.4   # STEPSOUNDTIME_NORMAL, bWalking ? 400 : 300 (ms -> 
 _STEP_INTERVAL_RUN = 0.3
 _STEP_INTERVAL_CROUCH_EXTRA = 0.1  # SetStepSoundTime's "+= 100" while FL_DUCKING
 
+# Minimum downward speed (m/s) at the moment ground is found for a
+# landing to count as a genuine fall worth a sound - see
+# _on_pre_substep's _fall_speed_on_touch and _update_footsteps'
+# just_landed. Comfortably above the sub-0.1 m/s noise a single tick (or
+# few) of ground-sweep flicker produces (e.g. pressed against a wall),
+# comfortably below any real jump/fall's landing speed.
+_MIN_LANDING_FALL_SPEED = 1.0
+
 # Per-surface walk/run volumes now come from footstep_materials.
 # get_footstep_volume (Source's own psurface->game.material switch in
 # UpdateStepSound), not a flat constant here. Ducking multiplies
@@ -287,6 +295,17 @@ class CharacterController:
         # reset to the next interval.
         self._step_sound_timer = 0.0
         self._pending_footstep = None
+        # Grounded state as of the END of the previous tick's footstep
+        # update - used only to detect a landing edge (see
+        # _update_footsteps' just_landed).
+        self._was_grounded = False
+        # Whether categorize_position found ground THIS tick, captured
+        # before the jump-request handling in _on_pre_substep can clear
+        # self._grounded again - see that capture site and
+        # _update_footsteps' just_landed for why this exists separately
+        # from self._grounded.
+        self._touched_ground = False
+        self._fall_speed_on_touch = 0.0
 
         # Last completed substep's (smoothed - see _on_pre_substep)
         # render-space position, for get_position() to interpolate
@@ -803,6 +822,32 @@ class CharacterController:
         # from the previous frame.
         self._categorize_position()
 
+        # Captured immediately after categorize_position, BEFORE the
+        # jump-request handling below can clear self._grounded again -
+        # holding jump (app.py calls player.jump() every frame the key
+        # is held, for Source-style auto-bunnyhop-on-landing) means a
+        # landing tick often immediately re-launches within the SAME
+        # tick, so by the time _update_footsteps runs later this tick,
+        # self._grounded already reads False again even though the hull
+        # genuinely touched the floor a few lines up. _update_footsteps
+        # needs to see that real, if momentary, ground contact to fire a
+        # landing sound - see its just_landed.
+        self._touched_ground = self._grounded
+        # How fast the hull was actually falling at the moment ground
+        # was found this tick (0 if it wasn't falling at all) - see
+        # _update_footsteps' just_landed for why this gates the landing
+        # sound instead of self._touched_ground alone: pressed against a
+        # wall while otherwise resting on the floor, the ground sweep
+        # can flicker no-hit/hit tick to tick (the same class of sweep-
+        # margin noise noted elsewhere in this file) with velocity.y
+        # sitting at ~0 throughout - not a real fall, just noise - and
+        # firing a landing sound on every one of those flickers reads as
+        # a machine-gun of footsteps while just standing still shoving a
+        # wall. A genuine fall (even a small hop) carries real downward
+        # speed by the time it's caught here; standing-still noise does
+        # not.
+        self._fall_speed_on_touch = -self.velocity.y if self.velocity.y < 0.0 else 0.0
+
         if self._grounded and self.velocity.y < 0.0:
             # Landed (or resting) - clear any residual downward
             # velocity so it doesn't accumulate call after call; actual
@@ -839,8 +884,45 @@ class CharacterController:
         the next interval - it does NOT reset just because the player
         stopped or went airborne, matching Source exactly (there's no
         such reset in UpdateStepSound either)."""
+        # Landing edge (was airborne last tick, touched ground THIS
+        # tick) - deliberately keyed off self._touched_ground, captured
+        # in _on_pre_substep right after categorize_position, rather
+        # than self._grounded as it reads down here. With jump held
+        # (app.py calls player.jump() every frame the key's down, for
+        # Source-style auto-bunnyhop-on-landing), a landing tick almost
+        # always re-launches within that SAME tick - by the time this
+        # method runs, self._jump_requested handling in _on_pre_substep
+        # has already flipped self._grounded back to False, even though
+        # the hull genuinely touched the floor a few lines earlier that
+        # tick. Using the stale self._grounded here would mean bunny-
+        # hopping (airborne almost the entire time, "grounded" for
+        # under one tick between hops) never registers a landing at all.
+        just_landed = (
+            self._touched_ground and not self._was_grounded
+            and self._fall_speed_on_touch >= _MIN_LANDING_FALL_SPEED
+        )
+        self._was_grounded = self._touched_ground
+
         if self._step_sound_timer > 0.0:
             self._step_sound_timer = max(self._step_sound_timer - dt, 0.0)
+
+        if just_landed:
+            # A landing impact is footstep-worthy ground contact on its
+            # own, independent of the walking cadence timer below (which
+            # counts down even while airborne, matching Source's
+            # UpdateStepSound exactly - see this method's docstring) -
+            # a hop's brief mid-air time is rarely enough for that timer
+            # to reach 0 by the next landing, and a step that never hits
+            # 0 never fires at all. Uses running cadence/volume (the
+            # landing IS the impact, not a gait to keep time with) and
+            # still resets the timer afterward so an immediate walking
+            # step right after landing doesn't double up.
+            volume = get_footstep_volume(self._ground_material, walking=False)
+            if self._is_crouched:
+                volume *= _STEP_VOLUME_DUCK_MULT
+            self._step_sound_timer = _STEP_INTERVAL_RUN
+            self._pending_footstep = (self._ground_material, volume)
+            return
 
         if not self._grounded:
             return
@@ -848,12 +930,12 @@ class CharacterController:
         horiz_speed = math.hypot(self.velocity.x, self.velocity.z)
         min_speed = _STEP_MIN_SPEED_CROUCH if self._is_crouched else _STEP_MIN_SPEED_STAND
         run_speed = _STEP_RUN_SPEED_CROUCH if self._is_crouched else _STEP_RUN_SPEED_STAND
+        walking = horiz_speed < run_speed
+        interval = _STEP_INTERVAL_WALK if walking else _STEP_INTERVAL_RUN
 
         if self._step_sound_timer > 0.0 or horiz_speed < min_speed:
             return
 
-        walking = horiz_speed < run_speed
-        interval = _STEP_INTERVAL_WALK if walking else _STEP_INTERVAL_RUN
         volume = get_footstep_volume(self._ground_material, walking)
         if self._is_crouched:
             interval += _STEP_INTERVAL_CROUCH_EXTRA

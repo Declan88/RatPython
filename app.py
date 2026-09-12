@@ -101,6 +101,7 @@ from Modules.Window.window import WindowManager
 from Modules.Camera.camera import Camera
 from Modules.Scenes.torus_scene import TorusScene
 from Modules.Physics.character_controller import CharacterController
+from Modules.Player.player_model import PlayerModel
 
 
 def load_steam_api_dll():
@@ -165,14 +166,28 @@ def main():
     # ~46.3 degrees, fit to the actual tread-nosing line rather than a
     # shallower approximation, so it needs a hair more headroom to count
     # as walkable floor instead of a wall.
+    player_height = 1.5
     player = CharacterController(
         current_scene.physics,
         position=(0.0, 2.0, 3.0),
-        height=1.5,
+        height=player_height,
         max_slope_degrees=47.0,
     )
 
-    net_mgr = NetworkManager(camera)
+    # The local player's own visual body - shadow-only (visible_in_color
+    # =False) since a first-person player never sees their own model,
+    # only what it casts onto the ground. Model path/animation are
+    # hardcoded HERE, at the call site, rather than inside PlayerModel
+    # itself, so swapping the local player's visual model later is a
+    # one-line change - PlayerModel (Modules/Player/player_model.py)
+    # stays fully generic, not tied to this one asset.
+    local_player_model = PlayerModel(
+        current_scene, "Assets/Models/rat.glb",
+        visible_in_color=False, cast_shadow=True,
+        idle_animation="funnyrat_ARMAction",
+    )
+
+    net_mgr = NetworkManager(camera, current_scene)
 
     running = True
     while running:
@@ -214,6 +229,18 @@ def main():
         camera.position = player.get_position() + glm.vec3(
             0.0, player.get_eye_offset(), 0.0
         )
+
+        # get_position() is the hull CENTER, not feet - subtract half
+        # the standing height (the same player_height passed to
+        # CharacterController above, not a re-read of any private/
+        # crouch-varying internal) to get where the model should
+        # actually stand. horiz_speed matches the flat/horizontal
+        # convention already used elsewhere in this file (get_flat_
+        # forward, footstep gating) so vertical jump/fall speed never
+        # triggers a "running" pose.
+        feet_position = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
+        horiz_speed = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z))
+        local_player_model.update(dt, feet_position, camera.yaw, horiz_speed, is_crouched=player.is_crouched())
 
         footstep = player.pop_footstep()
         if footstep is not None:

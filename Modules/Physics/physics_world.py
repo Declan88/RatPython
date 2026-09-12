@@ -36,6 +36,7 @@ from panda3d.core import Quat as PandaQuat
 from panda3d.bullet import (
     BulletWorld, BulletRigidBodyNode, BulletBoxShape, BulletSphereShape,
     BulletTriangleMesh, BulletTriangleMeshShape, BulletConvexHullShape,
+    BulletGhostNode,
 )
 
 # Proper (determinant +1) rotation, +90 degrees about X, mapping render
@@ -114,6 +115,14 @@ class CollisionGroup:
     DYNAMIC = BitMask32.bit(1)
     PLAYER = BitMask32.bit(2)
     TRIGGER = BitMask32.bit(3)
+    # Deliberately never combined into any solid body's own collision_mask -
+    # this bit exists purely so a future damage query (a raycast/sweep/
+    # contactTest filtered to this mask) can find hitboxes specifically,
+    # without also picking up ordinary STATIC/DYNAMIC/PLAYER geometry. See
+    # add_hitbox - a hitbox is a BulletGhostNode, never attached as a rigid
+    # body, so it never physically collides with anything regardless of
+    # this bit; Bullet only consults a ghost's mask for manual queries.
+    HITBOX = BitMask32.bit(4)
     ALL = BitMask32.all_on()
 
 
@@ -457,6 +466,64 @@ class PhysicsWorld:
         get_transform()."""
         node_path.setPos(to_physics_pos(position))
         node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+    # ---------------------------------------------------------------
+    # HITBOXES (query-only - never physically solid, never pushed or
+    # pushes anything; groundwork for a future damage system)
+    # ---------------------------------------------------------------
+
+    def add_hitbox(self, half_extents, position=None, rotation=None,
+                    owner=None, collision_mask=CollisionGroup.HITBOX):
+        """A BulletGhostNode box, not a rigid body - unlike every other
+        add_* method here, this deliberately never calls
+        attachRigidBody, so it can never physically collide with
+        anything (push or be pushed) no matter what collision_mask says;
+        Bullet only consults a ghost's mask for manual overlap/sweep
+        queries a future damage system would run against it, never for
+        the main simulation step. owner is tagged onto the node via
+        setPythonTag (same pattern _add_body uses for
+        "physical_material") so a future query can read back whose
+        hitbox it hit - e.g. a remote player's steam_id. Position/
+        rotation follow update_hitbox every frame after this; there is
+        no kinematic flag to set since a ghost was never dynamic to
+        begin with."""
+        shape = BulletBoxShape(to_physics_extent(half_extents))
+        node = BulletGhostNode("hitbox")
+        node.addShape(shape)
+        node.setPythonTag("owner", owner)
+        node.setIntoCollideMask(collision_mask)
+
+        node_path = self._root.attachNewNode(node)
+        node_path.setPos(to_physics_pos(position) if position is not None else Point3(0, 0, 0))
+        if rotation is not None:
+            node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+        self.world.attachGhost(node)
+        self._node_paths.append(node_path)
+        return node_path
+
+    def update_hitbox(self, node_path, position, rotation):
+        """Repositions a hitbox created by add_hitbox - identical to
+        set_transform's own body (a ghost's transform is externally
+        driven exactly like a kinematic rigid body's, physics never
+        writes back to either), kept as its own named method so hitbox
+        call sites don't need to reason about set_transform's kinematic-
+        body-flavored docstring."""
+        node_path.setPos(to_physics_pos(position))
+        node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+    def remove_hitbox(self, node_path):
+        """Explicit teardown for one add_hitbox result - needed because
+        destroy()'s bulk cleanup loop below only calls removeRigidBody
+        (guarded by an isinstance(node, BulletRigidBodyNode) check), so
+        it silently skips ghost nodes entirely. Call this promptly on
+        whatever event ends a hitbox's owner (e.g. a peer disconnecting)
+        rather than waiting for scene teardown, or it leaks in the
+        Bullet world for the rest of the process."""
+        self.world.removeGhost(node_path.node())
+        node_path.removeNode()
+        if node_path in self._node_paths:
+            self._node_paths.remove(node_path)
 
     def destroy(self):
         for node_path in self._node_paths:

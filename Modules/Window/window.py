@@ -118,7 +118,7 @@ if sys.platform == "win32":
 
 
 class WindowManager:
-    def __init__(self, width=800, height=600, title="RatWar"):
+    def __init__(self, width=800, height=600, title="RatWar", fullscreen=True):
         pygame.init()
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
@@ -132,15 +132,36 @@ class WindowManager:
         icon_image = pygame.image.load(icon_path)
         pygame.display.set_icon(icon_image)
 
-        self.width = width
-        self.height = height
+        # Remembered so F11 (toggle_fullscreen) and a future windowed
+        # switch have a sane size to fall back to, rather than whatever
+        # the desktop resolution happened to be - toggle_fullscreen()
+        # only flips the FULLSCREEN flag on the existing surface, it
+        # doesn't resize, so this is the size that sticks once someone
+        # toggles back out of fullscreen.
+        self.windowed_width = width
+        self.windowed_height = height
         self.title = title
         self.flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+
+        if fullscreen:
+            # size (0, 0) with FULLSCREEN tells SDL to use the current
+            # desktop resolution rather than a fixed one - the right
+            # default for "launch fullscreen" since it matches whatever
+            # display the game happens to start on instead of assuming
+            # a specific resolution.
+            self.width, self.height = 0, 0
+            self.flags |= pygame.FULLSCREEN
+        else:
+            self.width, self.height = width, height
 
         self.vsync = 1
         self.screen = pygame.display.set_mode(
             (self.width, self.height), self.flags, vsync=self.vsync
         )
+        # set_mode with (0, 0) resolves to the actual desktop resolution -
+        # read it back so self.width/height (and anything computing
+        # camera aspect from them) reflect reality, not the (0, 0) request.
+        self.width, self.height = self.screen.get_size()
         pygame.display.set_caption(title)
 
         # pygame.display.set_icon() above is a cross-platform baseline

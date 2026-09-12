@@ -36,10 +36,16 @@ class NetworkManager:
        class exposes a glm.vec3 .position plus separate .yaw/.pitch
        floats instead - there's no NodePath, so this now takes the
        Camera directly rather than an "app" object with a ".player".
+
+    `scene` is threaded through for the same reason as `camera` above -
+    RemotePlayer needs it to build a visible PlayerModel via
+    scene.add_skeletal/scene.physics, and there's no Panda3D-style
+    global scene graph it could reach that through on its own.
     """
 
-    def __init__(self, camera):
+    def __init__(self, camera, scene):
         self.camera = camera
+        self.scene = scene
         self.remote_players = {}
         self.current_lobby_id = None
         self.last_pos = None
@@ -214,7 +220,7 @@ class NetworkManager:
     def handle_data(self, sender_id, ch, msg_bytes):
         if sender_id not in self.remote_players:
             print(f"\n--> Discovered peer in lobby: {sender_id}")
-            self.remote_players[sender_id] = RemotePlayer(self.camera, sender_id)
+            self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
 
         try:
             parsed = json.loads(msg_bytes.decode("utf-8"))
