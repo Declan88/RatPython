@@ -6,48 +6,30 @@ import glm
 
 
 def _is_frozen_build():
-    """True for a PyInstaller build (sys.frozen) or a Nuitka-compiled
-    one ("__compiled__" injected into this entry module's globals -
-    Nuitka's own documented detection method, since it never sets
-    sys.frozen at all) - False for an ordinary `python app.py` dev
-    run either way. Shared by every frozen-only check in this file
-    (asset-path chdir, GPU-preference registry key) so they can't
-    silently drift out of sync with each other."""
-    return (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) or "__compiled__" in globals()
+    """True for a Nuitka-compiled run ("__compiled__" injected into this
+    entry module's globals - Nuitka's own documented detection method),
+    False for an ordinary `python app.py` dev run. Shared by every
+    frozen-only check in this file (asset-path chdir, GPU-preference
+    registry key) so they can't silently drift out of sync with each
+    other."""
+    return "__compiled__" in globals()
 
 
 def _chdir_for_frozen_build():
-    """PyInstaller's --onefile mode extracts --add-data bundles (this
-    project's Assets folder included) to a temporary directory at
-    startup, exposed as sys._MEIPASS - NOT the working directory the
-    exe was launched from, and NOT the exe's own folder either. Every
+    """Nuitka's --onefile mode re-executes itself from its own unpacked
+    temp directory before any of this code runs, so sys.executable
+    already points at that unpacked location by the time this runs (for
+    --standalone too - there's just no separate temp dir to unpack to,
+    sys.executable is simply where the built exe already sits). Every
     asset path in this codebase (torus_scene.py's model/texture/audio
     paths, etc.) is a plain relative string like "Assets/Models/...",
     which only resolves correctly if the process's current working
-    directory happens to BE that extraction folder. Since none of
-    those call sites can be reached before this runs (they're all
-    behind imports/calls below), chdir'ing here once, before anything
-    else executes, makes every existing relative path keep working
-    unmodified instead of touching dozens of individual asset-loading
-    call sites. Below Assets: this exists only for the lifetime of the
-    process, so anything that writes there at runtime (e.g.
-    bake_static_lighting's lightmap cache) won't persist between runs
-    of a --onefile exe - that's a separate, real limitation of
-    --onefile for a cache that's meant to survive across runs, not
-    something this chdir fixes or is trying to fix."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        # PyInstaller (see BuildCMD).
-        os.chdir(sys._MEIPASS)
-    elif "__compiled__" in globals():
-        # Nuitka - both --standalone and --onefile. Unlike PyInstaller,
-        # Nuitka has no separate "_MEIPASS-equivalent" to look up: a
-        # --onefile build re-executes itself from its own unpacked temp
-        # directory before any of this code runs, so sys.executable
-        # already points at the unpacked location in EITHER mode -
-        # os.path.dirname(sys.executable) is the one lookup that works
-        # for both. "__compiled__" is a module-global Nuitka injects
-        # into the entry script specifically (not into sys) - this is
-        # Nuitka's own documented way to detect a compiled run.
+    directory happens to BE that location. Since none of those call
+    sites can be reached before this runs (they're all behind imports/
+    calls below), chdir'ing here once, before anything else executes,
+    makes every existing relative path keep working unmodified instead
+    of touching dozens of individual asset-loading call sites."""
+    if _is_frozen_build():
         os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
 
 
@@ -63,17 +45,16 @@ def _request_high_performance_gpu():
     performance" - but confirmed in practice that it's specifically
     designed for/reliably honored by DXGI (Direct3D) applications, NOT
     a raw OpenGL context created via WGL (which is what this project's
-    moderngl/pygame-ce rendering does) - see _load_gpu_hint_dll below
-    for the mechanism that actually works for OpenGL. Kept here anyway
-    as a harmless belt-and-suspenders extra: costs nothing, and covers
-    any future D3D-based rendering path or driver version where it
-    does get honored.
+    moderngl/pygame-ce rendering does) - see the NOTE below this
+    function for the mechanism that actually works for OpenGL. Kept
+    here anyway as a harmless belt-and-suspenders extra: costs nothing,
+    and covers any future D3D-based rendering path or driver version
+    where it does get honored.
 
-    Keyed by the exact exe PATH (sys.executable - still the actual
-    launched exe even under --onefile, not the temporary _MEIPASS
-    extraction folder), so this only ever affects this one built exe,
-    never other unrelated programs. Only runs for a frozen/built exe,
-    not a dev `python app.py` run - a dev run's sys.executable is
+    Keyed by the exact exe PATH (sys.executable), so this only ever
+    affects this one built exe, never other unrelated programs. Only
+    runs for a frozen/built exe, not a dev `python app.py` run - a
+    dev run's sys.executable is
     python.exe itself, and forcing a GPU preference there would apply
     to every OTHER Python script run through that same interpreter
     too, not just this project."""
@@ -105,20 +86,17 @@ _request_high_performance_gpu()
 # (moderngl/pygame-ce, via WGL) the way it is for Direct3D/DXGI apps.
 # The mechanism that DOES work is exporting two symbols -
 # NvOptimusEnablement and AmdPowerXpressRequestHighPerformance - but
-# confirmed (see build_tools/pyinstaller_bootloader/README.md) that
 # these MUST be in the actual .exe's own PE export table specifically;
 # a DLL loaded at runtime does nothing, regardless of how early it's
-# loaded here - an earlier version of this file tried exactly that
-# (a companion gpu_hint.dll) and it had no effect. Since PyInstaller's
-# stock bootloader is what becomes app.exe and has no exports of its
-# own, the actual fix lives one level down the toolchain: a patched
-# bootloader with those two symbols added to its source and rebuilt,
-# installed into the local PyInstaller package - see
-# build_tools/pyinstaller_bootloader/README.md for what was changed
-# and how to reproduce it (e.g. after reinstalling/upgrading
-# PyInstaller, which would silently restore the stock, unpatched
-# bootloader). Nothing in this Python file can express that fix -
-# there is no per-build-invocation flag or Python-level hook for it.
+# loaded here - an earlier version of this file tried exactly that (a
+# companion gpu_hint.dll) and it had no effect. Getting Nuitka's own
+# built exe to export those two symbols (its bootloader has no exports
+# of its own by default, same underlying issue the old PyInstaller
+# build used to have before it was worked around with a patched
+# bootloader - that workaround was PyInstaller-specific and doesn't
+# carry over) hasn't been done for this Nuitka-based build yet.
+# Nothing in this Python file can express that fix - there is no
+# per-build-invocation flag or Python-level hook for it.
 
 from Modules.Window.window import WindowManager
 from Modules.Camera.camera import Camera
@@ -143,23 +121,15 @@ def load_steam_api_dll():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    candidates = []
-
-    # Check PyInstaller's temporary extraction folder first if frozen -
-    # Nuitka needs no equivalent special-case here, since
-    # _chdir_for_frozen_build() (called at module import time, above
-    # this function's own call further down) already puts the process's
-    # cwd at the right unpacked location for a Nuitka build on every
-    # platform, which the os.getcwd() candidate below already covers.
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        candidates.append(os.path.join(sys._MEIPASS, lib_name))
-
-    candidates.extend(
-        [
-            os.path.join(script_dir, lib_name),
-            os.path.join(os.getcwd(), lib_name),
-        ]
-    )
+    # _chdir_for_frozen_build() (called at module import time, above this
+    # function's own call further down) already puts the process's cwd
+    # at the right unpacked location for a Nuitka build on every
+    # platform, so the os.getcwd() candidate below covers a frozen build
+    # on its own - no separate extraction-folder special-case needed.
+    candidates = [
+        os.path.join(script_dir, lib_name),
+        os.path.join(os.getcwd(), lib_name),
+    ]
 
     env_override = os.environ.get("STEAM_API_DLL_PATH")
     if env_override:
