@@ -5,6 +5,17 @@ import ctypes
 import glm
 
 
+def _is_frozen_build():
+    """True for a PyInstaller build (sys.frozen) or a Nuitka-compiled
+    one ("__compiled__" injected into this entry module's globals -
+    Nuitka's own documented detection method, since it never sets
+    sys.frozen at all) - False for an ordinary `python app.py` dev
+    run either way. Shared by every frozen-only check in this file
+    (asset-path chdir, GPU-preference registry key) so they can't
+    silently drift out of sync with each other."""
+    return (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) or "__compiled__" in globals()
+
+
 def _chdir_for_frozen_build():
     """PyInstaller's --onefile mode extracts --add-data bundles (this
     project's Assets folder included) to a temporary directory at
@@ -25,7 +36,19 @@ def _chdir_for_frozen_build():
     --onefile for a cache that's meant to survive across runs, not
     something this chdir fixes or is trying to fix."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        # PyInstaller (see BuildCMD).
         os.chdir(sys._MEIPASS)
+    elif "__compiled__" in globals():
+        # Nuitka - both --standalone and --onefile. Unlike PyInstaller,
+        # Nuitka has no separate "_MEIPASS-equivalent" to look up: a
+        # --onefile build re-executes itself from its own unpacked temp
+        # directory before any of this code runs, so sys.executable
+        # already points at the unpacked location in EITHER mode -
+        # os.path.dirname(sys.executable) is the one lookup that works
+        # for both. "__compiled__" is a module-global Nuitka injects
+        # into the entry script specifically (not into sys) - this is
+        # Nuitka's own documented way to detect a compiled run.
+        os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
 
 
 _chdir_for_frozen_build()
@@ -54,7 +77,7 @@ def _request_high_performance_gpu():
     python.exe itself, and forcing a GPU preference there would apply
     to every OTHER Python script run through that same interpreter
     too, not just this project."""
-    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+    if sys.platform != "win32" or not _is_frozen_build():
         return
     try:
         import winreg
@@ -105,21 +128,36 @@ from Modules.Player.player_model import PlayerModel
 
 
 def load_steam_api_dll():
-    if sys.platform != "win32":
-        return
+    # One shared library name per platform - Valve's Steamworks SDK ships
+    # a differently-named/formatted binary for each (steam_api64.dll on
+    # Windows, libsteam_api.dylib on macOS - a universal x86_64+arm64
+    # binary here, so one file covers both Intel and Apple Silicon -
+    # libsteam_api.so on Linux). ctypes.CDLL(..., mode=ctypes.RTLD_GLOBAL)
+    # and RTLD_GLOBAL itself are both real cross-platform POSIX/ctypes
+    # concepts, not Windows-specific, so the loading logic below is
+    # identical for all three - only the filename differs.
+    lib_name = {
+        "win32": "steam_api64.dll",
+        "darwin": "libsteam_api.dylib",
+    }.get(sys.platform, "libsteam_api.so")  # covers "linux" and any other POSIX platform
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     candidates = []
 
-    # Check PyInstaller's temporary extraction folder first if frozen
+    # Check PyInstaller's temporary extraction folder first if frozen -
+    # Nuitka needs no equivalent special-case here, since
+    # _chdir_for_frozen_build() (called at module import time, above
+    # this function's own call further down) already puts the process's
+    # cwd at the right unpacked location for a Nuitka build on every
+    # platform, which the os.getcwd() candidate below already covers.
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        candidates.append(os.path.join(sys._MEIPASS, "steam_api64.dll"))
+        candidates.append(os.path.join(sys._MEIPASS, lib_name))
 
     candidates.extend(
         [
-            os.path.join(script_dir, "steam_api64.dll"),
-            os.path.join(os.getcwd(), "steam_api64.dll"),
+            os.path.join(script_dir, lib_name),
+            os.path.join(os.getcwd(), lib_name),
         ]
     )
 
@@ -133,15 +171,16 @@ def load_steam_api_dll():
                 ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
                 if hasattr(os, "add_dll_directory"):
                     os.add_dll_directory(os.path.dirname(path))
-                print(f"Pre-loaded steam_api64.dll from: {path}")
+                print(f"Pre-loaded {lib_name} from: {path}")
                 return
             except Exception as e:
-                print(f"Found steam_api64.dll at {path} but failed to load it: {e}")
+                print(f"Found {lib_name} at {path} but failed to load it: {e}")
 
-    print("Warning: steam_api64.dll not found.")
+    print(f"Warning: {lib_name} not found.")
 
 
-# Pre-load steam_api64.dll globally before any modules import py_steam_net
+# Pre-load the platform's Steamworks shared library globally before any
+# modules import py_steam_net.
 load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager

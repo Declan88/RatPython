@@ -1,0 +1,1 @@
+python -m nuitka --onefile --assume-yes-for-downloads --disable-cache=ccache --windows-console-mode=disable --windows-icon-from-ico="Assets\icon\icon.ico" --include-data-files=steam_api64.dll=steam_api64.dll --include-data-dir=Assets=Assets --output-filename=RatWar.exe --output-dir=build_nuitka app.py
