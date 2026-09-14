@@ -25,7 +25,7 @@ from Modules.Graphics.lightmap_baker import (
 )
 from Modules.Graphics.model_loader import load_glb
 from Modules.Graphics import lightmap_cache_io
-from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao
+from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao, load_animation_clips
 from Modules.Graphics.skeletal_shader import (
     create_skeletal_program,
     create_skeletal_shadow_program,
@@ -41,6 +41,14 @@ from Modules.Graphics.skybox import (
     create_equirect_skybox_vao,
     render_equirect_skybox,
 )
+
+
+# Default crossfade time (seconds) between two animation clips on a
+# skeletal object - see set_skeletal_animation/set_skeletal_upper_
+# animation. Short enough that a state change (e.g. idle -> walk) still
+# feels immediate, long enough to smooth over the pop a hard instant cut
+# between two different clips would otherwise show.
+_DEFAULT_ANIM_BLEND_DURATION = 0.25
 
 
 def _release(resource):
@@ -419,7 +427,9 @@ class Scene:
                       transform=None, animation=None, metallic=None, roughness=None,
                       emissive=None, texture_path=None,
                       visible_in_color=True, cast_shadow=True,
-                      upper_body_root_joints=None, upper_animation=None):
+                      upper_body_root_joints=None, upper_animation=None,
+                      loop=True, upper_loop=True,
+                      time_scale=1.0):
         """Loads a skinned/animated glb - see skeletal_loader.py for
         format constraints (one skin, one mesh primitive, LINEAR/STEP
         interpolation only).
@@ -430,10 +440,18 @@ class Scene:
         explicitly only if you want to override what's actually authored
         in the file.
 
-        animation: name of the clip to start playing immediately (loops
-        automatically once it reaches the end). Pass None to start in the
-        bind/rest pose with nothing playing yet - use
-        set_skeletal_animation() later to start one.
+        animation: name of the clip to start playing immediately. Pass
+        None to start in the bind/rest pose with nothing playing yet -
+        use set_skeletal_animation() later to start one.
+
+        loop/upper_loop: whether `animation`/upper_animation repeat via
+        modulo (the default, matching every existing caller) or instead
+        clamp at the clip's own duration and hold its last frame once
+        reached - e.g. a one-shot jump takeoff pose meant to freeze in
+        mid-air until a landing event explicitly switches to something
+        else, rather than looping the takeoff motion while airborne. See
+        set_skeletal_animation/set_skeletal_upper_animation's own loop
+        param to change this later on an already-playing clip.
 
         visible_in_color/cast_shadow: both default True (existing
         behavior, unchanged for every current caller). Set
@@ -461,8 +479,13 @@ class Scene:
         Skeletal objects are always real-time only, never lightmap-baked
         - they're inherently dynamic (animated), so
         bake_static_lighting() never looks at this list at all, same as
-        dynamic_objects already doesn't."""
-        data = load_skinned_glb(model_path, ctx=self.ctx)
+        dynamic_objects already doesn't.
+
+        time_scale: see skeletal_loader.load_skinned_glb's own
+        docstring - an opt-in per-keyframe-time correction multiplier
+        for a model file known to have been baked at the wrong frame
+        rate. 1.0 (no change) by default."""
+        data = load_skinned_glb(model_path, ctx=self.ctx, time_scale=time_scale)
         if data is None:
             return None
 
@@ -510,9 +533,20 @@ class Scene:
             "skeleton": skeleton,
             "animation": animation,
             "anim_time": 0.0,
+            "anim_loop": bool(loop),
+            # Crossfade state (see set_skeletal_animation) - "done"
+            "prev_animation": None,
+            "prev_anim_time": 0.0,
+            "anim_blend_elapsed": _DEFAULT_ANIM_BLEND_DURATION,
+            "anim_blend_duration": _DEFAULT_ANIM_BLEND_DURATION,
             "upper_joint_mask": upper_joint_mask,
             "upper_animation": upper_animation,
             "upper_anim_time": 0.0,
+            "upper_anim_loop": bool(upper_loop),
+            "upper_prev_animation": None,
+            "upper_prev_anim_time": 0.0,
+            "upper_anim_blend_elapsed": _DEFAULT_ANIM_BLEND_DURATION,
+            "upper_anim_blend_duration": _DEFAULT_ANIM_BLEND_DURATION,
             "bone_matrices": initial_bones,
             "texture": texture,
             "metallic_roughness_texture": mr_texture,
@@ -537,25 +571,85 @@ class Scene:
         self.skeletal_objects.append(obj)
         return obj
 
-    def set_skeletal_animation(self, obj, animation_name):
+    def set_skeletal_animation(self, obj, animation_name, blend_duration=_DEFAULT_ANIM_BLEND_DURATION,
+                                loop=True):
         """Switches obj to a different animation clip, restarting from
-        time 0. animation_name must exist in obj["skeleton"].animations
-        (print obj["skeleton"].animations.keys() to see what a loaded
-        glb actually has)."""
+        time 0 - crossfading from whatever pose was showing the instant
+        this is called (frozen there, not still advancing) over
+        blend_duration seconds, rather than an instant hard cut (see
+        Skeleton._sample_track/_local_matrix for how that blend is
+        actually computed - decomposed TRS lerp/slerp per joint, applied
+        by Scene.update()'s own per-frame bone recompute). Pass
+        blend_duration=0.0 for the old instant-cut behavior.
+        animation_name must exist in obj["skeleton"].animations (print
+        obj["skeleton"].animations.keys() to see what a loaded glb
+        actually has).
+
+        loop: True (default) repeats the clip via modulo once Scene.
+        update() reaches its duration, matching every caller before this
+        param existed. False instead clamps anim_time at the clip's own
+        duration and holds its last frame there - e.g. a one-shot jump
+        takeoff pose that should freeze mid-air rather than loop the
+        takeoff motion while still airborne, until something explicitly
+        switches away from it (typically on a landing event).
+
+        A no-op if animation_name is already what's playing/being
+        blended toward (loop is NOT updated in that case either - if you
+        need to change loop on an already-current clip, switch away and
+        back, or call this only on the transition edge as PlayerModel's
+        own state machine already does) - calling this every frame while
+        a state persists (as PlayerModel's own transition-only guard
+        already avoids, but a future caller might not) would otherwise
+        restart the crossfade from scratch each time and it would never
+        finish."""
+        if animation_name == obj["animation"]:
+            return
+        obj["prev_animation"] = obj["animation"]
+        obj["prev_anim_time"] = obj["anim_time"]
+        obj["anim_blend_elapsed"] = 0.0
+        obj["anim_blend_duration"] = blend_duration
         obj["animation"] = animation_name
         obj["anim_time"] = 0.0
+        obj["anim_loop"] = bool(loop)
 
-    def set_skeletal_upper_animation(self, obj, animation_name):
-        """The upper-body equivalent of set_skeletal_animation - only
-        meaningful for an obj created with upper_body_root_joints set
-        (see add_skeletal); switches just the masked joints' clip,
-        restarting THEIR time from 0 independently of the lower-body
-        anim_time. Calling this on an obj without a mask configured is
-        harmless (the fields get set but nothing ever reads them, since
-        Scene.update()'s bone recompute only takes the blended path when
-        obj["upper_joint_mask"] is not None)."""
+    def set_skeletal_upper_animation(self, obj, animation_name, blend_duration=_DEFAULT_ANIM_BLEND_DURATION,
+                                      loop=True):
+        """The upper-body equivalent of set_skeletal_animation - same
+        crossfade and loop/hold-last-frame behavior, independent of the
+        lower-body one. Only meaningful for an obj created with
+        upper_body_root_joints set (see add_skeletal); switches just the
+        masked joints' clip. Calling this on an obj without a mask
+        configured is harmless (the fields get set but nothing ever
+        reads them, since Scene.update()'s bone recompute only takes the
+        blended path when obj["upper_joint_mask"] is not None)."""
+        if animation_name == obj["upper_animation"]:
+            return
+        obj["upper_prev_animation"] = obj["upper_animation"]
+        obj["upper_prev_anim_time"] = obj["upper_anim_time"]
+        obj["upper_anim_blend_elapsed"] = 0.0
+        obj["upper_anim_blend_duration"] = blend_duration
         obj["upper_animation"] = animation_name
         obj["upper_anim_time"] = 0.0
+        obj["upper_anim_loop"] = bool(loop)
+
+    def load_additional_animations(self, obj, path, rename=None, time_scale=1.0):
+        """Loads animation clip(s) from a SEPARATE .glb file sharing
+        obj's own armature (matched by joint NAME, not file/node order -
+        see skeletal_loader.load_animation_clips) and merges them into
+        obj's skeleton, so a "pose" file exported on its own (this
+        project's Assets/Animations/Poses/Rifle/*.glb, sharing rat.glb's
+        skeleton) can be played on this obj without re-exporting the
+        mesh into every pose file. Returns the list of clip names
+        actually added (after any `rename` - see load_animation_clips'
+        own docstring for why that's usually needed: it's common for
+        several separately-exported pose files to all name their one
+        clip the same generic thing, which would otherwise collide).
+
+        time_scale: see skeletal_loader.load_animation_clips' own
+        docstring - an opt-in per-keyframe-time correction multiplier
+        for a pose file known to have been baked at the wrong frame
+        rate. 1.0 (no change) by default."""
+        return load_animation_clips(path, obj["skeleton"], rename=rename, time_scale=time_scale)
 
     # =============================================================
     # SKYBOX
@@ -1023,9 +1117,30 @@ class Scene:
             # clip time advance - unchanged from before per-object.
             if obj["animation"] is not None:
                 clip = skeleton.animations.get(obj["animation"])
-                obj["anim_time"] = (
-                    (obj["anim_time"] + dt) % clip.duration if clip is not None and clip.duration > 0.0 else 0.0
-                )
+                if clip is not None and clip.duration > 0.0:
+                    obj["anim_time"] = (
+                        (obj["anim_time"] + dt) % clip.duration if obj["anim_loop"]
+                        # Clamp instead of wrap: holds the clip's last
+                        # frame once reached rather than restarting it
+                        # (see set_skeletal_animation's own loop param).
+                        else min(obj["anim_time"] + dt, clip.duration)
+                    )
+                else:
+                    obj["anim_time"] = 0.0
+
+            # Crossfade progress (see set_skeletal_animation) - advances
+            # every frame regardless of which clip is current; reaches
+            # weight 1.0 (pure current clip - the prev_animation fields
+            # stop mattering at that point, though they're left set
+            # rather than cleared, which is harmless) once
+            # anim_blend_elapsed catches up to anim_blend_duration, or
+            # immediately if that duration is 0 (the old instant-cut
+            # behavior, still available on request).
+            obj["anim_blend_elapsed"] = min(obj["anim_blend_elapsed"] + dt, obj["anim_blend_duration"])
+            lower_blend_weight = (
+                1.0 if obj["anim_blend_duration"] <= 0.0
+                else obj["anim_blend_elapsed"] / obj["anim_blend_duration"]
+            )
 
             if upper_mask is not None:
                 # Upper-body clip advances independently of the lower
@@ -1038,20 +1153,38 @@ class Scene:
                 # joint, matching the single-clip behavior exactly).
                 if obj["upper_animation"] is not None:
                     upper_clip = skeleton.animations.get(obj["upper_animation"])
-                    obj["upper_anim_time"] = (
-                        (obj["upper_anim_time"] + dt) % upper_clip.duration
-                        if upper_clip is not None and upper_clip.duration > 0.0 else 0.0
-                    )
+                    if upper_clip is not None and upper_clip.duration > 0.0:
+                        obj["upper_anim_time"] = (
+                            (obj["upper_anim_time"] + dt) % upper_clip.duration if obj["upper_anim_loop"]
+                            else min(obj["upper_anim_time"] + dt, upper_clip.duration)
+                        )
+                    else:
+                        obj["upper_anim_time"] = 0.0
+                obj["upper_anim_blend_elapsed"] = min(
+                    obj["upper_anim_blend_elapsed"] + dt, obj["upper_anim_blend_duration"]
+                )
+                upper_blend_weight = (
+                    1.0 if obj["upper_anim_blend_duration"] <= 0.0
+                    else obj["upper_anim_blend_elapsed"] / obj["upper_anim_blend_duration"]
+                )
                 obj["bone_matrices"] = skeleton.compute_blended_bone_matrices(
                     obj["animation"], obj["anim_time"],
                     obj["upper_animation"], obj["upper_anim_time"],
                     upper_mask,
+                    lower_prev_animation=obj["prev_animation"], lower_prev_time=obj["prev_anim_time"],
+                    lower_blend_weight=lower_blend_weight,
+                    upper_prev_animation=obj["upper_prev_animation"], upper_prev_time=obj["upper_prev_anim_time"],
+                    upper_blend_weight=upper_blend_weight,
                 )
                 continue
 
             if obj["animation"] is None:
                 continue
-            obj["bone_matrices"] = skeleton.compute_bone_matrices(obj["animation"], obj["anim_time"])
+            obj["bone_matrices"] = skeleton.compute_bone_matrices(
+                obj["animation"], obj["anim_time"],
+                prev_animation_name=obj["prev_animation"], prev_time=obj["prev_anim_time"],
+                blend_weight=lower_blend_weight,
+            )
 
     # =============================================================
     # DIRECTIONAL SHADOW PASS

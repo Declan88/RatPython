@@ -100,6 +100,7 @@ _request_high_performance_gpu()
 
 from Modules.Window.window import WindowManager
 from Modules.Camera.camera import Camera
+from Modules.Camera.camera_boom_arm import CameraBoomArm
 from Modules.Scenes.torus_scene import TorusScene
 from Modules.Physics.character_controller import CharacterController
 from Modules.Player.player_model import PlayerModel
@@ -175,7 +176,17 @@ def main():
     # ~46.3 degrees, fit to the actual tread-nosing line rather than a
     # shallower approximation, so it needs a hair more headroom to count
     # as walkable floor instead of a wall.
-    player_height = 1.5
+    # CharacterController.get_eye_offset() (non-crouched, see
+    # character_controller.py) puts the camera at height/2 +
+    # height*_DEFAULT_EYE_RATIO above the feet, where _DEFAULT_EYE_RATIO
+    # is 0.7/1.8 - i.e. eye level = height * 8/9. The rat.glb model's
+    # actual measured eye level is 1.39225m above its feet, so height is
+    # set here to whatever makes that formula land exactly there
+    # (1.39225 * 9/8), rather than picking an arbitrary height and
+    # letting the eye level fall wherever the generic ratio puts it -
+    # keeps the first-person camera at the same height the visible/
+    # shadow-casting model's own eyes actually are.
+    player_height = 1.39225 * 9 / 8
     player = CharacterController(
         current_scene.physics,
         position=(0.0, 2.0, 3.0),
@@ -190,17 +201,131 @@ def main():
     # itself, so swapping the local player's visual model later is a
     # one-line change - PlayerModel (Modules/Player/player_model.py)
     # stays fully generic, not tied to this one asset.
+    # All of this project's rat/rifle animations were baked with
+    # Blender's factory-default scene frame rate (24fps) left unchanged,
+    # even though they were actually authored/intended for 30fps - so
+    # every raw keyframe time in these files is 30/24 = 1.25x too long
+    # (each file plays back 25% slower than intended). RAT_ANIM_TIME_SCALE
+    # corrects for that by rescaling every keyframe time by 24/30 before
+    # it's used - see skeletal_loader.load_skinned_glb/
+    # load_animation_clips' own time_scale docstring for the mechanism.
+    RAT_ANIM_TIME_SCALE = 24.0 / 30.0
+
+    # Blend-state table: (name, clip, min_speed), min_speed in m/s.
+    # Source's own velwalk/velrun (90/220 Source units/s * 0.0254 - the
+    # same constants character_controller.py's footstep-sound code uses)
+    # decide when "walk"/"run" kick in. rat.glb's own baked-in "New" clip
+    # is actually a dancing animation, not an idle one - "rifle_idle"/
+    # "rifle_walk"/"rifle_run" (loaded below from the separate pose-only
+    # files, sharing rat.glb's armature) are the real poses. All three
+    # are full-body clips (legs included, not just arms), so the same
+    # table is reused for the upper-body split below too - appending a
+    # new blend state later (crouch-walk, sprint, whatever) is just
+    # adding another triple here, PlayerModel needs no other change.
+    player_animation_states = (
+        ("idle", "rifle_idle", 0.0),
+        ("walk", "rifle_walk", 90.0 * 0.0254),
+        ("run", "rifle_run", 220.0 * 0.0254),
+    )
+
     local_player_model = PlayerModel(
         current_scene, "Assets/Models/rat.glb",
         visible_in_color=False, cast_shadow=True,
-        idle_animation="funnyrat_ARMAction",
+        time_scale=RAT_ANIM_TIME_SCALE,
+        states=player_animation_states,
+        # Splits the model into a lower body (locomotion, above) and an
+        # upper body (gun-holding pose) driven independently - see
+        # Skeleton.compute_joint_mask's own docstring for why this rig
+        # needs BOTH names (Spine4/arms/neck/head is a sibling subtree
+        # of Spine/Spine1/Spine2 in rat.glb, not a descendant of it).
+        upper_body_root_joints=["ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine4"],
+        upper_states=player_animation_states,
+        # RifleJump.glb (loaded below) - a one-shot takeoff pose, not a
+        # speed-driven blend state like the three above, so it's its own
+        # param rather than another `states` entry: PlayerModel.update()
+        # overrides BOTH bodies with it the instant is_grounded reads
+        # False, holding its last frame (see add_skeletal's own loop
+        # param) until is_on_ground() is true again, at which point
+        # normal idle/walk/run switching resumes.
+        jump_animation="rifle_jump",
+        # RifleCrouch.glb (loaded below) - a static held pose (2
+        # identical keyframes, confirmed via raw glb inspection - not a
+        # cycle), not a speed-driven blend state, so it's its own param
+        # like jump_animation above rather than another `states` entry.
+        # PlayerModel.update() overrides BOTH bodies with it for as long
+        # as is_crouched (already passed below via player.is_crouched())
+        # reads True, resuming normal idle/walk/run switching the
+        # instant it reads False again.
+        crouch_animation="rifle_crouch",
     )
+    # Matches torus_scene.py's own decorative rat.glb character's
+    # shading exactly (same flat "character["specular_strength"] = 0"
+    # mutation there) - PlayerModel has no constructor knob for this
+    # (bind_material's own default is 1.0, a normal specular highlight),
+    # so it's set directly on the obj dict here, same as the decorative
+    # one does.
+    if local_player_model.obj is not None:
+        local_player_model.obj["specular_strength"] = 0
+    # rifleidle.glb/RifleWalkN.glb are separate pose-only exports sharing
+    # rat.glb's own armature (see load_additional_animations) - both
+    # files happen to name their one clip "New" (same name rat.glb's own
+    # base clip already uses), hence the rename to keep all three
+    # distinct on the merged skeleton.
+    current_scene.load_additional_animations(
+        local_player_model.obj, "Assets/Animations/Poses/Rifle/rifleidle.glb",
+        rename={"New": "rifle_idle"}, time_scale=RAT_ANIM_TIME_SCALE,
+    )
+    # RifleWalkN.glb specifically has ALREADY been re-exported at a
+    # correct 30fps (confirmed: its own keyframes are spaced at exactly
+    # 1/30s, unlike rat.glb/rifleidle.glb above, still at 1/24s) - no
+    # time_scale correction here, or this would double-correct an
+    # already-fixed file and play it 20% too fast.
+    current_scene.load_additional_animations(
+        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleWalkN.glb",
+        rename={"New": "rifle_walk"},
+    )
+    # RifleRunN.glb - also already baked at a correct 30fps (confirmed
+    # the same way as RifleWalkN.glb), no time_scale correction needed.
+    current_scene.load_additional_animations(
+        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleRunN.glb",
+        rename={"New": "rifle_run"},
+    )
+    # RifleJump.glb - confirmed already baked at a correct 30fps (same
+    # raw-keyframe-spacing check as RifleWalkN.glb/RifleRunN.glb), no
+    # time_scale correction needed.
+    current_scene.load_additional_animations(
+        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleJump.glb",
+        rename={"New": "rifle_jump"},
+    )
+    # RifleCrouch.glb - a static pose (its own first/last keyframe are
+    # identical, confirmed via raw glb inspection), so its authored
+    # frame rate/duration don't matter - no time_scale correction needed.
+    current_scene.load_additional_animations(
+        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
+        rename={"New": "rifle_crouch"},
+    )
+
+    # Third-person mode - see Modules/Camera/camera_boom_arm.py. Off by
+    # default (first person): the local player's own model stays
+    # shadow-only (visible_in_color=False above) until this is toggled.
+    third_person = False
+    boom_arm = CameraBoomArm(current_scene.physics)
+
+    def toggle_third_person(key):
+        nonlocal third_person
+        if key == pygame.K_v:
+            third_person = not third_person
+            # The local player's body is normally shadow-only (a first-
+            # person player never sees their own model - see
+            # local_player_model's own visible_in_color=False above) -
+            # third person needs it actually drawn instead.
+            local_player_model.set_visible_in_color(third_person)
 
     net_mgr = NetworkManager(camera, current_scene)
 
     running = True
     while running:
-        running, dt = window.handle_events(camera)
+        running, dt = window.handle_events(camera, on_key_down=toggle_third_person)
 
         # Handle scene switching inputs (1: Triangle, 2: Cube, 3: Torus)
         keys = pygame.key.get_pressed()
@@ -235,9 +360,15 @@ def main():
         # torus) and step physics - camera position then follows
         # wherever physics moved the player capsule to this frame.
         current_scene.update(dt)
-        camera.position = player.get_position() + glm.vec3(
-            0.0, player.get_eye_offset(), 0.0
-        )
+        eye_position = player.get_position() + glm.vec3(0.0, player.get_eye_offset(), 0.0)
+        if third_person:
+            # Same pivot first-person already uses (the player's own eye
+            # position) - camera.front/yaw/pitch (mouse look) and all
+            # movement math are completely unaffected by this branch,
+            # only WHERE the camera itself sits changes.
+            camera.position = boom_arm.get_camera_position(eye_position, camera.yaw, camera.pitch)
+        else:
+            camera.position = eye_position
 
         # get_position() is the hull CENTER, not feet - subtract half
         # the standing height (the same player_height passed to
@@ -249,7 +380,17 @@ def main():
         # triggers a "running" pose.
         feet_position = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
         horiz_speed = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z))
-        local_player_model.update(dt, feet_position, camera.yaw, horiz_speed, is_crouched=player.is_crouched())
+        local_player_model.update(
+            dt, feet_position, camera.yaw, horiz_speed,
+            is_crouched=player.is_crouched(), is_grounded=player.is_on_ground(),
+            # Walk-vs-run is now driven by the actual sprint key input,
+            # not momentum - see PlayerModel.update()'s own is_sprinting
+            # docstring for why (this was the real fix for the run
+            # animation "randomly restarting", which turned out to be
+            # physics speed noise crossing a threshold, not an animation
+            # data or looping-code problem).
+            is_sprinting=player.is_sprinting(),
+        )
 
         footstep = player.pop_footstep()
         if footstep is not None:

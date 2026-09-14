@@ -198,7 +198,18 @@ class WindowManager:
             (self.width, self.height), self.flags, vsync=self.vsync
         )
 
-    def handle_events(self, camera):
+    def handle_events(self, camera, on_key_down=None):
+        """on_key_down: optional callback(pygame_key_constant), invoked
+        for every KEYDOWN event this method sees (after its own internal
+        handling below, which happens regardless - it always still
+        toggles fullscreen/vsync/quits on its own reserved keys even if
+        a caller is also watching for other ones). Lets a caller react
+        to an edge-triggered key press (e.g. a mode toggle) without this
+        generic window/input module needing to know anything about
+        game-specific concepts like "third person mode" - it only ever
+        hands back which key went down, callers decide what that means.
+        Not called for QUIT/ESCAPE, since those already end the loop
+        before reaching it."""
         now = time.perf_counter()
         dt = now - self._last_time
         self._last_time = now
@@ -214,6 +225,8 @@ class WindowManager:
                     pygame.display.toggle_fullscreen()
                 elif event.key == pygame.K_F10:
                     self.toggle_vsync()
+                if on_key_down is not None:
+                    on_key_down(event.key)
             elif event.type == pygame.MOUSEMOTION:
                 camera.process_mouse(event.rel[0], event.rel[1])
             elif event.type == pygame.VIDEORESIZE:

@@ -115,10 +115,33 @@ class TorusScene(Scene):
         )
 
         # Skeletal Meshes
+        # rat.glb's own baked-in "New" clip is actually a dancing
+        # animation, not an idle one - "rifle_idle" (from the separate
+        # pose-only Assets/Animations/Poses/Rifle/rifleidle.glb, sharing
+        # this same armature - see load_additional_animations) is the
+        # real idle pose, used here for the whole mesh (no upper/lower
+        # split, unlike app.py's local player) since this is just a
+        # decorative background character.
+        # All of this project's rat/rifle animations were baked with
+        # Blender's factory-default scene frame rate (24fps) left
+        # unchanged, even though they were actually authored/intended
+        # for 30fps - so every raw keyframe time in these files is 30/24
+        # = 1.25x too long (each file plays back 25% slower/longer than
+        # intended). time_scale corrects for that by rescaling every
+        # keyframe time by 24/30 before it's used - see skeletal_loader.
+        # load_skinned_glb/load_animation_clips' own time_scale
+        # docstring for the general mechanism this is built on.
+        _RAT_ANIM_TIME_SCALE = 24.0 / 30.0
+
         character = self.add_skeletal(
             "Assets/Models/rat.glb",
             position=(0, -1, -3),
-            animation="funnyrat_ARMAction",
+            animation="rifle_run",
+            time_scale=_RAT_ANIM_TIME_SCALE,
+        )
+        self.load_additional_animations(
+            character, "Assets/Animations/Poses/Rifle/RifleRunN.glb",
+            rename={"New": "rifle_run"}, time_scale=_RAT_ANIM_TIME_SCALE,
         )
         character["specular_strength"] = 0
         print("Animations available:", list(character["skeleton"].animations.keys()))

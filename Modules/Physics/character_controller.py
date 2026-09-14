@@ -606,6 +606,13 @@ class CharacterController:
     def is_on_ground(self):
         return self._grounded
 
+    def is_sprinting(self):
+        """Whether set_sprinting(True) is the current input state - the
+        player's actual INTENT, not a derived speed measurement (see
+        PlayerModel.update()'s own is_sprinting param, which uses this
+        instead of a speed threshold to pick the run animation)."""
+        return self._sprinting
+
     def is_crouched(self):
         return self._is_crouched
 
@@ -679,6 +686,14 @@ class CharacterController:
         # Bullet's cached broadphase pair list and can stay stale
         # ("overlapping") for several ticks after the shapes have
         # actually separated (confirmed empirically during development).
+        #
+        # Only ever called while grounded (see _update_crouch) - the
+        # headroom-only slice this checks (see __init__) relies on the
+        # grounded stand-up's own feet-fixed/grow-upward-only assumption
+        # to safely skip the floor; there's no equivalent airborne call
+        # site anymore; standing up is simply never attempted mid-air at
+        # all (_update_crouch locks "still crouched" as the only outcome
+        # of crouching in the air, until landing).
         result = self._physics_world.world.contactTest(self._stand_check_ghost)
         for i in range(result.getNumContacts()):
             contact = result.getContact(i)
@@ -700,13 +715,10 @@ class CharacterController:
         candidate_pos = Point3(current_pos.x, current_pos.y, current_top + headroom / 2.0)
         self._stand_check_ghost_np.setPos(candidate_pos)
 
-    def _swap_to_shape(self, shape, total_height, target_crouch_amount):
-        # Swaps the shape on the SAME persistent ghost node
-        # (addShape/removeShape, confirmed to work on a live node)
-        # rather than replacing the node itself, so self.velocity is
-        # never touched by this at all - unlike
-        # BulletCharacterControllerNode, there's no hidden internal
-        # state here that recreating a node would lose.
+    def _compute_swap_pos(self, total_height, target_crouch_amount):
+        """Where _swap_to_shape would move the hull to for a swap to
+        (total_height, target_crouch_amount) - factored out of
+        _swap_to_shape only so the two don't duplicate this math."""
         old_pos = self.node_path.getPos()
 
         if self._grounded:
@@ -715,7 +727,7 @@ class CharacterController:
             # rather than leaving the center in place - crouching
             # should lower the head, not lift the feet off (or sink
             # them into) the ground.
-            new_pos = Point3(old_pos.x, old_pos.y, old_pos.z + (total_height - self._current_height) / 2.0)
+            return Point3(old_pos.x, old_pos.y, old_pos.z + (total_height - self._current_height) / 2.0)
         else:
             # Airborne, there's no floor to plant feet against, so
             # "feet stay fixed" is an arbitrary reference with nothing
@@ -729,9 +741,25 @@ class CharacterController:
             # because _update_crouch's airborne eye-offset snap hasn't
             # run yet this tick - this computes what the eye offset
             # WILL be right after it does, so the two stay in sync.
+            #
+            # This branch is only ever reached going DOWN (crouching)
+            # now - _update_crouch never attempts to grow back to
+            # standing height while airborne at all (see its own
+            # comment), so there's no case here where this needs a
+            # clearance check: shrinking always moves the feet UP, away
+            # from any floor.
             old_eye_offset = self._eye_offset_for(self._current_height, self._crouch_amount)
             new_eye_offset = self._eye_offset_for(total_height, target_crouch_amount)
-            new_pos = Point3(old_pos.x, old_pos.y, old_pos.z + (old_eye_offset - new_eye_offset))
+            return Point3(old_pos.x, old_pos.y, old_pos.z + (old_eye_offset - new_eye_offset))
+
+    def _swap_to_shape(self, shape, total_height, target_crouch_amount):
+        # Swaps the shape on the SAME persistent ghost node
+        # (addShape/removeShape, confirmed to work on a live node)
+        # rather than replacing the node itself, so self.velocity is
+        # never touched by this at all - unlike
+        # BulletCharacterControllerNode, there's no hidden internal
+        # state here that recreating a node would lose.
+        new_pos = self._compute_swap_pos(total_height, target_crouch_amount)
 
         self.node.removeShape(self._current_shape)
         self.node.addShape(shape)
@@ -758,7 +786,30 @@ class CharacterController:
             if not self._is_crouched:
                 self._swap_to_shape(self._crouch_shape, self._crouch_height, target_crouch_amount=1.0)
                 self._is_crouched = True
-        elif self._is_crouched:
+        elif self._is_crouched and self._grounded:
+            # Standing back up is ONLY ever attempted while grounded -
+            # crouch_input being released while AIRBORNE does nothing at
+            # all here (falls through to neither branch), no matter how
+            # many times it's toggled before landing. This used to also
+            # attempt a (correctly refused, once the earlier clip-
+            # through-the-floor bug was fixed) stand-up mid-air, which
+            # meant repeatedly tapping crouch in the air could land you
+            # in a state where the LAST toggle before touching down
+            # happened to be "released" at a moment the check refused,
+            # leaving you stuck crouched on the ground with no obvious
+            # reason why (the very next successful release should have
+            # stood you up, but nothing was still watching for it once
+            # this call returned). Locking "still crouched" as the ONLY
+            # possible outcome of crouching at all while airborne -
+            # standing up strictly requires a fresh crouch_input=False
+            # read while self._grounded is already True - removes that
+            # ambiguity entirely: landing always re-evaluates crouch_
+            # input fresh on the very next tick regardless of how it was
+            # spammed in the air, and going down mid-air is still fully
+            # allowed and instant (see _compute_swap_pos's airborne
+            # branch - shrinking always moves the feet UP, away from any
+            # floor, so it never needed a clearance check to begin with).
+            #
             # Position the probe at today's position, THEN check it -
             # contactTest() (see _can_stand) queries fresh, so there's
             # no need to check against yesterday's position anymore.
