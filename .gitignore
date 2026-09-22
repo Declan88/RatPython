@@ -1,0 +1,4 @@
+build/app/app.pkg
+build/RatWar/RatWar.pkg
+dist/RatWar.exe
+build_nuitka/

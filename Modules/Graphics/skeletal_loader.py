@@ -49,6 +49,7 @@ SCOPE, stated explicitly rather than silently assumed:
 import io
 import json
 import struct
+import bisect
 from pathlib import Path
 
 import numpy as np
@@ -209,23 +210,36 @@ class AnimationChannel:
     def __init__(self, joint_index, path, times, values, interpolation):
         self.joint_index = joint_index
         self.path = path  # "translation" | "rotation" | "scale"
-        self.times = times  # 1D numpy array, seconds
-        self.values = values  # (N, 3) for translation/scale, (N, 4) xyzw for rotation
+        # Converted from numpy once here at LOAD time (a one-off cost),
+        # not kept as numpy arrays - sample() below runs on EVERY
+        # candidate clip, for EVERY channel, EVERY frame (confirmed via
+        # cProfile: this was the single hottest function in the whole
+        # per-frame update, ~1.7ms of a ~2.1ms Scene.update on a single
+        # skeletal object with an upper/lower blend split - see git
+        # history around this comment for the profile). A plain Python
+        # list + bisect beats np.searchsorted here because numpy's
+        # per-call dispatch overhead dominates at these array sizes (a
+        # clip's channel times list is typically tens of entries, not
+        # thousands) - and per-component tuple arithmetic beats numpy
+        # elementwise ops for the same reason on a 3- or 4-vector.
+        self.times = [float(t) for t in times]  # seconds, ascending
+        self.values = [tuple(float(x) for x in row) for row in values]  # (x,y,z) or (x,y,z,w) tuples
         self.interpolation = interpolation  # "LINEAR" | "STEP" (CUBICSPLINE falls back to LINEAR with a warning)
 
     def sample(self, time):
         times = self.times
-        if len(times) == 0:
+        count = len(times)
+        if count == 0:
             return None
         if time <= times[0]:
             idx = 0
             t = 0.0
         elif time >= times[-1]:
-            idx = len(times) - 2 if len(times) > 1 else 0
-            t = 1.0 if len(times) > 1 else 0.0
+            idx = count - 2 if count > 1 else 0
+            t = 1.0 if count > 1 else 0.0
         else:
-            idx = int(np.searchsorted(times, time, side="right") - 1)
-            idx = max(0, min(idx, len(times) - 2))
+            idx = bisect.bisect_right(times, time) - 1
+            idx = max(0, min(idx, count - 2))
             span = times[idx + 1] - times[idx]
             t = 0.0 if span <= 0 else (time - times[idx]) / span
 
@@ -241,8 +255,11 @@ class AnimationChannel:
             q = glm.slerp(q0, q1, t)
             return ("rotation", q)
         else:
-            value = v0 + (v1 - v0) * t
-            return (self.path, glm.vec3(*value))
+            return (self.path, glm.vec3(
+                v0[0] + (v1[0] - v0[0]) * t,
+                v0[1] + (v1[1] - v0[1]) * t,
+                v0[2] + (v1[2] - v0[2]) * t,
+            ))
 
 
 class AnimationClip:
@@ -283,6 +300,30 @@ class AnimationClip:
         return translations, rotations, scales
 
 
+def _extract_rotation(matrix):
+    """Returns matrix's rotation component as a glm.quat, robust to
+    uniform (or non-uniform) scale baked into it - unlike
+    glm.quat_cast(glm.mat3(matrix)), which assumes its input already
+    has unit-length basis columns and silently returns a WRONG
+    (unnormalized garbage) quaternion otherwise. This matters here
+    because a joint's accumulated WORLD matrix commonly does carry a
+    scale factor with no rotation of its own mixed in - e.g. a skin's
+    root joint scaled by a fixed unit-conversion factor via its own
+    Joint.external_root_matrix (confirmed a real case, not just a
+    theoretical one: rat.glb's own Pelvis root is scaled by 0.024) -
+    which propagates into every descendant's world matrix multiplicatively
+    even though each joint's own LOCAL matrix might be scale=1.
+    glm.decompose handles this correctly by actually separating out
+    scale before returning rotation, at the cost of also computing
+    (and discarding) translation/skew/perspective this caller doesn't
+    need - a worthwhile trade for correctness over the cheaper but
+    unsafe quat_cast shortcut."""
+    scale, rotation, translation = glm.vec3(), glm.quat(), glm.vec3()
+    skew, perspective = glm.vec3(), glm.vec4()
+    glm.decompose(matrix, scale, rotation, translation, skew, perspective)
+    return rotation
+
+
 class Skeleton:
     def __init__(self, joints, animations):
         self.joints = joints  # list[Joint], in skin.joints order
@@ -320,6 +361,41 @@ class Skeleton:
             return glm.translate(glm.mat4(1.0), tt) * glm.mat4_cast(rr) * glm.scale(glm.mat4(1.0), ss)
         return joint.local_bind_matrix
 
+    def _blend_pose_sets(self, from_pose, to_pose, weight):
+        """Elementwise per-joint TRS blend between two already-sampled
+        poses (translations, rotations, scales) triples - shared by
+        _sample_track's two-clip crossfade and _sample_weighted's N-clip
+        blend space below, since both ultimately need "combine two poses
+        by a weight" as their base operation. Builds each joint's
+        concrete local matrix via _local_matrix (bind-pose fallback
+        already resolved, so there's always a real matrix on both sides
+        even if one pose is None/missing a channel for this joint),
+        decomposes each via glm.decompose, and interpolates the
+        decomposed TRS components (translation/scale lerp, rotation
+        slerp - matrices themselves can't be linearly interpolated,
+        hence decomposing first) weighted by weight (0 = entirely
+        from_pose, 1 = entirely to_pose)."""
+        from_t, from_r, from_s = from_pose
+        to_t, to_r, to_s = to_pose
+
+        joint_count = len(self.joints)
+        translations, rotations, scales = [None] * joint_count, [None] * joint_count, [None] * joint_count
+
+        for i, joint in enumerate(self.joints):
+            from_matrix = self._local_matrix(joint, from_t[i], from_r[i], from_s[i])
+            to_matrix = self._local_matrix(joint, to_t[i], to_r[i], to_s[i])
+
+            from_scale, from_rot, from_trans = glm.vec3(), glm.quat(), glm.vec3()
+            glm.decompose(from_matrix, from_scale, from_rot, from_trans, glm.vec3(), glm.vec4())
+            to_scale, to_rot, to_trans = glm.vec3(), glm.quat(), glm.vec3()
+            glm.decompose(to_matrix, to_scale, to_rot, to_trans, glm.vec3(), glm.vec4())
+
+            translations[i] = glm.mix(from_trans, to_trans, weight)
+            rotations[i] = glm.slerp(from_rot, to_rot, weight)
+            scales[i] = glm.mix(from_scale, to_scale, weight)
+
+        return translations, rotations, scales
+
     def _sample_track(self, animation_name, time, prev_animation_name=None,
                        prev_time=0.0, blend_weight=1.0):
         """The per-track (lower or upper) pose sampler behind both
@@ -332,44 +408,61 @@ class Skeleton:
         With a crossfade in progress, samples BOTH clips (prev_
         animation_name at prev_time - frozen at whatever pose was
         showing the moment the transition started, NOT still advancing -
-        and animation_name at time), builds each joint's concrete local
-        matrix via _local_matrix (bind-pose fallback already resolved,
-        so there's always a real matrix on both sides even if one clip
-        is None/missing a channel for this joint), decomposes each via
-        glm.decompose, and interpolates the decomposed TRS components
-        (translation/scale lerp, rotation slerp - matrices themselves
-        can't be linearly interpolated, hence decomposing first)
-        weighted by blend_weight (0 = entirely the outgoing pose, 1 =
-        entirely the incoming one). This is what turns a hard instant
-        cut between clips (the previous behavior - visible as a pop at
-        every idle/walk state change) into a smooth transition."""
-        cur_t, cur_r, cur_s = self._sample_clip(animation_name, time)
+        and animation_name at time) and blends them via _blend_pose_sets
+        (0 = entirely the outgoing pose, 1 = entirely the incoming one).
+        This is what turns a hard instant cut between clips (the
+        previous behavior - visible as a pop at every idle/walk state
+        change) into a smooth transition."""
+        cur_pose = self._sample_clip(animation_name, time)
         if prev_animation_name is None or blend_weight >= 1.0:
-            return cur_t, cur_r, cur_s
+            return cur_pose
 
-        prev_t, prev_r, prev_s = self._sample_clip(prev_animation_name, prev_time)
+        prev_pose = self._sample_clip(prev_animation_name, prev_time)
+        return self._blend_pose_sets(prev_pose, cur_pose, blend_weight)
 
-        joint_count = len(self.joints)
-        translations, rotations, scales = [None] * joint_count, [None] * joint_count, [None] * joint_count
-        blend_scale, blend_rot, blend_trans = glm.vec3(), glm.quat(), glm.vec3()
-        blend_skew, blend_persp = glm.vec3(), glm.vec4()
+    def _sample_weighted(self, weighted):
+        """The blend-space counterpart to _sample_clip: weighted is a
+        list of (clip_name, time, weight) - possibly several clips
+        sampled at once (e.g. idle/walk/run's adjacent speed tiers, or a
+        directional tier's two bracketing facing clips), each already at
+        its own independently-advancing time (see Scene.update()'s
+        locomotion_time - clips here are NOT phase-matched/restarted the
+        way single-clip state switches used to be, since nothing here
+        ever hard-cuts to begin with). Entries with a non-positive weight
+        or an unknown clip name are dropped, and the remainder's weights
+        renormalized to sum to 1 - a caller doesn't need to pre-normalize
+        (or pre-filter for clips this skeleton might not actually have).
 
-        for i, joint in enumerate(self.joints):
-            from_matrix = self._local_matrix(joint, prev_t[i], prev_r[i], prev_s[i])
-            to_matrix = self._local_matrix(joint, cur_t[i], cur_r[i], cur_s[i])
+        Combines the survivors via _blend_pose_sets, folded in one at a
+        time: after the first k entries, the running pose already
+        represents their correctly-weighted combination (by induction),
+        so blending it against entry k+1 with weight
+        entry_weight / (cumulative_weight so far) yields the correct
+        weighted combination of all k+1 - the standard incremental
+        generalization of a two-way weighted blend to N clips (rotation
+        is technically only an approximation of a true weighted average
+        this way, since slerp isn't linear/order-independent, but it's
+        the same practical trick real-time engines use, and is exact for
+        translation/scale). Returns bind pose (via _empty_pose) if
+        nothing survives filtering - e.g. every weight was ~0 or every
+        clip name was unrecognized."""
+        entries = [(name, time, w) for name, time, w in weighted if w > 0.0 and name in self.animations]
+        if not entries:
+            return self._empty_pose()
+        if len(entries) == 1:
+            name, time, _w = entries[0]
+            return self._sample_clip(name, time)
 
-            from_scale, from_rot, from_trans = glm.vec3(), glm.quat(), glm.vec3()
-            glm.decompose(from_matrix, from_scale, from_rot, from_trans, glm.vec3(), glm.vec4())
-            to_scale, to_rot, to_trans = glm.vec3(), glm.quat(), glm.vec3()
-            glm.decompose(to_matrix, to_scale, to_rot, to_trans, glm.vec3(), glm.vec4())
+        total = sum(w for _, _, w in entries)
+        pose = self._sample_clip(entries[0][0], entries[0][1])
+        running_weight = entries[0][2] / total
+        for name, time, w in entries[1:]:
+            running_weight += w / total
+            blend = (w / total) / running_weight if running_weight > 0.0 else 0.0
+            pose = self._blend_pose_sets(pose, self._sample_clip(name, time), blend)
+        return pose
 
-            translations[i] = glm.mix(from_trans, to_trans, blend_weight)
-            rotations[i] = glm.slerp(from_rot, to_rot, blend_weight)
-            scales[i] = glm.mix(from_scale, to_scale, blend_weight)
-
-        return translations, rotations, scales
-
-    def _world_matrices(self, translations, rotations, scales):
+    def _world_matrices(self, translations, rotations, scales, rotation_offsets=None):
         """Shared hierarchy walk: given a per-joint local pose (any
         entry may be None, meaning "use this joint's bind-pose local
         transform instead" - see AnimationClip.sample_pose), returns the
@@ -378,7 +471,41 @@ class Skeleton:
         by both compute_bone_matrices (single clip) and
         compute_blended_bone_matrices (two clips, picked per joint by a
         mask) - the walk itself doesn't care where each joint's local
-        pose came from."""
+        pose came from.
+
+        rotation_offsets: optional {joint_index: glm.quat} map of
+        COMPONENT-space correction rotations (see compute_blended_bone_
+        matrices' own docstring for why/where this is used - upper-body
+        pose corrections) - "component space" in the same sense Unreal's
+        AnimGraph uses the term: fixed relative to this skeleton's OWN
+        root (this method's implicit reference frame throughout - see
+        world_matrix's own root case below), not the joint's immediate
+        parent NOR the actual game-world/level axes. Deliberately not
+        the joint's own local/parent-relative space: a joint's local
+        axes are whatever its parent bone's rest orientation happens to
+        leave them as, which for a bent/twisted rig bears no predictable
+        relationship to the skeleton's own root orientation - tuning
+        "-45 on Y" expecting a torso turn only reliably means that if Y
+        is interpreted relative to the skeleton root regardless of the
+        joint's own local orientation or its parent's current animated
+        rotation. Also deliberately NOT true world/level space: this
+        skeleton's root itself sits inside an outer model transform
+        (obj["position"]/obj["rotation"] - see Scene._get_model_matrix)
+        that can rotate independently of the skeleton every frame (the
+        local player's own facing tracks the camera continuously) - a
+        correction expressed in true level-space would then visibly
+        fight that outer rotation instead of turning WITH the character
+        as one rigid unit, which is what an authoring correction like
+        this actually wants (confirmed the hard way: an earlier version
+        of this feature used true absolute/level space and the
+        correction visibly "un-rotated" itself relative to the body
+        every time the player turned). Converted to the joint's actual
+        local space here, during the walk, since that conversion needs
+        the joint's PARENT component-space rotation (component_space =
+        parent_component_space * local, so a component-space rotation R
+        applied at this joint's own pivot is inverse(parent_rotation) *
+        R * parent_rotation once expressed in local terms) - not
+        available before this walk computes it."""
         world_cache = {}
 
         def world_matrix(i):
@@ -386,16 +513,36 @@ class Skeleton:
                 return world_cache[i]
 
             joint = self.joints[i]
-            local = self._local_matrix(joint, translations[i], rotations[i], scales[i])
-
-            if joint.parent_joint_index == -1:
+            parent_world = (
+                joint.external_root_matrix if joint.parent_joint_index == -1
                 # external_root_matrix is identity unless this joint's
                 # real glTF parent lies outside the skin (e.g. an
                 # armature object node with its own scale/translation/
                 # rotation) - see Joint.external_root_matrix.
-                world = joint.external_root_matrix * local
-            else:
-                world = world_matrix(joint.parent_joint_index) * local
+                else world_matrix(joint.parent_joint_index)
+            )
+
+            rotation = rotations[i]
+            if rotation_offsets and i in rotation_offsets:
+                base_rotation = (
+                    rotation if rotation is not None
+                    else _extract_rotation(joint.local_bind_matrix)
+                )
+                # NOT glm.quat_cast(glm.mat3(parent_world)) - quat_cast
+                # requires unit-length basis columns and silently
+                # returns garbage otherwise; parent_world's columns
+                # carry whatever uniform scale this skeleton's root
+                # external_root_matrix bakes in (e.g. a unit-conversion
+                # factor - confirmed a real, not hypothetical, case:
+                # rat.glb's own Pelvis root is scaled by 0.024). See
+                # _extract_rotation for the decompose-based extraction
+                # that handles this correctly.
+                parent_rotation = _extract_rotation(parent_world)
+                local_offset = glm.inverse(parent_rotation) * rotation_offsets[i] * parent_rotation
+                rotation = local_offset * base_rotation
+
+            local = self._local_matrix(joint, translations[i], rotation, scales[i])
+            world = parent_world * local
 
             world_cache[i] = world
             return world
@@ -416,6 +563,35 @@ class Skeleton:
         )
         return self._world_matrices(translations, rotations, scales)
 
+    def compute_bone_matrices_multi(self, weighted, prev_animation_name=None, prev_time=0.0, blend_weight=1.0):
+        """The blend-space counterpart to compute_bone_matrices: weighted
+        is a list of (clip_name, time, weight) - see _sample_weighted for
+        exactly how those combine into one pose, instead of a single
+        named clip. prev_animation_name/prev_time/blend_weight still
+        crossfade from a single PREVIOUS clip exactly like
+        compute_bone_matrices's own (blend_weight=1.0, the default,
+        skips it entirely) - the same crossfade mechanism bridges a
+        discrete state (e.g. a held jump/crouch pose) into or out of a
+        continuous blend space without needing any special-casing at the
+        transition itself."""
+        pose = self._sample_weighted(weighted)
+        if prev_animation_name is not None and blend_weight < 1.0:
+            pose = self._blend_pose_sets(self._sample_clip(prev_animation_name, prev_time), pose, blend_weight)
+        return self._world_matrices(*pose)
+
+    def resolve_joint_indices(self, joint_names):
+        """Returns the list of joint indices matching joint_names (by
+        name), silently skipping any name not present in self.joints -
+        shared by compute_joint_mask (root_joint_names) and callers that
+        need the raw root INDICES themselves rather than the full
+        descendant mask (e.g. add_skeletal's upper_rotation_offset,
+        which must rotate only the roots themselves, not every joint the
+        mask covers - rotating a descendant too would double-apply the
+        correction on top of what it already inherits from its
+        parent)."""
+        name_to_index = {joint.name: i for i, joint in enumerate(self.joints)}
+        return [name_to_index[name] for name in joint_names if name in name_to_index]
+
     def compute_joint_mask(self, root_joint_names):
         """Returns a list[bool] of length len(self.joints): True for
         every joint whose name is in root_joint_names, OR that is a
@@ -433,8 +609,7 @@ class Skeleton:
         silently ignored (contribute nothing to the mask) rather than
         raising, so a caller can pass a name list that's a superset of
         what a specific model's rig actually has."""
-        name_to_index = {joint.name: i for i, joint in enumerate(self.joints)}
-        root_indices = {name_to_index[name] for name in root_joint_names if name in name_to_index}
+        root_indices = set(self.resolve_joint_indices(root_joint_names))
 
         mask = [False] * len(self.joints)
         for i, joint in enumerate(self.joints):
@@ -451,7 +626,9 @@ class Skeleton:
     def compute_blended_bone_matrices(self, lower_animation, lower_time,
                                        upper_animation, upper_time, upper_joint_mask,
                                        lower_prev_animation=None, lower_prev_time=0.0, lower_blend_weight=1.0,
-                                       upper_prev_animation=None, upper_prev_time=0.0, upper_blend_weight=1.0):
+                                       upper_prev_animation=None, upper_prev_time=0.0, upper_blend_weight=1.0,
+                                       upper_rotation_offsets=None,
+                                       upper_joint_mask_prev=None, mask_blend_weight=1.0):
         """Like compute_bone_matrices, but each joint's LOCAL pose comes
         from upper_animation (sampled at upper_time) where
         upper_joint_mask[joint_index] is True, and from lower_animation
@@ -475,21 +652,170 @@ class Skeleton:
         independently - see _sample_track. Every existing caller that
         doesn't pass these gets the exact previous behavior (both
         blend_weight defaults are 1.0, meaning "just the current clip",
-        same as compute_bone_matrices' own defaults)."""
-        lower_t, lower_r, lower_s = self._sample_track(
+        same as compute_bone_matrices' own defaults).
+
+        upper_rotation_offsets: an optional {joint_index: glm.quat}
+        map of constant COMPONENT-space correction rotations, one
+        independent value per joint - meant to be keyed by the upper-
+        body mask's own ROOT joints (e.g. each clavicle, or Spine4 for a
+        widened override mask - see add_skeletal's
+        upper_rotation_offset_degrees, which is what actually builds
+        this map), not every joint the mask covers: rotating a ROOT
+        reorients its entire subtree for free via the normal parent-
+        child world-matrix chain, so also rotating its descendants would
+        double-apply the correction on top of what they already inherit.
+        A practical knob for nudging a limb's authored rest orientation
+        without touching the animation data itself (e.g. a pose authored
+        on a rig with a different bind orientation than this skeleton's
+        own) - keyed per-joint specifically so the LEFT and RIGHT sides
+        of a symmetric rig can be corrected by different amounts
+        independently, since a mirrored pose bug doesn't necessarily
+        affect both sides equally (or at all). Component-space (fixed
+        relative to this skeleton's own root, not the joint's immediate
+        parent NOR the actual game world) specifically so a tuned value
+        like "-45 on Y" reliably means the same turn relative to the
+        character's own body regardless of whatever orientation the
+        joint's parent bone happens to leave its local axes in, AND so
+        the correction rotates rigidly WITH the character as the player
+        turns instead of fighting that turn the way a true world/level-
+        space correction would - see _world_matrices' own rotation_
+        offsets docstring for the actual local-space conversion math,
+        which needs the hierarchy walk itself (this method just forwards
+        the map, unresolved, into that walk). None or an empty map (the
+        default) skips this addition entirely, matching every caller
+        before this param existed.
+
+        upper_joint_mask_prev/mask_blend_weight: smooths a JOINT MASK
+        change itself (see Scene.set_skeletal_upper_joint_mask) - e.g.
+        widening the upper-body split from clavicles-only to Spine4 (and
+        back) when a manual override starts/ends. Without this, any
+        joint whose mask assignment actually differs between
+        upper_joint_mask_prev and upper_joint_mask would hard-cut
+        between an upper-sourced and lower-sourced pose the instant the
+        mask changes - a real, confirmed pop distinct from (and on top
+        of) upper_rotation_offsets' own crossfade, since the offset
+        blend alone only smooths the CORRECTION, not the pose it's
+        layered onto. For a joint whose mask assignment is UNCHANGED
+        between the two masks, this has no effect at all (same selection
+        as if upper_joint_mask_prev/mask_blend_weight were never passed)
+        - only the joints actually transitioning between upper/lower
+        control get slerped between their old and new pose source, using
+        mask_blend_weight as the interpolation factor. upper_joint_mask_
+        prev=None or mask_blend_weight>=1.0 (the defaults) skip this
+        entirely, matching every caller before this param existed."""
+        lower_pose = self._sample_track(
             lower_animation, lower_time, lower_prev_animation, lower_prev_time, lower_blend_weight
         )
-        if upper_animation is None:
-            return self._world_matrices(lower_t, lower_r, lower_s)
-
-        upper_t, upper_r, upper_s = self._sample_track(
-            upper_animation, upper_time, upper_prev_animation, upper_prev_time, upper_blend_weight
+        upper_pose = (
+            None if upper_animation is None
+            else self._sample_track(upper_animation, upper_time, upper_prev_animation, upper_prev_time, upper_blend_weight)
+        )
+        return self._composite_bone_matrices(
+            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight
         )
 
-        translations = [upper_t[i] if upper_joint_mask[i] else lower_t[i] for i in range(len(self.joints))]
-        rotations = [upper_r[i] if upper_joint_mask[i] else lower_r[i] for i in range(len(self.joints))]
-        scales = [upper_s[i] if upper_joint_mask[i] else lower_s[i] for i in range(len(self.joints))]
-        return self._world_matrices(translations, rotations, scales)
+    def compute_blended_bone_matrices_multi(self, lower_weighted, upper_weighted, upper_joint_mask,
+                                             lower_prev_animation=None, lower_prev_time=0.0, lower_blend_weight=1.0,
+                                             upper_prev_animation=None, upper_prev_time=0.0, upper_blend_weight=1.0,
+                                             upper_rotation_offsets=None,
+                                             upper_joint_mask_prev=None, mask_blend_weight=1.0):
+        """The upper/lower-split counterpart to compute_bone_matrices_
+        multi: each track's pose comes from a weighted list of clips (see
+        _sample_weighted) instead of one named clip, then composited by
+        upper_joint_mask exactly like compute_blended_bone_matrices - see
+        its own docstring for the compositing/rotation-offset/mask-
+        transition behavior, shared here via _composite_bone_matrices.
+        upper_weighted=None falls back to the lower track's own pose for
+        every joint, matching upper_animation=None's existing fallback in
+        compute_blended_bone_matrices. lower_prev_animation/upper_prev_
+        animation (each a single clip name, not a weighted list) still
+        crossfade in/out of each track's blend space exactly like
+        compute_bone_matrices_multi's own prev_animation_name."""
+        lower_pose = self._sample_weighted(lower_weighted)
+        if lower_prev_animation is not None and lower_blend_weight < 1.0:
+            lower_pose = self._blend_pose_sets(
+                self._sample_clip(lower_prev_animation, lower_prev_time), lower_pose, lower_blend_weight
+            )
+
+        if upper_weighted is None:
+            upper_pose = None
+        else:
+            upper_pose = self._sample_weighted(upper_weighted)
+            if upper_prev_animation is not None and upper_blend_weight < 1.0:
+                upper_pose = self._blend_pose_sets(
+                    self._sample_clip(upper_prev_animation, upper_prev_time), upper_pose, upper_blend_weight
+                )
+
+        return self._composite_bone_matrices(
+            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight
+        )
+
+    def _composite_bone_matrices(self, lower_pose, upper_pose, upper_joint_mask,
+                                  upper_rotation_offsets=None,
+                                  upper_joint_mask_prev=None, mask_blend_weight=1.0):
+        """Shared tail of compute_blended_bone_matrices and compute_
+        blended_bone_matrices_multi: given each track's already-sampled
+        pose (translations, rotations, scales), composites them per-joint
+        by upper_joint_mask (upper_pose=None means every joint just uses
+        lower_pose, matching a track with no upper clip configured/
+        playing), applies upper_rotation_offsets, and walks the hierarchy
+        via _world_matrices. See compute_blended_bone_matrices's own
+        docstring for exactly what upper_rotation_offsets/upper_joint_
+        mask_prev/mask_blend_weight do - this is purely the composition
+        step, agnostic to how each pose was sampled."""
+        lower_t, lower_r, lower_s = lower_pose
+        if upper_pose is None:
+            return self._world_matrices(lower_t, lower_r, lower_s)
+
+        upper_t, upper_r, upper_s = upper_pose
+
+        mask_transitioning = (
+            upper_joint_mask_prev is not None and mask_blend_weight < 1.0
+            and upper_joint_mask_prev != upper_joint_mask
+        )
+        if not mask_transitioning:
+            translations = [upper_t[i] if upper_joint_mask[i] else lower_t[i] for i in range(len(self.joints))]
+            rotations = [upper_r[i] if upper_joint_mask[i] else lower_r[i] for i in range(len(self.joints))]
+            scales = [upper_s[i] if upper_joint_mask[i] else lower_s[i] for i in range(len(self.joints))]
+        else:
+            identity_translation = glm.vec3(0.0)
+            identity_rotation = glm.quat(1.0, 0.0, 0.0, 0.0)
+            identity_scale = glm.vec3(1.0)
+            translations, rotations, scales = [], [], []
+            for i in range(len(self.joints)):
+                if upper_joint_mask[i] == upper_joint_mask_prev[i]:
+                    translations.append(upper_t[i] if upper_joint_mask[i] else lower_t[i])
+                    rotations.append(upper_r[i] if upper_joint_mask[i] else lower_r[i])
+                    scales.append(upper_s[i] if upper_joint_mask[i] else lower_s[i])
+                    continue
+                # This joint's mask assignment just changed - slerp/mix
+                # between its old and new pose source instead of a hard
+                # cut. None (an unanimated channel) resolves to identity
+                # here, matching _local_matrix's own None convention
+                # elsewhere, NOT the joint's bind pose.
+                old_t = upper_t[i] if upper_joint_mask_prev[i] else lower_t[i]
+                new_t = upper_t[i] if upper_joint_mask[i] else lower_t[i]
+                old_r = upper_r[i] if upper_joint_mask_prev[i] else lower_r[i]
+                new_r = upper_r[i] if upper_joint_mask[i] else lower_r[i]
+                old_s = upper_s[i] if upper_joint_mask_prev[i] else lower_s[i]
+                new_s = upper_s[i] if upper_joint_mask[i] else lower_s[i]
+                translations.append(glm.mix(
+                    old_t if old_t is not None else identity_translation,
+                    new_t if new_t is not None else identity_translation,
+                    mask_blend_weight,
+                ))
+                rotations.append(glm.slerp(
+                    old_r if old_r is not None else identity_rotation,
+                    new_r if new_r is not None else identity_rotation,
+                    mask_blend_weight,
+                ))
+                scales.append(glm.mix(
+                    old_s if old_s is not None else identity_scale,
+                    new_s if new_s is not None else identity_scale,
+                    mask_blend_weight,
+                ))
+
+        return self._world_matrices(translations, rotations, scales, rotation_offsets=upper_rotation_offsets)
 
 
 def _extract_material(ctx, gltf, blob, material_index, glb_dir):
@@ -553,6 +879,12 @@ def _extract_material(ctx, gltf, blob, material_index, glb_dir):
         img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         tex = ctx.texture(img.size, 3, img.tobytes())
         tex.build_mipmaps()
+        # Set once here, not per-frame in pbr_shader.py's
+        # _bind_material_textures (see that function's own comment on
+        # why it no longer touches .filter at all) - matches
+        # model_loader.py's _upload_texture, the other texture-creation
+        # site feeding the same bind_material() path.
+        tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
         tex.repeat_x = tex.repeat_y = True
         return tex
 

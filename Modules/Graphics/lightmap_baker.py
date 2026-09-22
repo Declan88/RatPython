@@ -7,17 +7,27 @@ texture atlas one texel per shader invocation - each texel's fragment
 shader invocation receives the interpolated world position/normal for
 that point on the mesh, and computes real (diffuse-only) lighting there.
 
-Only POINT lights get baked here. The directional light is deliberately
-never baked - it stays fully real-time via CascadedShadowMap for every
-object, static or dynamic (see scene.py's _render_shadows). Baking it
-here too would double-count it: the runtime shader already adds a
-real-time, correctly-shadowed directional term for every object
-regardless of whether it has a lightmap, so an object with both a baked
-directional contribution AND the real-time one would show it twice, at
-roughly double brightness. This module used to support baking the
-directional light too (a u_mode switch selecting directional vs point
-behavior) - that's been removed along with the double-counting bug it
-caused.
+Both point lights AND the directional (sun) light get baked here now -
+u_mode switches the single bake fragment shader between the two
+behaviors, since a lightmapped object's bake VAO is built against THIS
+program specifically (see Scene._load_object) and can't be reused
+against a second, separately-compiled program.
+
+To avoid double-counting the sun (baking it here AND still adding a
+real-time directional term at runtime would show it twice, at roughly
+double brightness), pbr_shader.py's runtime fragment shader now skips
+its own real-time directional calculation entirely for any object that
+has a lightmap (u_has_lightmap == 1) - see that file's main(). Only
+objects WITHOUT a lightmap (dynamic/skeletal - moving objects, which
+can't be baked since their transform changes every frame) still
+compute the sun's contribution live, and still cast/receive real-time
+shadows via CascadedShadowMap exactly as before. Static geometry still
+RENDERS into that same real-time cascade pass too (see Scene.
+_render_shadows) - not for its own lighting anymore, but so it still
+correctly occludes the sun for a moving object standing behind/under
+it (matching Unreal's stationary-light model: static shadowing is
+baked, but movable actors still get real-time shadows cast onto AND by
+static geometry).
 
 Bakes ONE LIGHT AT A TIME, additively blended into the lightmap texture,
 rather than declaring uniform arrays sized for every light in the scene
@@ -60,13 +70,35 @@ void main() {
 BAKE_FRAGMENT_SHADER = """
 #version 330
 
+// 0 = point light (default - see bake_point_light), 1 = directional
+// (sun) light (see bake_directional_light). One shader/program handles
+// both because a lightmapped object's "lightmap_vao" is built once,
+// against THIS specific compiled program (see Scene._load_object) -
+// baking the sun through a second, separate program would need a
+// second VAO per object just for that, for no real benefit.
+uniform int u_mode;
+
 uniform vec3 u_light_color;
+
+// u_mode == 0 (point light) uniforms.
 uniform vec3 u_point_pos;
 uniform float u_point_radius;
 uniform int u_has_shadow;
 uniform sampler2D u_point_shadow_faces[6];
 uniform mat4 u_point_light_mvps[6];
 uniform float u_point_shadow_texel;
+
+// u_mode == 1 (directional/sun) uniforms. Unlike the point-light path,
+// there's no falloff/attenuation (a directional light has no position,
+// every point in the scene receives the same intensity) and always a
+// single flat shadow map, never a 6-face cube - see Scene.
+// bake_static_lighting for how that shadow map is built (one static-
+// scene-covering orthographic depth render, done once for the whole
+// bake, not per object).
+uniform vec3 u_light_dir;
+uniform sampler2D u_directional_shadow_map;
+uniform mat4 u_directional_light_mvp;
+uniform float u_directional_shadow_texel;
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -121,8 +153,52 @@ float calc_point_shadow(vec3 world_pos, vec3 normal) {
     return shadow / 9.0;
 }
 
+// Same normal-offset-bias + 3x3 PCF approach as calc_point_shadow above
+// (see that function's own comment) and as pbr_shader.py's real-time
+// calculate_shadow - just against a single flat orthographic depth map
+// instead of a cube face or a cascade array. 0.05 offset rather than
+// calc_point_shadow's 0.02: this shadow map covers the WHOLE static
+// scene in one orthographic projection (see Scene.bake_static_lighting),
+// so its world-space texel size is coarser than a tightly-fit per-light
+// point shadow cube, and needs a proportionally bigger offset to stay
+// ahead of that.
+float calc_directional_shadow(vec3 world_pos, vec3 normal) {
+    vec3 offset_pos = world_pos + normal * 0.05;
+    vec4 ls = u_directional_light_mvp * vec4(offset_pos, 1.0);
+    if (ls.w <= 0.00001) return 0.0;
+    vec3 c = (ls.xyz / ls.w) * 0.5 + 0.5;
+    if (any(lessThan(c, vec3(0.0))) || any(greaterThan(c, vec3(1.0)))) return 0.0;
+
+    float shadow = 0.0;
+    vec2 texel_size = vec2(u_directional_shadow_texel);
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            vec2 uv = clamp(c.xy + vec2(x, y) * texel_size, vec2(0.001), vec2(0.999));
+            if (c.z > texture(u_directional_shadow_map, uv).r) {
+                shadow += 1.0;
+            }
+        }
+    }
+    return shadow / 9.0;
+}
+
 void main() {
     vec3 N = normalize(v_normal);
+
+    if (u_mode == 1) {
+        // Diffuse only, same as the point-light path below - baked
+        // lighting here never carries a specular term (a lightmap
+        // stores irradiance, not a view-dependent highlight; see this
+        // file's own module docstring). The real-time shader still
+        // adds the sun's specular highlight for objects WITHOUT a
+        // lightmap (moving objects - see pbr_shader.py's main()), just
+        // never a baked one.
+        vec3 L = normalize(u_light_dir);
+        float NdotL = max(dot(N, L), 0.0);
+        float shadow = calc_directional_shadow(v_world_pos, N);
+        fragColor = vec4(u_light_color * NdotL * (1.0 - shadow), 1.0);
+        return;
+    }
 
     vec3 to_light = u_point_pos - v_world_pos;
     float dist = length(to_light);
@@ -192,6 +268,7 @@ def bake_point_light(ctx, bake_program, obj, model_matrix, light, shadow_map=Non
     fbo = ctx.framebuffer(color_attachments=[obj["lightmap_texture"]])
     fbo.use()
 
+    bake_program["u_mode"].value = 0
     bake_program["u_model"].write(model_matrix.to_bytes())
     bake_program["u_light_color"].value = tuple(c * light["intensity"] for c in light["color"])
     bake_program["u_point_pos"].value = tuple(light["position"])
@@ -210,6 +287,44 @@ def bake_point_light(ctx, bake_program, obj, model_matrix, light, shadow_map=Non
             bake_program["u_point_light_mvps"].write(b"".join(m.to_bytes() for m in shadow_map.light_mvps))
     else:
         bake_program["u_has_shadow"].value = 0
+
+    obj["lightmap_vao"].render()
+    fbo.release()
+
+
+def bake_directional_light(ctx, bake_program, obj, model_matrix, light_dir, light_color,
+                            light_intensity, shadow_texture, shadow_light_mvp, shadow_resolution):
+    """Additively bakes the sun's contribution into obj["lightmap_
+    texture"] - the directional counterpart to bake_point_light above,
+    called once per eligible static object from Scene.bake_static_
+    lighting for the SAME single static-scene shadow map (built once
+    for the whole bake, not per object - a directional light has no
+    position for a per-object shadow cube to make sense of anyway).
+
+    shadow_texture: a single depth texture (not a 6-face cube - see
+    calc_directional_shadow's own comment) already containing every
+    static object's depth as seen from the light.
+    shadow_light_mvp: the glm.mat4 that produced it.
+    shadow_resolution: shadow_texture's resolution, for sizing the PCF
+    kernel's texel step (see calc_point_shadow's own u_point_shadow_
+    texel for why this is passed in rather than hardcoded)."""
+    if not obj.get("has_lightmap_uv") or obj.get("lightmap_vao") is None or obj.get("lightmap_texture") is None:
+        return
+
+    fbo = ctx.framebuffer(color_attachments=[obj["lightmap_texture"]])
+    fbo.use()
+
+    bake_program["u_mode"].value = 1
+    bake_program["u_model"].write(model_matrix.to_bytes())
+    bake_program["u_light_color"].value = tuple(c * light_intensity for c in light_color)
+    bake_program["u_light_dir"].value = tuple(light_dir)
+
+    shadow_texture.use(location=0)
+    if "u_directional_shadow_map" in bake_program:
+        bake_program["u_directional_shadow_map"].value = 0
+    if "u_directional_light_mvp" in bake_program:
+        bake_program["u_directional_light_mvp"].write(shadow_light_mvp.to_bytes())
+    bake_program["u_directional_shadow_texel"].value = 1.0 / shadow_resolution
 
     obj["lightmap_vao"].render()
     fbo.release()

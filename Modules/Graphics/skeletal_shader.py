@@ -11,9 +11,16 @@ that already happened once in this project (MAX_SHADOW_POINT_LIGHTS
 disagreeing between two copies) and was fixed by never letting two
 copies of the same logic exist in the first place.
 
-Bone matrices are supplied as ONE WHOLE ARRAY (prog["u_bone_matrices"].write(...)),
-never via per-index bracket names - see pbr_shader.py's docstring for
-why that distinction matters in moderngl.
+Bone matrices live in a std140 UNIFORM BUFFER (block "BoneBlock"), one
+buffer per skeletal object, uploaded ONCE per frame (see
+upload_bone_matrices) and merely re-bound for every draw that frame
+(bind_bone_matrices) - the main shadow cascades, the movable-only
+cascades and the color pass all skin from the same pose. This used to
+be a plain program-uniform array (prog["u_bone_matrices"].write(...))
+rewritten on every draw, which on Intel Arc integrated graphics made
+the FIRST such write each frame block inside the driver for up to
+~250ms (measured: p99 37ms) - visible as random hard stutters - on top
+of re-packing 64 mat4s in Python once per draw call.
 
 MAX_BONES lives only in the vertex stage (the reused fragment shader has
 no bone data at all), so it doesn't compete with the fragment shader's
@@ -26,9 +33,13 @@ only if you've verified it compiles on your target hardware.
 
 import glm
 
-from Modules.Graphics.pbr_shader import FRAGMENT_SHADER_HEADER, FRAGMENT_SHADER_BODY
+from Modules.Graphics.pbr_shader import FRAGMENT_SHADER_HEADER, FRAGMENT_SHADER_BODY, bind_material_block
 
 MAX_BONES = 64
+
+# Uniform-buffer binding point shared by every skeletal program (only one
+# object's bones are bound at any instant, so one point is enough).
+BONE_UBO_BINDING = 0
 
 SKELETAL_VERTEX_HEADER = f"""
 #version 330
@@ -38,7 +49,7 @@ SKELETAL_VERTEX_HEADER = f"""
 SKELETAL_VERTEX_BODY = """
 uniform mat4 u_mvp;
 uniform mat4 u_model;
-uniform mat4 u_bone_matrices[MAX_BONES];
+layout(std140) uniform BoneBlock { mat4 u_bone_matrices[MAX_BONES]; };
 
 in vec3 in_position;
 in vec3 in_normal;
@@ -92,7 +103,7 @@ SKELETAL_SHADOW_VERTEX_HEADER = f"""
 
 SKELETAL_SHADOW_VERTEX_BODY = """
 uniform mat4 u_light_mvp;
-uniform mat4 u_bone_matrices[MAX_BONES];
+layout(std140) uniform BoneBlock { mat4 u_bone_matrices[MAX_BONES]; };
 
 in vec3 in_position;
 in ivec4 in_joints;
@@ -122,22 +133,56 @@ void main() {}
 """
 
 
+def _bind_bone_block(prog):
+    if "BoneBlock" in prog:
+        prog["BoneBlock"].binding = BONE_UBO_BINDING
+    return prog
+
+
 def create_skeletal_program(ctx):
-    return ctx.program(vertex_shader=SKELETAL_VERTEX_SHADER, fragment_shader=SKELETAL_FRAGMENT_SHADER)
+    # Also binds MaterialBlock (pbr_shader.py's bind_material_block) -
+    # this program reuses FRAGMENT_SHADER_BODY verbatim (see module
+    # docstring), so it declares that same block too.
+    return bind_material_block(_bind_bone_block(
+        ctx.program(vertex_shader=SKELETAL_VERTEX_SHADER, fragment_shader=SKELETAL_FRAGMENT_SHADER)
+    ))
 
 
 def create_skeletal_shadow_program(ctx):
-    return ctx.program(vertex_shader=SKELETAL_SHADOW_VERTEX_SHADER, fragment_shader=SKELETAL_SHADOW_FRAGMENT_SHADER)
+    return _bind_bone_block(
+        ctx.program(vertex_shader=SKELETAL_SHADOW_VERTEX_SHADER, fragment_shader=SKELETAL_SHADOW_FRAGMENT_SHADER)
+    )
 
 
-def bind_bone_matrices(prog, bone_matrices):
-    """bone_matrices: list of glm.mat4 (e.g. from
-    Skeleton.compute_bone_matrices()), any length up to MAX_BONES -
-    padded with identity matrices past that. Whole-array write, not
-    per-index bracket names - see module docstring."""
+def _pack_bone_matrices(bone_matrices):
     padded = list(bone_matrices[:MAX_BONES])
     while len(padded) < MAX_BONES:
         padded.append(glm.mat4(1.0))
+    return b"".join(m.to_bytes() for m in padded)
 
-    if "u_bone_matrices" in prog:
-        prog["u_bone_matrices"].write(b"".join(m.to_bytes() for m in padded))
+
+def upload_bone_matrices(ctx, obj):
+    """Writes obj["bone_matrices"] (list of glm.mat4, any length up to
+    MAX_BONES, identity-padded past that) into obj's own uniform buffer,
+    creating it on first use. Call once per frame per object after the
+    pose is computed (Scene.update does) - NOT once per draw. Skipped
+    entirely if the pose list is the very same object as last upload
+    (Scene.update only rebinds obj["bone_matrices"] when it recomputes)."""
+    bones = obj["bone_matrices"]
+    if obj.get("_bones_uploaded") is bones and obj.get("bone_ubo") is not None:
+        return
+    data = _pack_bone_matrices(bones)
+    ubo = obj.get("bone_ubo")
+    if ubo is None:
+        obj["bone_ubo"] = ctx.buffer(data, dynamic=True)
+    else:
+        ubo.orphan()
+        ubo.write(data)
+    obj["_bones_uploaded"] = bones
+
+
+def bind_bone_matrices(obj):
+    """Makes obj's bone uniform buffer the active BoneBlock source for
+    subsequent draws - a cheap bind, no data upload (see
+    upload_bone_matrices)."""
+    obj["bone_ubo"].bind_to_uniform_block(BONE_UBO_BINDING)

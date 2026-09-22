@@ -4,7 +4,7 @@ from Modules.Scenes.scene_base import Scene
 
 class TorusScene(Scene):
     def __init__(self, ctx):
-        super().__init__(ctx, recalculate_shadows=True)
+        super().__init__(ctx, recalculate_shadows=False)
 
         # Natural overhead sun angle (shining down from above, slightly right and forward)
         self.light_dir = glm.vec3(0.5, 1.0, 0.8)
@@ -136,24 +136,26 @@ class TorusScene(Scene):
         character = self.add_skeletal(
             "Assets/Models/rat.glb",
             position=(0, -1, -3),
-            animation="rifle_run",
+            animation="pistol_idle",
             time_scale=_RAT_ANIM_TIME_SCALE,
         )
         self.load_additional_animations(
-            character, "Assets/Animations/Poses/Rifle/RifleRunN.glb",
-            rename={"New": "rifle_run"}, time_scale=_RAT_ANIM_TIME_SCALE,
+            character,
+            "Assets/Animations/Poses/Pistol/pistolidle.glb",
+            rename={"New": "pistol_idle"},
+            time_scale=_RAT_ANIM_TIME_SCALE,
         )
         character["specular_strength"] = 0
         print("Animations available:", list(character["skeleton"].animations.keys()))
 
         # Lights
 
-        self.add_lights_from_glb(
-            "Assets/Models/Testmap/plane.glb",
-            cast_shadows=True,
-            radius_multiplier=3,
-            intensity_multiplier=0.8,
-        )
+        # self.add_lights_from_glb(
+        #     "Assets/Models/Testmap/plane.glb",
+        #     cast_shadows=True,
+        #     radius_multiplier=3,
+        #     intensity_multiplier=0.8,
+        # )
 
         # Sound
 

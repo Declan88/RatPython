@@ -117,6 +117,28 @@ _SURFACE_PUSHBACK = 0.001
 # player as fully stuck (matches Source's TryPlayerMove numbumps).
 _MAX_BUMPS = 4
 
+# Squared-distance tolerance (meters^2) for _step_slide_move's own flat-
+# vs-stepped tie-break - see its own comment for the full reasoning.
+# Needs to be comfortably bigger than _SURFACE_PUSHBACK's own scale: both
+# candidates apply that same ~1mm pushback independently (via their own
+# separate _try_move call), so two outcomes that are "equally blocked" -
+# pushed straight into a flat wall, say, with no stairs/slope involved at
+# all - routinely differ from each other by roughly that much even though
+# nothing is genuinely different between them. A too-tight tolerance here
+# (1e-9 - three orders of magnitude below the pushback's own ~1e-6
+# squared-distance scale) let final_pos flip between flat_pos and
+# settled_pos essentially at random, every tick, purely from which
+# candidate's own independent sweep noise happened to travel fractionally
+# further that tick - visibly, the whole character's root position
+# vibrated by that sub-centimeter amount continuously while pinned
+# against any wall, reading as the legs/stride stuttering even though the
+# animation blend weights themselves (see PlayerModel.update()'s own
+# is_sprinting/move_direction docstrings) were completely stable. 1e-4
+# (1cm, squared) sits comfortably above that pushback-scale noise floor
+# while staying far below any genuine stair/slope horizontal travel this
+# tie-break needs to keep detecting correctly.
+_STEP_TIE_EPSILON_SQ = 1e-4
+
 # Direct port of the constants in Source SDK 2013's
 # CBasePlayer::UpdateStepSound / GetStepSoundVelocities /
 # SetStepSoundTime (game/shared/baseplayer_shared.cpp) - confirmed by
@@ -305,6 +327,20 @@ class CharacterController:
         # _update_footsteps' just_landed for why this exists separately
         # from self._grounded.
         self._touched_ground = False
+
+        # Set the instant a queued jump actually executes (see
+        # _on_pre_substep) - mirrors _pending_footstep/pop_footstep()
+        # exactly (a physics-tick-rate event latched until the next
+        # render-frame poll consumes it via pop_jumped()), so a caller
+        # driving player animation (see app.py/PlayerModel.update()'s own
+        # just_jumped param) can react to the ACTUAL jump input the same
+        # frame it happens, rather than only inferring "airborne" from
+        # is_on_ground() - which, pressed against a wall, can flicker
+        # False for a tick or two with no jump involved at all (see
+        # PlayerModel's own _JUMP_CONFIRM_SECONDS docstring), so waiting
+        # on that debounce to also gate a REAL jump's own animation made
+        # a genuine jump feel noticeably delayed/laggy.
+        self._pending_jump_event = False
         self._fall_speed_on_touch = 0.0
 
         # Last completed substep's (smoothed - see _on_pre_substep)
@@ -555,8 +591,11 @@ class CharacterController:
                 # ground (the hasHit + slope check above), it should win
                 # every tie - flat only wins when it's UNAMBIGUOUSLY
                 # better (e.g. stepping got blocked by something flat
-                # could slide past).
-                if flat_dist_sq > step_dist_sq + 1e-9:
+                # could slide past). See _STEP_TIE_EPSILON_SQ's own
+                # docstring for why this comparison needs a real
+                # tolerance rather than an exact ">" (a too-tight one
+                # visibly vibrated the character against any wall).
+                if flat_dist_sq > step_dist_sq + _STEP_TIE_EPSILON_SQ:
                     final_pos, final_vel = flat_pos, flat_vel
                 else:
                     final_pos, final_vel = settled_pos, step_vel
@@ -910,6 +949,7 @@ class CharacterController:
         if self._jump_requested and self._grounded:
             self.velocity.y = self.jump_speed
             self._grounded = False
+            self._pending_jump_event = True
         self._jump_requested = False
 
         wishdir, wishspeed = self._wish()
@@ -1004,6 +1044,16 @@ class CharacterController:
         once before the next physics tick runs."""
         event = self._pending_footstep
         self._pending_footstep = None
+        return event
+
+    def pop_jumped(self):
+        """Returns whether a jump actually executed since the last call,
+        consuming the event the same way pop_footstep() does (so it never
+        double-fires even if this is polled more than once before the
+        next physics tick runs) - call once per frame (see app.py) and
+        forward to PlayerModel.update()'s own just_jumped param."""
+        event = self._pending_jump_event
+        self._pending_jump_event = False
         return event
 
     def get_position(self):

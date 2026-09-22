@@ -143,14 +143,14 @@ class RemotePlayer:
         self._last_feet_pos = feet_pos
         self._last_update_time = now
 
-        # dt=elapsed (real wall time since the last packet), not a
-        # constant 0.0 - PlayerModel.update() uses dt to accumulate its
-        # own min_state_dwell anti-flicker timer (see PlayerModel.
-        # _compute_movement_state's docstring), not just animation
-        # timing (which really does stay entirely inside Scene.update()'s
-        # own per-frame loop, untouched by this) - a constant 0.0 would
-        # leave that timer stuck at 0 forever after the first state
-        # change, permanently jamming the dwell gate shut.
+        # dt=elapsed (real wall time since the last packet) - PlayerModel.
+        # update() doesn't currently use dt for anything itself (its
+        # locomotion blend space is re-evaluated fresh from speed/
+        # direction every call, with no dwell timer to accumulate -
+        # actual animation time advance stays entirely inside Scene.
+        # update()'s own per-frame loop), but is passed through anyway to
+        # match the local player's own call and in case a future need
+        # arises here.
         self.model.update(elapsed, feet_pos, yaw_degrees, speed)
 
         # Hitbox centered vertically on the body (feet to eye), not at

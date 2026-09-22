@@ -51,7 +51,8 @@ def lightmap_cache_path(lightmap_dir, name):
     return lightmap_dir / f"{name}.{ext}"
 
 
-def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolution):
+def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolution,
+                         directional_shadow_resolution):
     """array: (H, W, 3) float16 numpy array."""
     if HAS_OPENEXR:
         header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
@@ -61,26 +62,38 @@ def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolutio
         path.with_suffix(".json").write_text(json.dumps({
             "lightmap_resolution": lightmap_resolution,
             "point_shadow_resolution": point_shadow_resolution,
+            "directional_shadow_resolution": directional_shadow_resolution,
         }))
     else:
         np.savez_compressed(
             path, data=array,
             lightmap_resolution=lightmap_resolution,
             point_shadow_resolution=point_shadow_resolution,
+            directional_shadow_resolution=directional_shadow_resolution,
         )
 
 
-def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution):
+def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution,
+                         directional_shadow_resolution):
     """Returns the cached (H, W, 3) float16 array if it exists AND
     matches the requested resolutions, else None (missing or stale -
-    either way, the caller should treat it as a cache miss and rebake)."""
+    either way, the caller should treat it as a cache miss and rebake).
+
+    directional_shadow_resolution: added when the sun's contribution
+    started being baked too (previously only point lights were baked -
+    see lightmap_baker.py's own docstring). A cache file saved before
+    that change simply has no such key at all, so meta.get(...) here
+    reads back None != directional_shadow_resolution and this already,
+    correctly, treats it as stale - no separate version bump needed to
+    force every pre-existing cache to rebake once."""
     if HAS_OPENEXR:
         meta_path = path.with_suffix(".json")
         if not path.exists() or not meta_path.exists():
             return None
         meta = json.loads(meta_path.read_text())
         if meta.get("lightmap_resolution") != lightmap_resolution or \
-           meta.get("point_shadow_resolution") != point_shadow_resolution:
+           meta.get("point_shadow_resolution") != point_shadow_resolution or \
+           meta.get("directional_shadow_resolution") != directional_shadow_resolution:
             return None
         with OpenEXR.File(str(path)) as infile:
             return infile.channels()["RGB"].pixels.astype(np.float16)
@@ -89,6 +102,7 @@ def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution):
             return None
         with np.load(path) as npz:
             if int(npz["lightmap_resolution"]) != lightmap_resolution or \
-               int(npz["point_shadow_resolution"]) != point_shadow_resolution:
+               int(npz["point_shadow_resolution"]) != point_shadow_resolution or \
+               int(npz.get("directional_shadow_resolution", -1)) != directional_shadow_resolution:
                 return None
             return npz["data"]

@@ -1,8 +1,11 @@
 from pathlib import Path
+from functools import lru_cache
 import moderngl
 import numpy as np
 from PIL import Image
 import trimesh
+
+from Modules.Graphics.lightmap_uv_generator import generate_lightmap_uvs
 
 DEFAULT_CREASE_ANGLE_DEG = 30.0
 
@@ -105,18 +108,44 @@ def _normalize_color(values):
 def _upload_texture(ctx, img):
     if img is None: return None
     if not isinstance(img, Image.Image): img = Image.fromarray(np.asarray(img))
-    img = img.convert("RGB")
-    tex = ctx.texture(img.size, 3, img.tobytes())
+    # RGBA, not RGB - a base color texture's own alpha channel needs to
+    # survive into the shader for MASK/BLEND alpha_mode materials to
+    # render correctly (see _extract_material's own alpha_mode/
+    # alpha_cutoff and pbr_shader.py's fragment shader). A texture with
+    # no real alpha channel (a plain JPEG, say) just comes out fully
+    # opaque (255) here, matching how it always rendered before this.
+    img = img.convert("RGBA")
+    tex = ctx.texture(img.size, 4, img.tobytes())
     tex.build_mipmaps()
-    # This filter setting is immediately overwritten every frame by
-    # pbr_shader.py's _bind_material_textures (which sets .filter on
-    # every bind call) - it's set here too only so this file doesn't
-    # visually contradict what's actually in effect at runtime. If you
-    # change the filtering mode, change it in _bind_material_textures;
-    # this line won't do anything on its own.
     tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
     tex.repeat_x = tex.repeat_y = True
     return tex
+
+@lru_cache(maxsize=8)
+def _parse_gltf2_cached(path_str):
+    """Parses a .glb's full glTF structure via pygltflib exactly once
+    per file path for this process (an in-memory cache, not a disk
+    one - nothing here is persisted, and nothing invalidates it if the
+    file changes on disk mid-session, which never happens in this
+    codebase's own load-once-at-scene-startup usage).
+
+    _read_gltf_uv1 and _read_raw_gltf_material_factors both used to
+    call GLTF2().load(path) independently, and _read_gltf_uv1 did so
+    from INSIDE _build_mesh_data - i.e. once per MATERIAL GROUP, not
+    once per file. pygltflib's own JSON->dataclass decoding (via
+    dataclasses_json, which leans on Python's typing/reflection
+    machinery per field) is slow enough on a large file that this
+    was confirmed, via cProfile, to be a multi-second cost EACH call -
+    for a 107-material glb, loaded 3x over (once per pbr/shadow/bake
+    program - see _load_objects_by_material), that added up to several
+    hundred redundant full-file re-parses and a multi-MINUTE scene
+    load before anything appeared on screen. Raises ImportError if
+    pygltflib isn't installed, same as the direct GLTF2().load(...)
+    call this replaces - callers still handle that themselves for
+    their own distinct warning message."""
+    from pygltflib import GLTF2
+    return GLTF2().load(path_str)
+
 
 def _read_gltf_uv1(path, node_order):
     """Reads the TEXCOORD_1 (lightmap UV) accessor from each node in
@@ -155,7 +184,7 @@ def _read_gltf_uv1(path, node_order):
     only some of the rendered geometry would misalign texture coords
     across the rest."""
     try:
-        from pygltflib import GLTF2
+        gltf = _parse_gltf2_cached(str(path))
     except ImportError:
         print(
             "[model_loader] pygltflib is not installed - lightmap UVs "
@@ -165,7 +194,6 @@ def _read_gltf_uv1(path, node_order):
         return None
 
     try:
-        gltf = GLTF2().load(str(path))
         nodes_by_name = {n.name: n for n in (gltf.nodes or []) if n.name}
         blob = gltf.binary_blob()
 
@@ -194,23 +222,59 @@ def _read_gltf_uv1(path, node_order):
 
 def _read_raw_gltf_material_factors(path):
     try:
-        from pygltflib import GLTF2
-        gltf = GLTF2().load(str(path))
+        gltf = _parse_gltf2_cached(str(path))
         return {m.name: {"roughnessFactor": getattr(m.pbrMetallicRoughness, "roughnessFactor", None) if m.pbrMetallicRoughness else None,
-                         "metallicFactor": getattr(m.pbrMetallicRoughness, "metallicFactor", None) if m.pbrMetallicRoughness else None}
+                         "metallicFactor": getattr(m.pbrMetallicRoughness, "metallicFactor", None) if m.pbrMetallicRoughness else None,
+                         # alphaMode/alphaCutoff aren't exposed by
+                         # trimesh's own material wrapper at all (unlike
+                         # roughness/metallic factors, which trimesh
+                         # usually does surface) - straight from the raw
+                         # glTF, same as these two. alphaMode's own glTF-
+                         # spec default is "OPAQUE" when the field is
+                         # omitted entirely; alphaCutoff's is 0.5,
+                         # meaningful only for MASK.
+                         "alphaMode": getattr(m, "alphaMode", None) or "OPAQUE",
+                         "alphaCutoff": getattr(m, "alphaCutoff", None)}
                 for m in (gltf.materials or [])}
     except Exception:
         return {}
 
-def _extract_material(mesh, scene, ctx, raw_factors=None):
+def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
+    """load_textures=False skips the two _upload_texture calls at the
+    end entirely (returning (None, None) for tex_obj/mr_tex_obj instead)
+    - every OTHER factor here (base_color/metallic/roughness/emissive/
+    alpha_mode/alpha_cutoff) is cheap pure-Python/numpy work, but
+    _upload_texture decodes a PIL image and uploads/mipmaps a GPU
+    texture, measured at up to ~1s EACH on a large embedded image.
+    _build_mesh_data passes False here for a `prog` that has no texture
+    sampler at all (the depth-only shadow_program, and the lightmap
+    bake_program - see that function's own comment) - their VAOs never
+    read a texture, so decoding and uploading one for them was pure
+    waste, confirmed as the actual cause of a ~2-6 MINUTE load on a
+    107-material glb (each material's base-color/metallic-roughness
+    textures were being decoded and uploaded to the GPU three times
+    over - once per program - for only one of those three to ever
+    sample them)."""
     base_color, metallic, roughness, emissive = np.array([0.8, 0.8, 0.8], dtype="f4"), 1.0, 1.0, np.zeros(3, dtype="f4")
+    base_alpha, alpha_mode, alpha_cutoff = 1.0, "OPAQUE", 0.5
     mat = getattr(mesh.visual, "material", None)
-    if mat is None: return base_color, metallic, roughness, emissive, None, None
+    if mat is None: return base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, None, None
+    if not load_textures:
+        return base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, None, None
 
     for attr in ("main_color", "baseColorFactor", "diffuse"):
         val = getattr(mat, attr, None)
         if val is not None:
             base_color = _normalize_color(val)
+            # The 4th (alpha) component, if the source array actually
+            # has one - _normalize_color above only ever looks at the
+            # first 3. Values already in 0..1 (a raw glTF baseColorFactor)
+            # pass through as-is; an 8-bit 0..255 channel (some trimesh
+            # material representations) gets normalized the same way
+            # _normalize_color does for RGB.
+            if len(val) > 3:
+                raw_a = float(val[3])
+                base_alpha = raw_a / 255.0 if raw_a > 1.0 else raw_a
             break
 
     file_factors = (raw_factors or {}).get(getattr(mat, "name", None), {})
@@ -225,13 +289,25 @@ def _extract_material(mesh, scene, ctx, raw_factors=None):
     em_val = getattr(mat, "emissiveFactor", None)
     if em_val is not None: emissive = _normalize_color(em_val)
 
+    # alphaMode/alphaCutoff only ever come from the raw glTF read (see
+    # _read_raw_gltf_material_factors) - trimesh's own material wrapper
+    # doesn't surface either.
+    if file_factors.get("alphaMode") in ("OPAQUE", "MASK", "BLEND"):
+        alpha_mode = file_factors["alphaMode"]
+    if file_factors.get("alphaCutoff") is not None:
+        try: alpha_cutoff = float(file_factors["alphaCutoff"])
+        except (TypeError, ValueError): pass
+
     img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
     if img is None and isinstance(scene, trimesh.Scene):
         textures = getattr(scene, "textures", None)
         if textures:
             img = next(iter(textures.values()))
 
-    return base_color, metallic, roughness, emissive, _upload_texture(ctx, img), _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None))
+    return (
+        base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
+        _upload_texture(ctx, img), _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None)),
+    )
 
 def _extract_vertex_colors(mesh, base_color, vertex_count):
     colors = np.tile(base_color, (vertex_count, 1)).astype("f4")
@@ -290,13 +366,18 @@ def _flatten_scene(scene):
         if all(u is not None for u in all_uvs): combined.visual.uv = np.concatenate(all_uvs, axis=0)
     return combined, used_node_names
 
-def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG):
-    path = Path(filepath)
-    if not path.exists(): return print(f"[Warning] Model file not found: {path.resolve()}") or None
+def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg, raw_factors, load_textures=None):
+    """The GPU-upload half of load_glb - given an already-flattened
+    (mesh, node_order) pair (see _flatten_scene/_flatten_scene_by_
+    material) plus the file's raw material factors (see
+    _read_raw_gltf_material_factors, computed once by the caller and
+    passed in here rather than re-parsed per call - matters for load_glb_
+    by_material, which calls this once per material group from the same
+    file), returns the same dict shape load_glb always has, or None on
+    failure (after releasing whatever GL resources this call already
+    created, exactly as load_glb's own try/except used to do inline)."""
     buffers, vao, tex_obj, mr_tex_obj = [], None, None, None
     try:
-        scene = trimesh.load(str(path), process=False)
-        mesh, node_order = _flatten_scene(scene)
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0: raise RuntimeError("Invalid or empty mesh.")
 
         vertices, faces = np.asarray(mesh.vertices, dtype="f4"), np.asarray(mesh.faces, dtype="i4")
@@ -305,10 +386,49 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
 
         lightmap_uvs = _read_gltf_uv1(path, node_order) if node_order else None
         has_lightmap_uv = lightmap_uvs is not None and len(lightmap_uvs) == len(vertices)
-        if not has_lightmap_uv: lightmap_uvs = np.zeros((len(vertices), 2), dtype="f4")
 
-        base_color, metallic, roughness, emissive, tex_obj, mr_tex_obj = _extract_material(mesh, scene, ctx, _read_raw_gltf_material_factors(path))
+        # Only the actual PBR/color-pass program's own VAO build needs a
+        # decoded/uploaded texture - the lightmap bake_program's shader
+        # declares no u_texture at all, and shadow_program's now DOES
+        # (see its own fragment shader in scene_base.py - an alpha-
+        # tested discard for MASK/BLEND casters) but never uses one
+        # loaded via THIS path: Scene._bind_shadow_alpha rebinds the
+        # object's already-loaded PBR-pass texture at draw time instead
+        # (see that method's own docstring), so a second, separate
+        # decode/upload just for the shadow VAO build would be pure
+        # duplicated waste - confirmed via cProfile as a real, multi-
+        # second-per-material cost earlier in this project's history
+        # (see _parse_gltf2_cached's own docstring) once a scene grew to
+        # 100+ materials, which is exactly the class of regression
+        # skipping this explicitly avoids reintroducing. load_textures=
+        # None (every existing caller) keeps the automatic "does prog
+        # declare u_texture" heuristic; a caller building specifically
+        # the SHADOW VAO passes load_textures=False explicitly to opt
+        # out of that heuristic.
+        needs_textures = ("u_texture" in prog) if load_textures is None else load_textures
+        base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, tex_obj, mr_tex_obj = _extract_material(
+            mesh, scene, ctx, raw_factors, load_textures=needs_textures
+        )
         colors = _extract_vertex_colors(mesh, base_color, len(vertices))
+
+        if not has_lightmap_uv:
+            # No authored TEXCOORD_1 - generate one instead of falling
+            # back to an all-zero UV (which used to just leave the
+            # object out of lightmap baking entirely - see has_
+            # lightmap_uv's other read sites in scene_base.py). See
+            # lightmap_uv_generator.py's own docstring for the actual
+            # unwrap approach. This RE-INDEXES the mesh (charts can't
+            # share vertices across a UV seam - see generate_lightmap_
+            # uvs' own vertex_remap docstring), so every other per-
+            # vertex array has to be rebuilt to match via the same
+            # vertex_remap before anything below reads len(vertices)
+            # again.
+            faces, lightmap_uvs, vertex_remap = generate_lightmap_uvs(vertices, faces)
+            vertices = vertices[vertex_remap]
+            normals = normals[vertex_remap]
+            uvs = uvs[vertex_remap]
+            colors = colors[vertex_remap]
+            has_lightmap_uv = True
 
         attr_data = {"in_position": (vertices, "3f"), "in_normal": (normals, "3f"), "in_color": (colors, "3f"), "in_uv": (uvs, "2f"), "in_lightmap_uv": (lightmap_uvs, "2f")}
         vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items() if _has_attribute(prog, name)}
@@ -326,9 +446,156 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
             "texture": tex_obj, "metallic_roughness_texture": mr_tex_obj,
             "metallic": metallic, "roughness": roughness, "emissive": emissive.tolist(),
             "has_texture": 1 if tex_obj else 0, "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
+            # "OPAQUE" | "MASK" | "BLEND" (glTF alphaMode - see
+            # _extract_material's own docstring) plus the cutoff MASK
+            # uses and the material's own base alpha factor (multiplied
+            # with the base color texture's own alpha, if any, in the
+            # fragment shader - see pbr_shader.py). Scene._render_scene
+            # uses alpha_mode to decide per-object blend/cull-face state:
+            # OPAQUE renders exactly as before (back-face culled, no
+            # blending); MASK/BLEND both render double-sided (no
+            # culling) per this project's own choice to treat "not fully
+            # opaque" as "render both sides" - MASK additionally discards
+            # below alpha_cutoff in the shader instead of blending; BLEND
+            # draws in a separate, depth-write-disabled pass after
+            # every opaque/cutout object, with real alpha blending.
+            "alpha_mode": alpha_mode, "alpha_cutoff": alpha_cutoff, "base_alpha": base_alpha,
         }
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
         for res in [vao, *buffers, tex_obj, mr_tex_obj]:
             if res: res.release()
         return None
+
+def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,
+              load_textures=None):
+    path = Path(filepath)
+    if not path.exists(): return print(f"[Warning] Model file not found: {path.resolve()}") or None
+    try:
+        scene = trimesh.load(str(path), process=False)
+    except Exception as e:
+        print(f"[Error] Failed to parse model {path}: {e}")
+        return None
+    mesh, node_order = _flatten_scene(scene)
+    return _build_mesh_data(
+        mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg,
+        _read_raw_gltf_material_factors(path), load_textures=load_textures,
+    )
+
+def _material_key(geom):
+    """Identity key for grouping geometry by material in
+    _flatten_scene_by_material - the material's own name (glTF materials
+    loaded through trimesh carry the name authored in Blender/the source
+    file) when it has one, else its Python identity so two distinct
+    unnamed materials never accidentally merge. None (no material at
+    all) is its own valid group too."""
+    mat = getattr(geom.visual, "material", None)
+    if mat is None: return None
+    name = getattr(mat, "name", None)
+    return name if name else id(mat)
+
+def _flatten_scene_by_material(scene):
+    """Like _flatten_scene, but groups nodes by MATERIAL instead of
+    merging every node in the file into one mesh - _flatten_scene keeps
+    only the FIRST node's material for the whole combined result
+    (`combined.visual = representative.visual`), which is invisible for
+    a single-material prop (there's only one material to keep anyway)
+    but silently wrong for a real multi-material level: confirmed via
+    mainmap.glb, which has 9 distinct materials across 11 mesh nodes -
+    the old single-flatten path rendered the whole map with whichever
+    ONE material happened to belong to the first node in the file,
+    including cases where that material has no texture at all.
+
+    Returns a list of (combined_mesh, node_order) pairs, one per
+    distinct material actually present (collision-only nodes excluded,
+    same as _flatten_scene), in first-encountered order - each pair is
+    exactly what _flatten_scene would have returned if the file had
+    ONLY that material's nodes in it. A non-Scene input (a bare Trimesh/
+    PointCloud with no per-node material split possible) falls back to
+    a single one-group result, matching _flatten_scene's own behavior
+    for that case."""
+    if not isinstance(scene, trimesh.Scene):
+        return [(scene, [])] if scene is not None else []
+
+    groups = {}
+    order = []
+    for node_name in scene.graph.nodes_geometry:
+        if _is_collision_only_node(node_name): continue
+        transform, geom_name = scene.graph[node_name]
+        geom = scene.geometry.get(geom_name)
+        if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0: continue
+
+        key = _material_key(geom)
+        if key not in groups:
+            groups[key] = {"vertices": [], "faces": [], "normals": [], "uvs": [], "representative": None, "offset": 0, "names": []}
+            order.append(key)
+        g = groups[key]
+
+        rot, trans = transform[:3, :3], transform[:3, 3]
+        g["vertices"].append(np.asarray(geom.vertices) @ rot.T + trans)
+        g["faces"].append(np.asarray(geom.faces) + g["offset"])
+
+        geom_normals = getattr(geom, "vertex_normals", None)
+        g["normals"].append((np.asarray(geom_normals) @ rot.T) if geom_normals is not None and len(geom_normals) == len(geom.vertices) else None)
+
+        geom_uv = getattr(geom.visual, "uv", None)
+        g["uvs"].append(np.asarray(geom_uv) if geom_uv is not None and len(geom_uv) == len(geom.vertices) else None)
+
+        if g["representative"] is None: g["representative"] = geom
+        g["offset"] += len(geom.vertices)
+        g["names"].append(node_name)
+
+    results = []
+    for key in order:
+        g = groups[key]
+        if not g["vertices"]: continue
+        combined = trimesh.Trimesh(vertices=np.concatenate(g["vertices"]), faces=np.concatenate(g["faces"]), process=False)
+        if all(n is not None for n in g["normals"]): combined.vertex_normals = np.concatenate(g["normals"], axis=0)
+        if g["representative"] is not None:
+            combined.visual = g["representative"].visual
+            if all(u is not None for u in g["uvs"]): combined.visual.uv = np.concatenate(g["uvs"], axis=0)
+        results.append((combined, g["names"]))
+    return results
+
+def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,
+                          load_textures=None):
+    """Like load_glb, but returns a LIST of per-material mesh-data dicts
+    (each shaped exactly like load_glb's own single return value, empty
+    list on total failure) instead of one dict merging every material in
+    the file into one - see _flatten_scene_by_material's own docstring
+    for why this exists. _read_raw_gltf_material_factors(path) is read
+    once here and shared across every group's _build_mesh_data call,
+    rather than re-parsing the file's raw glTF once per material just
+    for that lookup."""
+    path = Path(filepath)
+    if not path.exists(): return print(f"[Warning] Model file not found: {path.resolve()}") or []
+    try:
+        scene = trimesh.load(str(path), process=False)
+    except Exception as e:
+        print(f"[Error] Failed to parse model {path}: {e}")
+        return []
+    groups = _flatten_scene_by_material(scene)
+    if not groups:
+        print(f"[Error] Failed to parse model {path}: no renderable geometry.")
+        return []
+    raw_factors = _read_raw_gltf_material_factors(path)
+    results = []
+    for mesh, node_order in groups:
+        data = _build_mesh_data(
+            mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg, raw_factors,
+            load_textures=load_textures,
+        )
+        if data is not None:
+            # Same key _flatten_scene_by_material itself grouped this
+            # mesh by (name if the material has one, else id(mat) - see
+            # _material_key) - exposed here so a caller (Scene.add_
+            # static's own alpha_mode_overrides) can target a SPECIFIC
+            # material by name without needing to re-export the source
+            # file just to fix how one material's alphaMode was
+            # authored (e.g. a foliage material exported as BLEND/
+            # Alpha Blend in Blender when it should behave like
+            # Unreal's Masked - hard cutout, full depth write/test, no
+            # sort-order dependence - see that override's own docstring).
+            data["material_name"] = _material_key(mesh)
+            results.append(data)
+    return results

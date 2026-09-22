@@ -126,7 +126,16 @@ class WindowManager:
             pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
         )
         pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 4)
+        # 2x rather than 4x - MSAA resolve cost is a real bandwidth tax
+        # on the Arc iGPU this project targets (shared system memory,
+        # no dedicated VRAM - see this file's own vsync comment below
+        # for the same class of hardware-specific tradeoff). Dropping
+        # to 2x roughly halves the resolve/edge-shading cost while
+        # keeping most of the anti-aliasing benefit over no MSAA at
+        # all - if edges still look acceptable, this is a cheap frame-
+        # time win; raise back to 4 if the difference in quality isn't
+        # worth it.
+        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 2)
 
         icon_path = resource_path("Assets/icon/icon.png")
         icon_image = pygame.image.load(icon_path)
@@ -154,10 +163,40 @@ class WindowManager:
         else:
             self.width, self.height = width, height
 
-        self.vsync = 1
-        self.screen = pygame.display.set_mode(
-            (self.width, self.height), self.flags, vsync=self.vsync
-        )
+        # Off by default (F10 toggles it, see handle_events): on the
+        # Intel Arc iGPU this was developed on, wglSwapBuffers with a
+        # swap interval of 1 intermittently blocked for 50-165ms even
+        # though a whole frame's CPU+GPU work is ~2-3ms - measured as
+        # ~6% of frames over 33ms with vsync on (in fullscreen, borderless
+        # and windowed alike, and unchanged by MSAA or extra GPU load),
+        # vs ~0.01% with it off. It costs screen tearing instead, but
+        # this scene renders at ~500fps uncapped so tears are very brief.
+        self.vsync = 0
+        try:
+            self.screen = pygame.display.set_mode(
+                (self.width, self.height), self.flags, vsync=self.vsync
+            )
+        except pygame.error as e:
+            # A GPU/driver that can't satisfy the requested MSAA sample
+            # count for this pixel format is a well-known, genuinely
+            # cross-vendor way for context creation to fail outright
+            # instead of just silently downgrading - and with this
+            # project's own --windows-console-mode=disable build (see
+            # BuildCMD_Nuitka), an uncaught failure here has no console
+            # to ever print to, so it reads as the whole window just
+            # flashing and closing with no visible error at all (see
+            # app.py's own _write_crash_log for the other half of
+            # making that diagnosable). Retrying once with MSAA
+            # disabled entirely costs nothing on hardware that didn't
+            # need this fallback (this branch never runs there) and
+            # turns a hard crash into "runs without anti-aliasing" on
+            # hardware that does.
+            print(f"[WindowManager] set_mode failed with MSAA requested ({e}) - retrying without it.")
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
+            self.screen = pygame.display.set_mode(
+                (self.width, self.height), self.flags, vsync=self.vsync
+            )
         # set_mode with (0, 0) resolves to the actual desktop resolution -
         # read it back so self.width/height (and anything computing
         # camera aspect from them) reflect reality, not the (0, 0) request.
@@ -190,6 +229,21 @@ class WindowManager:
         self.ctx = moderngl.create_context()
         self.clock = pygame.time.Clock()
         self._fps_display_timer = 0.0
+        self._last_time = time.perf_counter()
+
+    def reset_frame_timer(self):
+        """Call this after any deliberate blocking stretch on the main
+        thread that ISN'T normal frame work - a scene's blocking first-
+        time construction (see app.py's get_or_load_scene/loading_
+        screen.py) is the actual case this exists for. Without it, the
+        NEXT handle_events() call computes dt as time-since-the-frame-
+        BEFORE-loading-started, so a multi-second scene load would
+        appear as a single multi-second dt on the very next frame -
+        physics already clamps a huge dt on its own (see physics_
+        world.py's own _PHYSICS_MAX_STEP_DT), but nothing else reading
+        dt directly (animation blending, footstep timers, ...) does,
+        so left alone this would show up as those systems jumping far
+        ahead in one tick instead of a smooth continuation from "now"."""
         self._last_time = time.perf_counter()
 
     def toggle_vsync(self):

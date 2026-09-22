@@ -117,6 +117,36 @@ class SoundManager:
 
         self.emitters = still_active
 
+    def pause_all(self):
+        """Pauses every currently-playing emitter's own mixer channel,
+        WITHOUT stopping/clearing them (see resume_all) - for a Scene
+        that's been switched away from but still exists (app.py keeps
+        every Scene constructed for the lifetime of the app, not just
+        the active one - see its own scene-switching code), so its
+        emitters (including a looping ambient sound started once in
+        __init__, never re-triggered) are still there to resume from
+        exactly where they left off if switched back to, rather than
+        needing to restart from the beginning or never play again.
+        Without this, a Scene's own looping sounds keep playing
+        completely independently of whether that Scene is the one
+        actually being rendered/updated - pygame mixer channels have no
+        concept of "which scene is active" on their own, and this
+        project's own per-frame SoundManager.update() (which is what
+        keeps a still-active emitter's volume/panning current) simply
+        isn't called for an inactive Scene at all, which stops it being
+        updated but was never enough to stop it being HEARD."""
+        for emitter in self.emitters:
+            channel = emitter["channel"]
+            if channel is not None:
+                channel.pause()
+
+    def resume_all(self):
+        """Undoes pause_all - see that method's own docstring."""
+        for emitter in self.emitters:
+            channel = emitter["channel"]
+            if channel is not None:
+                channel.unpause()
+
     def destroy(self):
         for emitter in self.emitters:
             try:

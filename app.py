@@ -3,6 +3,164 @@ import pygame
 import os
 import ctypes
 import glm
+import time
+import gc
+from collections import deque
+
+# Set True to print a sorted CPU wall-clock breakdown of the main loop's
+# own big segments (event handling, scene.update/physics, player model
+# animation update, scene.render's Python-side submission, window.flip's
+# vsync/swap wait) every _CPU_PROFILE_WINDOW_FRAMES frames - a companion
+# to scene_base.py's PROFILE_RENDER, which only times GPU execution
+# inside render() and says nothing about the CPU-side cost of getting
+# there each frame (Python per-object uniform/matrix work, physics
+# stepping, animation blending, event polling). Off by default, same
+# opt-in/zero-cost-when-off shape as PROFILE_RENDER - the `with
+# _profiled_cpu(...)` blocks below are plain time.perf_counter deltas,
+# cheap enough to leave in permanently.
+PROFILE_CPU = False
+_CPU_PROFILE_WINDOW_FRAMES = 60
+_cpu_profile_samples = {}
+_cpu_profile_frame_count = 0
+
+# Set True to write every lag spike to frame_spikes.log (project dir):
+# any frame that takes > _SPIKE_FACTOR x the recent median frame time (and
+# at least _SPIKE_MIN_MS) gets a line naming which main-loop segment(s)
+# ate the time, any Python GC pause inside it, and the player's speed/
+# grounded state - plus a min-FPS / 1%-low summary every
+# _SPIKE_SUMMARY_SECONDS. Meant to be left on while PLAYING normally
+# (nothing scripted or forced) so a stutter you feel is caught with its
+# cause. Costs a few dict updates per frame and a file write only on a
+# spike or summary.
+PROFILE_SPIKES = False
+_SPIKE_FACTOR = 3.0
+_SPIKE_MIN_MS = 6.0
+_SPIKE_SUMMARY_SECONDS = 5.0
+_spike_segments = {}
+_spike_recent = deque(maxlen=240)
+_spike_state = {"last": None, "median": 0.0, "since_median": 0, "log": None,
+                "window": [], "window_start": None, "spikes_in_window": 0}
+
+
+def _spike_gc_callback(stage, info):
+    if not PROFILE_SPIKES:
+        return
+    if stage == "start":
+        _spike_state["gc_start"] = time.perf_counter()
+    else:
+        dt = time.perf_counter() - _spike_state.get("gc_start", time.perf_counter())
+        _spike_segments["gc"] = _spike_segments.get("gc", 0.0) + dt
+
+
+gc.callbacks.append(_spike_gc_callback)
+
+
+class _profiled_cpu:
+    """Context manager version of scene_base.py's Scene._profiled, but
+    for CPU wall-clock time via time.perf_counter instead of a GPU timer
+    query - there's no Scene instance conveniently in scope for every
+    segment being timed here (window.handle_events, player model update,
+    etc. are all called directly from main()'s loop body), so this is a
+    free function/class using the module-level accumulator dict above
+    rather than an instance method."""
+
+    __slots__ = ("label", "_start")
+
+    def __init__(self, label):
+        self.label = label
+
+    def __enter__(self):
+        if PROFILE_CPU or PROFILE_SPIKES:
+            self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc_info):
+        if not (PROFILE_CPU or PROFILE_SPIKES):
+            return False
+        elapsed = time.perf_counter() - self._start
+        if PROFILE_CPU:
+            _cpu_profile_samples[self.label] = _cpu_profile_samples.get(self.label, 0.0) + elapsed
+        if PROFILE_SPIKES:
+            _spike_segments[self.label] = _spike_segments.get(self.label, 0.0) + elapsed
+        return False
+
+
+def _report_cpu_profile_window():
+    """Called once per frame from main()'s loop - mirrors Scene.
+    _report_profile_window exactly (same window size, same sorted-
+    most-expensive-first total+average report), just for the CPU-side
+    accumulator above instead of Scene._profile_samples."""
+    global _cpu_profile_frame_count, _cpu_profile_samples
+    if not PROFILE_CPU:
+        return
+    _cpu_profile_frame_count += 1
+    if _cpu_profile_frame_count < _CPU_PROFILE_WINDOW_FRAMES:
+        return
+
+    frames = _cpu_profile_frame_count
+    ranked = sorted(_cpu_profile_samples.items(), key=lambda kv: kv[1], reverse=True)
+    print(f"[cpu profile] over the last {frames} frame(s):")
+    for label, total_s in ranked:
+        total_ms = total_s * 1000.0
+        print(f"  {label:20s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
+
+    _cpu_profile_samples = {}
+    _cpu_profile_frame_count = 0
+
+
+def _report_frame_spikes(context=""):
+    """Called once per frame at the very end of main()'s loop (after the
+    buffer swap). Measures the whole frame (previous call -> this one),
+    logs it if it's a spike (see PROFILE_SPIKES), and emits the periodic
+    min-FPS summary. `context` is a short free-form string (player speed/
+    grounded state) appended to a spike line."""
+    if not PROFILE_SPIKES:
+        return
+    st = _spike_state
+    now = time.perf_counter()
+    last, st["last"] = st["last"], now
+    segments = dict(_spike_segments)
+    _spike_segments.clear()
+    if last is None:
+        return
+    frame_ms = (now - last) * 1000.0
+
+    if st["log"] is None:
+        st["log"] = open("frame_spikes.log", "a", buffering=1, encoding="utf-8")
+        st["log"].write(f"\n=== session start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        st["window_start"] = now
+
+    _spike_recent.append(frame_ms)
+    st["window"].append(frame_ms)
+    st["since_median"] += 1
+    if st["since_median"] >= 30 and len(_spike_recent) >= 60:
+        st["since_median"] = 0
+        ordered = sorted(_spike_recent)
+        st["median"] = ordered[len(ordered) // 2]
+
+    median = st["median"]
+    if median > 0.0 and frame_ms > max(_SPIKE_FACTOR * median, _SPIKE_MIN_MS):
+        st["spikes_in_window"] += 1
+        parts = sorted(((v * 1000.0, k) for k, v in segments.items()), reverse=True)
+        accounted = sum(ms for ms, _ in parts)
+        breakdown = " ".join(f"{k}={ms:.1f}" for ms, k in parts if ms >= 0.3)
+        st["log"].write(
+            f"SPIKE {frame_ms:7.1f}ms (median {median:.1f}) | {breakdown} "
+            f"other={max(frame_ms - accounted, 0.0):.1f} | {context}\n"
+        )
+
+    if now - st["window_start"] >= _SPIKE_SUMMARY_SECONDS:
+        w = sorted(st["window"])
+        n = len(w)
+        one_pct = w[min(n - 1, int(n * 0.99))]
+        st["log"].write(
+            f"[{time.strftime('%H:%M:%S')}] frames={n} avg={n / (now - st['window_start']):.0f}fps "
+            f"median={w[n // 2]:.1f}ms 1%low={1000.0 / one_pct:.0f}fps "
+            f"min={1000.0 / w[-1]:.1f}fps (worst {w[-1]:.1f}ms) spikes={st['spikes_in_window']}\n"
+        )
+        st["window"] = []
+        st["window_start"] = now
+        st["spikes_in_window"] = 0
 
 
 def _is_frozen_build():
@@ -62,11 +220,13 @@ def _request_high_performance_gpu():
         return
     try:
         import winreg
+
         exe_path = os.path.abspath(sys.executable)
         key = winreg.CreateKeyEx(
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\DirectX\UserGpuPreference",
-            0, winreg.KEY_SET_VALUE,
+            0,
+            winreg.KEY_SET_VALUE,
         )
         with key:
             # "GpuPreference=2;" is Windows' own literal value format
@@ -89,19 +249,28 @@ _request_high_performance_gpu()
 # these MUST be in the actual .exe's own PE export table specifically;
 # a DLL loaded at runtime does nothing, regardless of how early it's
 # loaded here - an earlier version of this file tried exactly that (a
-# companion gpu_hint.dll) and it had no effect. Getting Nuitka's own
-# built exe to export those two symbols (its bootloader has no exports
-# of its own by default, same underlying issue the old PyInstaller
-# build used to have before it was worked around with a patched
-# bootloader - that workaround was PyInstaller-specific and doesn't
-# carry over) hasn't been done for this Nuitka-based build yet.
-# Nothing in this Python file can express that fix - there is no
-# per-build-invocation flag or Python-level hook for it.
+# companion gpu_hint.dll) and it had no effect, and the old PyInstaller
+# build needed a patched bootloader to get this right for the same
+# underlying reason (that workaround was PyInstaller-specific and
+# doesn't carry over to Nuitka).
+#
+# Nothing in THIS Python file can express that fix - there is no
+# per-build-invocation flag or Python-level hook for it - but
+# nuitka_gpu_preference_plugin.py (project root, loaded via
+# BuildCMD_Nuitka's own --user-plugin= flag) now does, using Nuitka's
+# getExtraCodeFiles() plugin hook. Confirmed working (see that file's
+# own docstring for the pefile-verified proof and the two non-obvious
+# details that made it work: which compile stage a --onefile build's
+# "onefile_"-prefixed extra-code-file key actually reaches, and why the
+# onefile bootstrap .exe - not some separate extracted exe - is the
+# right target in the first place).
 
 from Modules.Window.window import WindowManager
+from Modules.Window.loading_screen import show_loading_screen
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
 from Modules.Scenes.torus_scene import TorusScene
+from Modules.Scenes.mainmap_scene import MainMapScene
 from Modules.Physics.character_controller import CharacterController
 from Modules.Player.player_model import PlayerModel
 
@@ -118,7 +287,9 @@ def load_steam_api_dll():
     lib_name = {
         "win32": "steam_api64.dll",
         "darwin": "libsteam_api.dylib",
-    }.get(sys.platform, "libsteam_api.so")  # covers "linux" and any other POSIX platform
+    }.get(
+        sys.platform, "libsteam_api.so"
+    )  # covers "linux" and any other POSIX platform
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -162,10 +333,34 @@ def main():
     window = WindowManager(800, 600, "RatWar")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
 
-    # Load initial scenes dictionary
-    scenes = {"torus": TorusScene(window.ctx)}
-    current_scene_key = "torus"
-    current_scene = scenes[current_scene_key]
+    # Scene classes, not instances - see get_or_load_scene below. Only
+    # ever constructed the first time something actually switches to
+    # that key, not all up front: TorusScene is kept around purely as a
+    # K_1-selectable test/comparison scene (see the switch handler
+    # below), and building it (parsing its glb, uploading GPU
+    # resources, baking lightmaps) is real, non-trivial work worth
+    # skipping entirely for a run that never visits it.
+    SCENE_CLASSES = {"torus": TorusScene, "mainmap": MainMapScene}
+    scenes = {}
+
+    def get_or_load_scene(key):
+        """Returns the already-built scenes[key] if it exists, else
+        constructs it first - showing one loading-screen frame right
+        before that (still fully synchronous/blocking - see loading_
+        screen.py's own docstring for why) construction runs, so
+        switching to a not-yet-visited scene reads as "loading"
+        instead of as a frozen window."""
+        if key not in scenes:
+            show_loading_screen(window, f"Loading {key}...")
+            scenes[key] = SCENE_CLASSES[key](window.ctx)
+            # See WindowManager.reset_frame_timer's own docstring - a
+            # multi-second construction just ran on this same thread,
+            # and the NEXT dt computed would otherwise include all of it.
+            window.reset_frame_timer()
+        return scenes[key]
+
+    current_scene_key = "mainmap"
+    current_scene = get_or_load_scene(current_scene_key)
 
     # Player capsule: walks/collides against current_scene's static
     # geometry (see torus_scene.py's collision=True statics) via the
@@ -228,17 +423,69 @@ def main():
         ("run", "rifle_run", 220.0 * 0.0254),
     )
 
+    # Facing-relative directional overrides for the "walk" state only -
+    # RifleWalkS/E/W/NE/NW/SE/SW.glb (loaded below) exist alongside
+    # RifleWalkN.glb, but there's no equivalent run-direction set yet,
+    # so "run" deliberately has no entry here at all and keeps playing
+    # rifle_run regardless of direction until those are authored too -
+    # see PlayerModel's directional_clips docstring for exactly how a
+    # missing state/direction falls back to the plain (or nearest-
+    # cardinal) clip.
+    player_directional_clips = {
+        "walk": {
+            "N": "rifle_walk",
+            "S": "rifle_walk_s",
+            "E": "rifle_walk_e",
+            "W": "rifle_walk_w",
+            "NE": "rifle_walk_ne",
+            "NW": "rifle_walk_nw",
+            "SE": "rifle_walk_se",
+            "SW": "rifle_walk_sw",
+        },
+    }
+
     local_player_model = PlayerModel(
-        current_scene, "Assets/Models/rat.glb",
-        visible_in_color=False, cast_shadow=True,
+        current_scene,
+        "Assets/Models/rat.glb",
+        visible_in_color=False,
+        cast_shadow=True,
         time_scale=RAT_ANIM_TIME_SCALE,
         states=player_animation_states,
-        # Splits the model into a lower body (locomotion, above) and an
-        # upper body (gun-holding pose) driven independently - see
-        # Skeleton.compute_joint_mask's own docstring for why this rig
-        # needs BOTH names (Spine4/arms/neck/head is a sibling subtree
-        # of Spine/Spine1/Spine2 in rat.glb, not a descendant of it).
-        upper_body_root_joints=["ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine4"],
+        directional_clips=player_directional_clips,
+        # Splits the model into a lower body (locomotion - legs, spine,
+        # neck, head - above) and an upper body (gun-holding pose)
+        # driven independently. Deliberately just the two clavicles, NOT
+        # their shared parent Spine4 - Spine4 also parents Neck1 (->
+        # Head1), and Bip01_Spine/Spine1/Spine2 above IT drive the torso
+        # twist - rooting the split there pulled the spine AND neck/head
+        # into the "upper body" mask too, so a gun-holding pose (or the
+        # shotgun-idle override) would visibly override the head/neck
+        # look-direction and spine lean along with the arms, not just
+        # the arms. Rooting at the clavicles instead confines the swap
+        # to exactly the shoulder/arm/hand chains - spine, neck, and
+        # head always follow the LOWER body's own locomotion clip
+        # (idle/walk/run/jump/crouch) no matter what the upper body is
+        # doing.
+        upper_body_root_joints=[
+            "ValveBiped.Bip01_R_Clavicle",
+            "ValveBiped.Bip01_L_Clavicle",
+        ],
+        # A manually-forced upper-body override (set_upper_override -
+        # see the Y-key cycle below) uses a WIDER split instead, rooted
+        # at Spine4 - which also parents Neck1 (-> Head1) alongside both
+        # clavicle chains in this rig, so this pulls in arms, neck, AND
+        # head as one unit. Locomotion-driven upper-body poses above
+        # stay narrower (clavicles only) on purpose, but an override
+        # like pistol_idle was authored with its own Spine4/neck
+        # rotation as PART of the pose - splitting it at the clavicles
+        # instead fed that clip's clavicle rotation the wrong PARENT
+        # transform (whatever Spine4 orientation the current locomotion
+        # clip happened to be using), which is what actually made the
+        # arm look rotated wrong. Widening the override's own mask to
+        # include Spine4 lets it supply its own correct pose for
+        # everything above the shoulders, matching how it was actually
+        # authored - no manual per-joint rotation correction needed.
+        override_upper_body_root_joints=["ValveBiped.Bip01_Spine4"],
         upper_states=player_animation_states,
         # RifleJump.glb (loaded below) - a one-shot takeoff pose, not a
         # speed-driven blend state like the three above, so it's its own
@@ -272,8 +519,10 @@ def main():
     # base clip already uses), hence the rename to keep all three
     # distinct on the merged skeleton.
     current_scene.load_additional_animations(
-        local_player_model.obj, "Assets/Animations/Poses/Rifle/rifleidle.glb",
-        rename={"New": "rifle_idle"}, time_scale=RAT_ANIM_TIME_SCALE,
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/rifleidle.glb",
+        rename={"New": "rifle_idle"},
+        time_scale=RAT_ANIM_TIME_SCALE,
     )
     # RifleWalkN.glb specifically has ALREADY been re-exported at a
     # correct 30fps (confirmed: its own keyframes are spaced at exactly
@@ -281,28 +530,97 @@ def main():
     # time_scale correction here, or this would double-correct an
     # already-fixed file and play it 20% too fast.
     current_scene.load_additional_animations(
-        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleWalkN.glb",
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleWalkN.glb",
         rename={"New": "rifle_walk"},
     )
+    # RifleWalkS.glb/RifleWalkE.glb - re-exported since this was first
+    # wired in and now BOTH already bake at a correct 30fps (confirmed
+    # via raw glb inspection: 28 keyframes/0.9s and 23 keyframes/0.7333s
+    # respectively, both exactly 30fps) - no time_scale correction, same
+    # as RifleWalkN.glb.
+    current_scene.load_additional_animations(
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleWalkS.glb",
+        rename={"New": "rifle_walk_s"},
+    )
+    current_scene.load_additional_animations(
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleWalkE.glb",
+        rename={"New": "rifle_walk_e"},
+    )
+    # RifleWalkW.glb - unlike S/E above, still baked at 24fps (confirmed:
+    # 18 keyframes over 0.7083s), so it still needs the correction or it
+    # plays 25% slower than intended.
+    current_scene.load_additional_animations(
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleWalkW.glb",
+        rename={"New": "rifle_walk_w"},
+        time_scale=RAT_ANIM_TIME_SCALE,
+    )
+    # RifleWalkNE/NW/SE/SW.glb - each of these bundles 34 clips (a full
+    # animation library re-export, not just the one directional pose),
+    # all byte-identical to each other across the 4 files EXCEPT the one
+    # literally named "New" - confirmed by directly comparing every
+    # clip's keyframe data across all 4 files. That's the same clip name
+    # every other single-pose file here (rifleidle.glb, RifleWalkN.glb,
+    # etc.) uses for its real authored pose, so it's used here too rather
+    # than the more prominent-looking "Diag" clip, which turned out to be
+    # byte-for-byte identical junk shared by all 4 files (a leftover
+    # reference/placeholder track, not the actual walk motion). All 4
+    # confirmed at 24fps via the same keyframe-spacing check as
+    # RifleWalkW.glb above, so all 4 need the correction.
+    for _direction, _filename in (
+        ("ne", "RifleWalkNE.glb"),
+        ("nw", "RifleWalkNW.glb"),
+        ("se", "RifleWalkSE.glb"),
+        ("sw", "RifleWalkSW.glb"),
+    ):
+        current_scene.load_additional_animations(
+            local_player_model.obj,
+            f"Assets/Animations/Poses/Rifle/{_filename}",
+            rename={"New": f"rifle_walk_{_direction}"},
+            time_scale=RAT_ANIM_TIME_SCALE,
+        )
     # RifleRunN.glb - also already baked at a correct 30fps (confirmed
     # the same way as RifleWalkN.glb), no time_scale correction needed.
     current_scene.load_additional_animations(
-        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleRunN.glb",
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleRunN.glb",
         rename={"New": "rifle_run"},
     )
     # RifleJump.glb - confirmed already baked at a correct 30fps (same
     # raw-keyframe-spacing check as RifleWalkN.glb/RifleRunN.glb), no
     # time_scale correction needed.
     current_scene.load_additional_animations(
-        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleJump.glb",
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleJump.glb",
         rename={"New": "rifle_jump"},
     )
     # RifleCrouch.glb - a static pose (its own first/last keyframe are
     # identical, confirmed via raw glb inspection), so its authored
     # frame rate/duration don't matter - no time_scale correction needed.
     current_scene.load_additional_animations(
-        local_player_model.obj, "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
+        local_player_model.obj,
+        "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
         rename={"New": "rifle_crouch"},
+    )
+    # ShotgunIdle.glb/pistolidle.glb - both static held poses (each
+    # file's own first/last keyframe are identical, confirmed via raw
+    # glb inspection, same as RifleCrouch.glb above), so their authored
+    # frame rate/duration don't matter - no time_scale correction
+    # needed. Cycled via the Y key below through PlayerModel.
+    # set_upper_override/clear_upper_override, purely as an experiment -
+    # not tied to any actual weapon-switching system yet.
+    current_scene.load_additional_animations(
+        local_player_model.obj,
+        "Assets/Animations/Poses/Shotgun/ShotgunIdle.glb",
+        rename={"New": "shotgun_idle"},
+    )
+    current_scene.load_additional_animations(
+        local_player_model.obj,
+        "Assets/Animations/Poses/Pistol/pistolidle.glb",
+        rename={"New": "pistol_idle"},
     )
 
     # Third-person mode - see Modules/Camera/camera_boom_arm.py. Off by
@@ -321,17 +639,80 @@ def main():
             # third person needs it actually drawn instead.
             local_player_model.set_visible_in_color(third_person)
 
+    # Experimental - Y cycles the upper body through 3 states: normal
+    # (locomotion-driven, e.g. the rifle idle/walk/run poses), a locked
+    # ShotgunIdle.glb override, and a locked pistolidle.glb override
+    # (see PlayerModel.set_upper_override/clear_upper_override) - not
+    # wired to any real weapon-switching system yet, just trying out the
+    # poses. None in this tuple means "normal" - clear_upper_override()
+    # rather than a real clip name.
+    _UPPER_OVERRIDE_CYCLE = (None, "shotgun_idle", "pistol_idle")
+    # Per-clip rotation correction on top of the override's own joint
+    # mask (see PlayerModel's override_upper_body_root_joints and
+    # set_upper_rotation_offset) - keyed by clip, applied AFTER set_
+    # upper_override so it isn't wiped by that call's own mask swap
+    # (Scene.set_skeletal_upper_joint_mask clears any existing offsets
+    # as part of switching masks - see its docstring). Only pistol_idle
+    # needs one right now, on Spine4 itself (NOT a per-clavicle
+    # correction like before - now that the override's own mask is
+    # rooted at Spine4, see [[upper-body-joint-split]], Spine4 is one of
+    # the joints IT drives, so nudging it directly is the natural knob
+    # instead of fighting it through both arms). This is COMPONENT-space
+    # (fixed relative to the character's own body, same sense Unreal's
+    # AnimGraph uses the term - see set_upper_rotation_offset's own
+    # docstring), NOT true world/level space - it rotates rigidly WITH
+    # the player as they turn instead of fighting that turn.
+    _UPPER_OVERRIDE_ROTATION_DEGREES = {
+        "pistol_idle": {"ValveBiped.Bip01_Spine4": (-10, 60, 10)},
+    }
+    upper_override_index = 0
+
+    def cycle_upper_override(key):
+        nonlocal upper_override_index
+        if key == pygame.K_y:
+            upper_override_index = (upper_override_index + 1) % len(
+                _UPPER_OVERRIDE_CYCLE
+            )
+            override_clip = _UPPER_OVERRIDE_CYCLE[upper_override_index]
+            if override_clip is None:
+                local_player_model.clear_upper_override()
+            else:
+                local_player_model.set_upper_override(override_clip)
+                local_player_model.set_upper_rotation_offset(
+                    _UPPER_OVERRIDE_ROTATION_DEGREES.get(override_clip, (0.0, 0.0, 0.0))
+                )
+
+    def on_key_down(key):
+        toggle_third_person(key)
+        cycle_upper_override(key)
+
     net_mgr = NetworkManager(camera, current_scene)
 
     running = True
     while running:
-        running, dt = window.handle_events(camera, on_key_down=toggle_third_person)
+        with _profiled_cpu("handle_events"):
+            running, dt = window.handle_events(camera, on_key_down=on_key_down)
 
-        # Handle scene switching inputs (1: Triangle, 2: Cube, 3: Torus)
+        # Handle scene switching inputs (1: torus test scene, 2: mainmap)
         keys = pygame.key.get_pressed()
+        new_scene_key = None
         if keys[pygame.K_1]:
-            current_scene_key = "torus"
-            current_scene = scenes[current_scene_key]
+            new_scene_key = "torus"
+        if keys[pygame.K_2]:
+            new_scene_key = "mainmap"
+        # Gated on an ACTUAL change, not just "key held" - keys[...] is
+        # a per-frame snapshot (true every frame the key stays down, not
+        # just the one it was first pressed), and pause_all/resume_all
+        # below don't need to run every single one of those frames.
+        if new_scene_key is not None and new_scene_key != current_scene_key:
+            # See SoundManager.pause_all's own docstring - every Scene
+            # keeps running/existing once switched away from, including
+            # any looping ambient sound it started, unless explicitly
+            # paused here.
+            current_scene.sound_manager.pause_all()
+            current_scene_key = new_scene_key
+            current_scene = get_or_load_scene(current_scene_key)
+            current_scene.sound_manager.resume_all()
 
         # Ground-relative movement, driven by camera yaw (mouse-look)
         # but ignoring pitch - walking shouldn't speed up/slow down
@@ -359,14 +740,19 @@ def main():
         # Call update to drive scene animations (like the rotating
         # torus) and step physics - camera position then follows
         # wherever physics moved the player capsule to this frame.
-        current_scene.update(dt)
-        eye_position = player.get_position() + glm.vec3(0.0, player.get_eye_offset(), 0.0)
+        with _profiled_cpu("scene.update (physics+anim)"):
+            current_scene.update(dt)
+        eye_position = player.get_position() + glm.vec3(
+            0.0, player.get_eye_offset(), 0.0
+        )
         if third_person:
             # Same pivot first-person already uses (the player's own eye
             # position) - camera.front/yaw/pitch (mouse look) and all
             # movement math are completely unaffected by this branch,
             # only WHERE the camera itself sits changes.
-            camera.position = boom_arm.get_camera_position(eye_position, camera.yaw, camera.pitch)
+            camera.position = boom_arm.get_camera_position(
+                eye_position, camera.yaw, camera.pitch
+            )
         else:
             camera.position = eye_position
 
@@ -380,34 +766,116 @@ def main():
         # triggers a "running" pose.
         feet_position = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
         horiz_speed = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z))
-        local_player_model.update(
-            dt, feet_position, camera.yaw, horiz_speed,
-            is_crouched=player.is_crouched(), is_grounded=player.is_on_ground(),
-            # Walk-vs-run is now driven by the actual sprint key input,
-            # not momentum - see PlayerModel.update()'s own is_sprinting
-            # docstring for why (this was the real fix for the run
-            # animation "randomly restarting", which turned out to be
-            # physics speed noise crossing a threshold, not an animation
-            # data or looping-code problem).
-            is_sprinting=player.is_sprinting(),
-        )
+        # A one-shot consumed event (see CharacterController.pop_jumped's
+        # own docstring, mirroring pop_footstep below) - popped BEFORE
+        # the update() call it feeds, so PlayerModel can play the jump
+        # takeoff pose the instant a jump actually executes instead of
+        # waiting on is_on_ground()'s own debounced reading (see
+        # PlayerModel.update()'s own just_jumped docstring for why that
+        # debounce alone made a real jump feel delayed).
+        just_jumped = player.pop_jumped()
+        with _profiled_cpu("player_model.update (anim)"):
+            local_player_model.update(
+                dt,
+                feet_position,
+                camera.yaw,
+                horiz_speed,
+                is_crouched=player.is_crouched(),
+                is_grounded=player.is_on_ground(),
+                # Walk-vs-run is now driven by the actual sprint key input,
+                # not momentum - see PlayerModel.update()'s own is_sprinting
+                # docstring for why (this was the real fix for the run
+                # animation "randomly restarting", which turned out to be
+                # physics speed noise crossing a threshold, not an animation
+                # data or looping-code problem).
+                is_sprinting=player.is_sprinting(),
+                # Same raw WASD-derived direction vector already passed to
+                # player.set_move_direction() above - drives
+                # player_directional_clips' facing-relative N/S/E/W walk
+                # selection (see PlayerModel.update()'s own move_direction
+                # docstring). Reused as-is rather than reading it back off
+                # CharacterController, since that's exactly the vector this
+                # was built from a few lines up.
+                move_direction=move_dir,
+                just_jumped=just_jumped,
+            )
 
         footstep = player.pop_footstep()
         if footstep is not None:
             material, volume = footstep
-            current_scene.play_footstep_sound(material, player.get_position(), volume=volume)
+            current_scene.play_footstep_sound(
+                material, player.get_position(), volume=volume
+            )
 
-        current_scene.update_audio(camera)
+        with _profiled_cpu("update_audio"):
+            current_scene.update_audio(camera)
 
-        net_mgr.update()
+        with _profiled_cpu("net_mgr.update"):
+            net_mgr.update()
 
-        window.ctx.clear(0.1, 0.1, 0.1, 1.0)
-        current_scene.render(camera, None)
-        window.flip()
+        with _profiled_cpu("ctx.clear"):
+            window.ctx.clear(0.1, 0.1, 0.1, 1.0)
+        with _profiled_cpu("scene.render (cpu submit)"):
+            current_scene.render(camera, None)
+        with _profiled_cpu("window.flip"):
+            window.flip()
+        _report_cpu_profile_window()
+        _report_frame_spikes(
+            f"speed={horiz_speed:.1f} grounded={player.is_on_ground()} "
+            f"crouched={player.is_crouched()} sprint={player.is_sprinting()} scene={current_scene_key}"
+        )
 
     window.quit()
     sys.exit()
 
 
+def _write_crash_log(exc):
+    """Appends a full traceback (plus a few basics: frozen or not,
+    platform) to crash_log.txt next to the running exe (or the project
+    root, for a dev `python app.py` run - see _is_frozen_build's own
+    docstring for that distinction). Exists specifically because
+    BuildCMD_Nuitka builds with --windows-console-mode=disable - a
+    frozen build has NO console for an unhandled exception's traceback
+    to print to at all, so today an unhandled crash (a GL context that
+    fails to create because a given GPU/driver doesn't support some
+    requested feature is the leading suspect for a reported AMD-only
+    crash - see the entry point below) is completely silent: the window
+    just flashes and closes, with nothing anywhere explaining why. This
+    doesn't fix any particular crash - it exists so the NEXT one leaves
+    behind something to actually diagnose it from, rather than staying
+    a guess. Never lets a failure IN this logging itself replace the
+    original exception - see the entry point's own re-raise.
+
+    Deliberately NOT written "next to the exe" via sys.executable - a
+    first version of this did exactly that, and it was WRONG for a
+    --onefile build specifically: Nuitka's own onefile bootstrap
+    unpacks the real program into a TEMPORARY directory and runs it
+    from there (confirmed directly in Nuitka's own C source,
+    OnefileBootstrap.c) - sys.executable inside that process points
+    INTO that temp directory, which the bootstrap deletes the moment
+    this process exits, crash or not. A crash log written there was
+    already gone by the time anyone went looking for it - it looked
+    exactly like no log had been written at all. ~/.ratwar isn't
+    touched by that cleanup and survives the process exiting, which is
+    the entire point of a crash log."""
+    import traceback
+    import datetime
+    try:
+        log_dir = os.path.join(os.path.expanduser("~"), ".ratwar")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "crash_log.txt")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n=== crash at {datetime.datetime.now().isoformat()} ===\n")
+            f.write(f"frozen build: {_is_frozen_build()}\n")
+            f.write(f"platform: {sys.platform}\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        _write_crash_log(e)
+        raise

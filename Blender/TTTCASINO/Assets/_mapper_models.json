@@ -1,0 +1,602 @@
+{
+  "props/light_fixture02a": [
+    "props.blend",
+    "props/light_fixture02a"
+  ],
+  "props/security_camera02a": [
+    "props.blend",
+    "props/security_camera02a"
+  ],
+  "props/security_camera2": [
+    "props.blend",
+    "props/security_camera2"
+  ],
+  "props/security_camera2_base": [
+    "props.blend",
+    "props/security_camera2_base"
+  ],
+  "props/security_camera2_piece1": [
+    "props.blend",
+    "props/security_camera2_piece1"
+  ],
+  "props/security_camera2_piece2": [
+    "props.blend",
+    "props/security_camera2_piece2"
+  ],
+  "props/security_camera2_piece3": [
+    "props.blend",
+    "props/security_camera2_piece3"
+  ],
+  "props/wet_floor01": [
+    "props.blend",
+    "props/wet_floor01"
+  ],
+  "props/boardgame/boardgame": [
+    "props_-_boardgame.blend",
+    "props/boardgame/boardgame"
+  ],
+  "props/casino/antiquebookcase": [
+    "props_-_casino.blend",
+    "props/casino/antiquebookcase"
+  ],
+  "props/casino/antiquetable": [
+    "props_-_casino.blend",
+    "props/casino/antiquetable"
+  ],
+  "props/casino/archset1": [
+    "props_-_casino.blend",
+    "props/casino/archset1"
+  ],
+  "props/casino/archset2": [
+    "props_-_casino.blend",
+    "props/casino/archset2"
+  ],
+  "props/casino/backstairrailing": [
+    "props_-_casino.blend",
+    "props/casino/backstairrailing"
+  ],
+  "props/casino/baggagecart": [
+    "props_-_casino.blend",
+    "props/casino/baggagecart"
+  ],
+  "props/casino/balustrade1": [
+    "props_-_casino.blend",
+    "props/casino/balustrade1"
+  ],
+  "props/casino/balustrade2": [
+    "props_-_casino.blend",
+    "props/casino/balustrade2"
+  ],
+  "props/casino/bathroomcounter": [
+    "props_-_casino.blend",
+    "props/casino/bathroomcounter"
+  ],
+  "props/casino/bathroomlight": [
+    "props_-_casino.blend",
+    "props/casino/bathroomlight"
+  ],
+  "props/casino/bed": [
+    "props_-_casino.blend",
+    "props/casino/bed"
+  ],
+  "props/casino/blackjacktable": [
+    "props_-_casino.blend",
+    "props/casino/blackjacktable"
+  ],
+  "props/casino/ceilingdome": [
+    "props_-_casino.blend",
+    "props/casino/ceilingdome"
+  ],
+  "props/casino/chip1": [
+    "props_-_casino.blend",
+    "props/casino/chip1"
+  ],
+  "props/casino/chip2": [
+    "props_-_casino.blend",
+    "props/casino/chip2"
+  ],
+  "props/casino/chip3": [
+    "props_-_casino.blend",
+    "props/casino/chip3"
+  ],
+  "props/casino/chip4": [
+    "props_-_casino.blend",
+    "props/casino/chip4"
+  ],
+  "props/casino/chip5": [
+    "props_-_casino.blend",
+    "props/casino/chip5"
+  ],
+  "props/casino/crapstable": [
+    "props_-_casino.blend",
+    "props/casino/crapstable"
+  ],
+  "props/casino/dishlid": [
+    "props_-_casino.blend",
+    "props/casino/dishlid"
+  ],
+  "props/casino/doorhandle_left": [
+    "props_-_casino.blend",
+    "props/casino/doorhandle_left"
+  ],
+  "props/casino/doorhandle_right": [
+    "props_-_casino.blend",
+    "props/casino/doorhandle_right"
+  ],
+  "props/casino/doorpushbar": [
+    "props_-_casino.blend",
+    "props/casino/doorpushbar"
+  ],
+  "props/casino/entrancecover": [
+    "props_-_casino.blend",
+    "props/casino/entrancecover"
+  ],
+  "props/casino/foodtrolley": [
+    "props_-_casino.blend",
+    "props/casino/foodtrolley"
+  ],
+  "props/casino/fountain": [
+    "props_-_casino.blend",
+    "props/casino/fountain"
+  ],
+  "props/casino/frontentrance": [
+    "props_-_casino.blend",
+    "props/casino/frontentrance"
+  ],
+  "props/casino/goldbar": [
+    "props_-_casino.blend",
+    "props/casino/goldbar"
+  ],
+  "props/casino/goldornament": [
+    "props_-_casino.blend",
+    "props/casino/goldornament"
+  ],
+  "props/casino/goldplaque": [
+    "props_-_casino.blend",
+    "props/casino/goldplaque"
+  ],
+  "props/casino/grandpiano": [
+    "props_-_casino.blend",
+    "props/casino/grandpiano"
+  ],
+  "props/casino/grandstairs_balcony": [
+    "props_-_casino.blend",
+    "props/casino/grandstairs_balcony"
+  ],
+  "props/casino/hallwaytrim": [
+    "props_-_casino.blend",
+    "props/casino/hallwaytrim"
+  ],
+  "props/casino/hanginglight": [
+    "props_-_casino.blend",
+    "props/casino/hanginglight"
+  ],
+  "props/casino/hanginglight2": [
+    "props_-_casino.blend",
+    "props/casino/hanginglight2"
+  ],
+  "props/casino/hanginglight3": [
+    "props_-_casino.blend",
+    "props/casino/hanginglight3"
+  ],
+  "props/casino/infosign": [
+    "props_-_casino.blend",
+    "props/casino/infosign"
+  ],
+  "props/casino/lobbyclocks": [
+    "props_-_casino.blend",
+    "props/casino/lobbyclocks"
+  ],
+  "props/casino/luxurychair": [
+    "props_-_casino.blend",
+    "props/casino/luxurychair"
+  ],
+  "props/casino/luxurychair_parta": [
+    "props_-_casino.blend",
+    "props/casino/luxurychair_parta"
+  ],
+  "props/casino/luxurychair_partb": [
+    "props_-_casino.blend",
+    "props/casino/luxurychair_partb"
+  ],
+  "props/casino/luxurychair_partc": [
+    "props_-_casino.blend",
+    "props/casino/luxurychair_partc"
+  ],
+  "props/casino/luxurychair_partd": [
+    "props_-_casino.blend",
+    "props/casino/luxurychair_partd"
+  ],
+  "props/casino/machete": [
+    "props_-_casino.blend",
+    "props/casino/machete"
+  ],
+  "props/casino/marblecolumn1": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn1"
+  ],
+  "props/casino/marblecolumn2": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn2"
+  ],
+  "props/casino/marblecolumn3": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn3"
+  ],
+  "props/casino/marblecolumn4": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn4"
+  ],
+  "props/casino/marblecolumn5": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn5"
+  ],
+  "props/casino/marblecolumn6": [
+    "props_-_casino.blend",
+    "props/casino/marblecolumn6"
+  ],
+  "props/casino/metalbench": [
+    "props_-_casino.blend",
+    "props/casino/metalbench"
+  ],
+  "props/casino/pedestallamp": [
+    "props_-_casino.blend",
+    "props/casino/pedestallamp"
+  ],
+  "props/casino/pictureframe1": [
+    "props_-_casino.blend",
+    "props/casino/pictureframe1"
+  ],
+  "props/casino/plantstand": [
+    "props_-_casino.blend",
+    "props/casino/plantstand"
+  ],
+  "props/casino/plaque": [
+    "props_-_casino.blend",
+    "props/casino/plaque"
+  ],
+  "props/casino/platformrailing": [
+    "props_-_casino.blend",
+    "props/casino/platformrailing"
+  ],
+  "props/casino/pokerchair": [
+    "props_-_casino.blend",
+    "props/casino/pokerchair"
+  ],
+  "props/casino/pokerchips": [
+    "props_-_casino.blend",
+    "props/casino/pokerchips"
+  ],
+  "props/casino/pokerroomarch1": [
+    "props_-_casino.blend",
+    "props/casino/pokerroomarch1"
+  ],
+  "props/casino/pokerroomarch2": [
+    "props_-_casino.blend",
+    "props/casino/pokerroomarch2"
+  ],
+  "props/casino/pokertable": [
+    "props_-_casino.blend",
+    "props/casino/pokertable"
+  ],
+  "props/casino/pokertablecards": [
+    "props_-_casino.blend",
+    "props/casino/pokertablecards"
+  ],
+  "props/casino/pottedplant": [
+    "props_-_casino.blend",
+    "props/casino/pottedplant"
+  ],
+  "props/casino/privatesign": [
+    "props_-_casino.blend",
+    "props/casino/privatesign"
+  ],
+  "props/casino/redropebarrier": [
+    "props_-_casino.blend",
+    "props/casino/redropebarrier"
+  ],
+  "props/casino/registrationdesk": [
+    "props_-_casino.blend",
+    "props/casino/registrationdesk"
+  ],
+  "props/casino/roofspire": [
+    "props_-_casino.blend",
+    "props/casino/roofspire"
+  ],
+  "props/casino/shower": [
+    "props_-_casino.blend",
+    "props/casino/shower"
+  ],
+  "props/casino/smokealarm": [
+    "props_-_casino.blend",
+    "props/casino/smokealarm"
+  ],
+  "props/casino/spotlight": [
+    "props_-_casino.blend",
+    "props/casino/spotlight"
+  ],
+  "props/casino/suitcase": [
+    "props_-_casino.blend",
+    "props/casino/suitcase"
+  ],
+  "props/casino/tableclock": [
+    "props_-_casino.blend",
+    "props/casino/tableclock"
+  ],
+  "props/casino/tableset": [
+    "props_-_casino.blend",
+    "props/casino/tableset"
+  ],
+  "props/casino/towelrack": [
+    "props_-_casino.blend",
+    "props/casino/towelrack"
+  ],
+  "props/casino/urinal": [
+    "props_-_casino.blend",
+    "props/casino/urinal"
+  ],
+  "props/casino/vaultdoor": [
+    "props_-_casino.blend",
+    "props/casino/vaultdoor"
+  ],
+  "props/casino/walllamp": [
+    "props_-_casino.blend",
+    "props/casino/walllamp"
+  ],
+  "props/casino/walllampshade": [
+    "props_-_casino.blend",
+    "props/casino/walllampshade"
+  ],
+  "props/casino/whitesink": [
+    "props_-_casino.blend",
+    "props/casino/whitesink"
+  ],
+  "props/casino/windowcurtains1": [
+    "props_-_casino.blend",
+    "props/casino/windowcurtains1"
+  ],
+  "props/casino/windowcurtains2": [
+    "props_-_casino.blend",
+    "props/casino/windowcurtains2"
+  ],
+  "props/casino/windowframe1": [
+    "props_-_casino.blend",
+    "props/casino/windowframe1"
+  ],
+  "props/casino/windowframe2": [
+    "props_-_casino.blend",
+    "props/casino/windowframe2"
+  ],
+  "props/casino/windowframe3": [
+    "props_-_casino.blend",
+    "props/casino/windowframe3"
+  ],
+  "props/casino/winebottle1": [
+    "props_-_casino.blend",
+    "props/casino/winebottle1"
+  ],
+  "props/casino/winebottle2": [
+    "props_-_casino.blend",
+    "props/casino/winebottle2"
+  ],
+  "props/casino/wineglass": [
+    "props_-_casino.blend",
+    "props/casino/wineglass"
+  ],
+  "props/casino/wooddoor1": [
+    "props_-_casino.blend",
+    "props/casino/wooddoor1"
+  ],
+  "props/egyptian/pot3": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3"
+  ],
+  "props/egyptian/pot3_peice1": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice1"
+  ],
+  "props/egyptian/pot3_peice2": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice2"
+  ],
+  "props/egyptian/pot3_peice3": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice3"
+  ],
+  "props/egyptian/pot3_peice4": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice4"
+  ],
+  "props/egyptian/pot3_peice5": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice5"
+  ],
+  "props/egyptian/pot3_peice6": [
+    "props_-_egyptian.blend",
+    "props/egyptian/pot3_peice6"
+  ],
+  "props/facility/ceillight_diag": [
+    "props_-_facility.blend",
+    "props/facility/ceillight_diag"
+  ],
+  "props/facility/ceillight_rect": [
+    "props_-_facility.blend",
+    "props/facility/ceillight_rect"
+  ],
+  "props/facility/lockers": [
+    "props_-_facility.blend",
+    "props/facility/lockers"
+  ],
+  "props/facility/storage_junk01b": [
+    "props_-_facility.blend",
+    "props/facility/storage_junk01b"
+  ],
+  "props/facility/vent_cover01b": [
+    "props_-_facility.blend",
+    "props/facility/vent_cover01b"
+  ],
+  "props/facility_backzone/access_panel01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/access_panel01a"
+  ],
+  "props/facility_backzone/alarm01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/alarm01a"
+  ],
+  "props/facility_backzone/bucket01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/bucket01a"
+  ],
+  "props/facility_backzone/cardboard_box01a_static": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/cardboard_box01a_static"
+  ],
+  "props/facility_backzone/cardboard_box01b_static": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/cardboard_box01b_static"
+  ],
+  "props/facility_backzone/cartridge01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/cartridge01a"
+  ],
+  "props/facility_backzone/cigarette_ashtray01b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/cigarette_ashtray01b"
+  ],
+  "props/facility_backzone/coffeepot01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/coffeepot01a"
+  ],
+  "props/facility_backzone/handcrate01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/handcrate01a"
+  ],
+  "props/facility_backzone/keypad01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/keypad01a"
+  ],
+  "props/facility_backzone/light_fixture02a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_fixture02a"
+  ],
+  "props/facility_backzone/light_fixture03a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_fixture03a"
+  ],
+  "props/facility_backzone/light_fixture05a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_fixture05a"
+  ],
+  "props/facility_backzone/light_fixture12a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_fixture12a"
+  ],
+  "props/facility_backzone/light_switch02a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_switch02a"
+  ],
+  "props/facility_backzone/light_switch02b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_switch02b"
+  ],
+  "props/facility_backzone/light_switch1": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/light_switch1"
+  ],
+  "props/facility_backzone/papercup01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/papercup01a"
+  ],
+  "props/facility_backzone/power_socket02b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/power_socket02b"
+  ],
+  "props/facility_backzone/soap_dispenser01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/soap_dispenser01a"
+  ],
+  "props/facility_backzone/toiletpaper01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/toiletpaper01a"
+  ],
+  "props/facility_backzone/toiletpaper01b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/toiletpaper01b"
+  ],
+  "props/facility_backzone/toiletpaper01c": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/toiletpaper01c"
+  ],
+  "props/facility_backzone/toolbox01": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/toolbox01"
+  ],
+  "props/facility_backzone/towel_dispenser01b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/towel_dispenser01b"
+  ],
+  "props/facility_backzone/trash_bin1": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/trash_bin1"
+  ],
+  "props/facility_backzone/tv01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/tv01a"
+  ],
+  "props/facility_backzone/vent01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/vent01a"
+  ],
+  "props/facility_backzone/wood_shelves01a": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/wood_shelves01a"
+  ],
+  "props/facility_backzone/wood_shelves01b": [
+    "props_-_facility_backzone.blend",
+    "props/facility_backzone/wood_shelves01b"
+  ],
+  "props/facility_backzone/pipes_and_power/pipeset04_cap1": [
+    "props_-_facility_backzone_-_pipes_and_power.blend",
+    "props/facility_backzone/pipes_and_power/pipeset04_cap1"
+  ],
+  "props/facility_backzone/pipes_and_power/pipeset04_elbow1": [
+    "props_-_facility_backzone_-_pipes_and_power.blend",
+    "props/facility_backzone/pipes_and_power/pipeset04_elbow1"
+  ],
+  "props/facility_backzone/pipes_and_power/pipeset04_str_128": [
+    "props_-_facility_backzone_-_pipes_and_power.blend",
+    "props/facility_backzone/pipes_and_power/pipeset04_str_128"
+  ],
+  "props/silo/conduit01c": [
+    "props_-_silo.blend",
+    "props/silo/conduit01c"
+  ],
+  "props/silo/powerbox01a": [
+    "props_-_silo.blend",
+    "props/silo/powerbox01a"
+  ],
+  "props/silo/powerbox02a": [
+    "props_-_silo.blend",
+    "props/silo/powerbox02a"
+  ],
+  "props/streets/street_lamp": [
+    "props_-_streets.blend",
+    "props/streets/street_lamp"
+  ],
+  "sgg/starwars/weapons/w_luke_ep6_saber": [
+    "SGG_-_Starwars_-_Weapons.blend",
+    "sgg/starwars/weapons/w_luke_ep6_saber"
+  ],
+  "sgg/starwars/weapons/w_luke_ep6_saber_hilt": [
+    "SGG_-_Starwars_-_Weapons.blend",
+    "sgg/starwars/weapons/w_luke_ep6_saber_hilt"
+  ],
+  "sgg/starwars/weapons/w_obiwan_ep1_saber": [
+    "SGG_-_Starwars_-_Weapons.blend",
+    "sgg/starwars/weapons/w_obiwan_ep1_saber"
+  ],
+  "sgg/starwars/weapons/w_obiwan_ep1_saber_hilt": [
+    "SGG_-_Starwars_-_Weapons.blend",
+    "sgg/starwars/weapons/w_obiwan_ep1_saber_hilt"
+  ]
+}
