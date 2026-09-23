@@ -48,6 +48,7 @@ already used for real-time shadows, just fed different light_mvps.
 """
 
 import moderngl
+import numpy as np
 
 BAKE_VERTEX_SHADER = """
 #version 330
@@ -254,6 +255,133 @@ def create_lightmap(ctx, resolution=256):
     fbo.clear(0.0, 0.0, 0.0, 0.0)
     fbo.release()
     return texture
+
+
+# alpha=0 (create_lightmap's own clear value) marks a texel no light
+# pass has ever rasterized over at all - both bake_point_light's and
+# bake_directional_light's fragment shaders write alpha=1.0
+# unconditionally wherever a triangle DOES cover a texel (see their own
+# fragColor lines), regardless of how dark that texel's actual lit
+# color comes out - so alpha here is a pure coverage flag, never
+# confusable with "covered but black". Every eligible object gets AT
+# LEAST the sun baked into it (see Scene.bake_static_lighting's own
+# docstring), so this is always a reliable signal even for an object
+# with zero point lights ever reaching it.
+DILATE_VERTEX_SHADER = """
+#version 330
+in vec2 in_position;
+out vec2 v_uv;
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+DILATE_FRAGMENT_SHADER = """
+#version 330
+uniform sampler2D u_source;
+uniform vec2 u_texel_size;
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+    vec4 center = texture(u_source, v_uv);
+    if (center.a > 0.0) {
+        fragColor = center;
+        return;
+    }
+    // Grow the valid region outward by one texel: average whichever of
+    // the 8 neighbors are themselves already valid (alpha > 0). Several
+    // passes (see dilate_lightmap's own iterations) push this outward
+    // one ring at a time, same as any standard texture-margin dilation
+    // ("push-pull") technique.
+    vec3 sum = vec3(0.0);
+    float count = 0.0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy == 0) continue;
+            vec4 s = texture(u_source, v_uv + vec2(float(dx), float(dy)) * u_texel_size);
+            if (s.a > 0.0) {
+                sum += s.rgb;
+                count += 1.0;
+            }
+        }
+    }
+    fragColor = count > 0.0 ? vec4(sum / count, 1.0) : vec4(0.0);
+}
+"""
+
+
+def create_dilate_program(ctx):
+    return ctx.program(vertex_shader=DILATE_VERTEX_SHADER, fragment_shader=DILATE_FRAGMENT_SHADER)
+
+
+def create_dilate_quad_vao(ctx, dilate_program):
+    """A single fullscreen triangle-strip quad, reused for every object's
+    dilate_lightmap call this Scene ever makes - the geometry never
+    changes, only which lightmap texture is bound as u_source."""
+    vertices = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype="f4")
+    vbo = ctx.buffer(vertices.tobytes())
+    vao = ctx.vertex_array(dilate_program, [(vbo, "2f", "in_position")])
+    return vao, vbo
+
+
+def dilate_lightmap(ctx, dilate_program, quad_vao, texture, iterations=6):
+    """Grows each chart's own baked lighting outward by `iterations`
+    texels into the empty padding gap generate_lightmap_uvs left around
+    it (see that function's own padding_texels docstring - it explicitly
+    expects a dilation step like this one to exist, sized to match; 6
+    here comfortably covers padding_texels' own default of 4.0 with a
+    little slack).
+
+    Without this, the padding gap is still just whatever create_lightmap
+    cleared it to (transparent black) - bilinear sampling at a chart's
+    OWN edge (not just between two DIFFERENT charts, which the padding
+    gap alone already keeps apart) blends toward that black, reading as
+    a dark seam/border around every lightmapped surface. Dilating first
+    fills the gap with a plausible extension of the chart's own nearby
+    color, so a sample landing anywhere in the (now no longer really
+    "empty") gap blends between real lit colors instead of black.
+
+    Ping-pongs between `texture` and a same-sized scratch texture
+    (NEAREST-filtered for the duration - bilinear sampling DURING
+    dilation would reintroduce the exact bleeding this is meant to fix,
+    by blending toward not-yet-dilated black neighbors mid-pass) and
+    copies the final result back into `texture` itself if it landed in
+    the scratch texture instead, so the caller's own object dict entry
+    (obj["lightmap_texture"]) never needs to change identity. Restores
+    `texture`'s normal LINEAR filtering before returning either way."""
+    resolution = texture.size
+    scratch = ctx.texture(resolution, 4, dtype="f2")
+    scratch.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    original_filter = texture.filter
+    texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+    texel_size = (1.0 / resolution[0], 1.0 / resolution[1])
+    dilate_program["u_texel_size"].value = texel_size
+
+    src, dst = texture, scratch
+    for _ in range(iterations):
+        fbo = ctx.framebuffer(color_attachments=[dst])
+        fbo.use()
+        src.use(location=0)
+        dilate_program["u_source"].value = 0
+        quad_vao.render(moderngl.TRIANGLE_STRIP)
+        fbo.release()
+        src, dst = dst, src
+
+    if src is not texture:
+        # Landed in the scratch texture after an odd number of
+        # iterations - blit it back into the object's own texture
+        # object rather than handing the caller a different one.
+        src_fbo = ctx.framebuffer(color_attachments=[src])
+        dst_fbo = ctx.framebuffer(color_attachments=[texture])
+        ctx.copy_framebuffer(dst_fbo, src_fbo)
+        src_fbo.release()
+        dst_fbo.release()
+
+    scratch.release()
+    texture.filter = original_filter
 
 
 def bake_point_light(ctx, bake_program, obj, model_matrix, light, shadow_map=None):

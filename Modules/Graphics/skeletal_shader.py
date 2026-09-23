@@ -64,6 +64,19 @@ out vec3 v_normal;
 out vec3 v_color;
 out vec2 v_uv;
 out vec2 v_lightmap_uv;
+// Fixed placeholder, not real per-vertex tangent data - see pbr_
+// shader.py's FRAGMENT_SHADER_BODY (shared verbatim by this program -
+// see this file's own module docstring) for why v_tangent still needs
+// to exist here even though no skeletal mesh currently has one: a
+// skinned rig has no in_tangent attribute or _compute_tangents call of
+// its own (normal mapping was only ever added for static level
+// geometry - see model_loader.py's own comment), so any GLSL "in" the
+// shared fragment shader declares still needs SOME matching vertex
+// "out" for this program to link at all, regardless of whether that
+// data is ever meaningful. Harmless: no skeletal object currently sets
+// has_normal_texture=1, so the fragment shader's tangent-consuming
+// branch (apply_normal_map) never actually executes for one.
+out vec4 v_tangent;
 
 void main() {
     // Standard linear blend skinning - up to 4 bones per vertex,
@@ -86,6 +99,9 @@ void main() {
     v_color = in_color;
     v_uv = in_uv;
     v_lightmap_uv = in_lightmap_uv;
+    // See this file's own v_tangent declaration comment above - a fixed
+    // placeholder, never actually sampled against for a skeletal object.
+    v_tangent = vec4(1.0, 0.0, 0.0, 1.0);
     gl_Position = u_mvp * skinned_position;
 }
 """

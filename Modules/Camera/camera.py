@@ -2,7 +2,7 @@ import glm
 import pygame
 
 class Camera:
-    def __init__(self, position=(0.0, 0.0, 3.0), fov=45.0, aspect=800/600):
+    def __init__(self, position=(0.0, 0.0, 3.0), fov=45.0, aspect=800/600, near=0.1, far=100.0):
         self.position = glm.vec3(position)
         self.pitch = 0.0
         self.yaw = -90.0
@@ -10,6 +10,14 @@ class Camera:
         self.up = glm.vec3(0.0, 1.0, 0.0)
         self.fov = fov
         self.aspect = aspect
+        # Exposed as real attributes (not just baked into get_projection_
+        # matrix's own literals) so a caller that needs to reconstruct
+        # view-space depth from this camera's own projection - see pbr_
+        # shader.py's ssr_reflect/Scene._render_ssr_pass - has a single
+        # source of truth to read them from instead of a second,
+        # separately-hardcoded copy of the same two numbers.
+        self.near = near
+        self.far = far
         self.speed = 7
         self.sensitivity = 0.1
 
@@ -17,7 +25,7 @@ class Camera:
         return glm.lookAt(self.position, self.position + self.front, self.up)
 
     def get_projection_matrix(self):
-        return glm.perspective(glm.radians(self.fov), self.aspect, 0.1, 100.0)
+        return glm.perspective(glm.radians(self.fov), self.aspect, self.near, self.far)
 
     def get_matrix(self):
         return self.get_projection_matrix() * self.get_view_matrix()

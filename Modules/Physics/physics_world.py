@@ -32,6 +32,7 @@ import glm
 import trimesh
 import numpy as np
 from panda3d.core import NodePath, PandaNode, Point3, Vec3, BitMask32
+from Modules.Graphics.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object
 from panda3d.core import Quat as PandaQuat
 from panda3d.bullet import (
     BulletWorld, BulletRigidBodyNode, BulletBoxShape, BulletSphereShape,
@@ -135,6 +136,35 @@ def _load_mesh(model_path, scale):
     if scale is not None:
         vertices = vertices * np.asarray(glm.vec3(scale), dtype="f8")
     return vertices, np.asarray(mesh.faces, dtype="i4")
+
+
+def _build_triangle_mesh_shape(vertices, faces):
+    """Shared by add_static_mesh and add_static_mesh_by_material - a
+    BulletTriangleMeshShape built from a plain (vertices, faces) pair.
+
+    glTF exports (especially flat-shaded ones) commonly duplicate a
+    vertex's POSITION once per adjacent face so each triangle can carry
+    its own normal - so two triangles that are visually coplanar and
+    share an edge often don't share a vertex index at all in the raw
+    buffer trimesh hands back. Without welding here, Bullet has no way
+    to know those triangles are connected, so it treats their shared
+    edge as an "internal edge" a sweep can snag on (spurious edge/vertex
+    normal instead of the flat face normal) - confirmed as the cause of
+    walking jitter on flat multi-triangle surfaces (see this module's
+    docstring, and torus_scene.py's plane.glb/floorbase.glb comments).
+    A tiny welding distance merges any positions that coincide to within
+    floating-point noise back into shared indices, restoring the
+    adjacency info Bullet needs."""
+    tri_mesh = BulletTriangleMesh()
+    tri_mesh.setWeldingDistance(1e-8)
+    for a, b, c in faces:
+        tri_mesh.addTriangle(
+            to_physics_pos(vertices[a]),
+            to_physics_pos(vertices[b]),
+            to_physics_pos(vertices[c]),
+            True,
+        )
+    return BulletTriangleMeshShape(tri_mesh, dynamic=False)
 
 
 class PhysicsWorld:
@@ -242,32 +272,109 @@ class PhysicsWorld:
             inside = np.all((centroids >= mins) & (centroids <= maxs), axis=1)
             faces = faces[~inside]
 
-        tri_mesh = BulletTriangleMesh()
-        # glTF exports (especially flat-shaded ones) commonly duplicate a
-        # vertex's POSITION once per adjacent face so each triangle can
-        # carry its own normal - so two triangles that are visually
-        # coplanar and share an edge often don't share a vertex index at
-        # all in the raw buffer trimesh hands back. Without welding here,
-        # Bullet has no way to know those triangles are connected, so it
-        # treats their shared edge as an "internal edge" a sweep can snag
-        # on (spurious edge/vertex normal instead of the flat face normal)
-        # - confirmed as the cause of walking jitter on flat multi-
-        # triangle surfaces (see this module's docstring, and torus_
-        # scene.py's plane.glb/floorbase.glb comments). remove_duplicate_
-        # vertices=True + a tiny welding distance merges any positions
-        # that coincide to within floating-point noise back into shared
-        # indices, restoring the adjacency info Bullet needs.
-        tri_mesh.setWeldingDistance(1e-8)
-        for a, b, c in faces:
-            tri_mesh.addTriangle(
-                to_physics_pos(vertices[a]),
-                to_physics_pos(vertices[b]),
-                to_physics_pos(vertices[c]),
-                True,
-            )
-
-        shape = BulletTriangleMeshShape(tri_mesh, dynamic=False)
+        shape = _build_triangle_mesh_shape(vertices, faces)
         return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_mesh", material=material)
+
+    def add_static_mesh_by_material(self, model_path, position=None, rotation=None,
+                                     scale=None, collision_mask=CollisionGroup.ALL,
+                                     material_overrides=None, default_material=None):
+        """Like add_static_mesh, but builds a SEPARATE Bullet collider
+        per distinct material in model_path (the same per-material split
+        the render pipeline uses for a multi-material level - see
+        model_loader.py's load_mesh_groups_by_material/_flatten_scene_
+        by_material), so different parts of one glb can have entirely
+        different collision behavior (no collider at all for one
+        material, a different physical_material/footstep sound for
+        another) without splitting the level into multiple separate
+        files or add_static calls.
+
+        material_overrides: optional {material_name: str_or_None} - per-
+        material physical_material (see footstep_materials.py), or
+        explicitly None to build NO collider at all for that material's
+        geometry (e.g. a water surface someone should fall/swim through
+        rather than stand on). A material NOT named here at all falls
+        back to `default_material` instead - matched by the same
+        material_name load_mesh_groups_by_material/Scene.add_static's
+        own alpha_mode_overrides use (the glTF material's own authored
+        name, or an opaque id() for an unnamed one).
+
+        default_material: physical_material for every material NOT
+        named in material_overrides at all - None (footstep_materials.
+        DEFAULT_FOOTSTEP_MATERIAL, same fallback every other add_static_
+        * method here already uses) if not given. NOT the same thing as
+        explicitly overriding a material to None in material_overrides,
+        which skips collision for it entirely rather than just picking a
+        default sound.
+
+        No exclude_local_bounds support (unlike add_static_mesh) - carve
+        the unwanted region out at the material/export level instead
+        (or give it its own material_overrides entry) if this is ever
+        needed; not worth the added complexity for a case with no
+        current caller.
+
+        Returns the list of node paths actually created - one per
+        material that got a real collider; a material overridden to
+        None contributes none at all."""
+        groups = load_mesh_groups_by_material(model_path, scale=scale)
+        node_paths = []
+        for material_name, vertices, faces in groups:
+            if material_overrides and material_name in material_overrides:
+                physical_material = material_overrides[material_name]
+                if physical_material is None:
+                    continue
+            else:
+                physical_material = default_material
+
+            shape = _build_triangle_mesh_shape(vertices, faces)
+            node_paths.append(
+                self._add_body(
+                    shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
+                )
+            )
+        return node_paths
+
+    def add_static_mesh_by_object(self, model_path, position=None, rotation=None,
+                                   scale=None, collision_mask=CollisionGroup.ALL,
+                                   object_overrides=None, default_material=None):
+        """Like add_static_mesh_by_material, but splits/matches by each
+        mesh's own OBJECT/NODE name (Blender's "Object name" - see
+        model_loader.py's load_mesh_groups_by_object) instead of its
+        material - use this instead when collision decisions are
+        naturally per-OBJECT rather than per-material, e.g. a level
+        built from a handful of shared trim materials reused across many
+        distinct objects, where "this ONE object should have no
+        collision" can't be expressed by naming a material at all
+        (naming that material in add_static_mesh_by_material's own
+        material_overrides would affect EVERY object using it, not just
+        the one intended).
+
+        object_overrides: optional {node_name: str_or_None} - per-object
+        physical_material, or explicitly None to build no collider at
+        all for that object - same shape/semantics as add_static_mesh_
+        by_material's own material_overrides, just matched by node name
+        instead of material name. default_material: same as add_static_
+        mesh_by_material's own.
+
+        Returns the list of node paths actually created - one per object
+        that got a real collider; an object overridden to None
+        contributes none at all."""
+        groups = load_mesh_groups_by_object(model_path, scale=scale)
+        node_paths = []
+        for node_name, vertices, faces in groups:
+            if object_overrides and node_name in object_overrides:
+                physical_material = object_overrides[node_name]
+                if physical_material is None:
+                    continue
+            else:
+                physical_material = default_material
+
+            shape = _build_triangle_mesh_shape(vertices, faces)
+            node_paths.append(
+                self._add_body(
+                    shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
+                )
+            )
+        return node_paths
 
     def add_static_box(self, half_extents, position=None, rotation=None,
                         collision_mask=CollisionGroup.ALL, material=None):

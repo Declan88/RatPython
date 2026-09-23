@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from pathlib import Path
 
 import moderngl
@@ -15,7 +16,10 @@ from Modules.Graphics.pbr_shader import (
     bind_material,
     bind_frame_uniforms,
     bind_point_lights,
-    bind_environment
+    bind_environment,
+    bind_reflection_environment,
+    bind_ssr_textures,
+    MAX_POINT_LIGHTS,
 )
 from Modules.Graphics.frustum import extract_frustum_planes, aabb_outside_frustum
 from Modules.Graphics.shadow_module import CascadedShadowMap
@@ -25,7 +29,10 @@ from Modules.Graphics.lightmap_baker import (
     create_bake_program,
     create_lightmap,
     bake_point_light,
-    bake_directional_light
+    bake_directional_light,
+    create_dilate_program,
+    create_dilate_quad_vao,
+    dilate_lightmap,
 )
 from Modules.Graphics.model_loader import load_glb, load_glb_by_material
 from Modules.Graphics import lightmap_cache_io
@@ -68,13 +75,28 @@ _DEFAULT_ANIM_BLEND_DURATION = 0.25
 PROFILE_RENDER = False
 _PROFILE_RENDER_WINDOW_FRAMES = 60
 
-# Temporary perf-comparison switch - set False to skip both real-time
-# shadow passes entirely (_render_shadows never runs, and every
-# bind_frame_uniforms call gets shadow_manager/movable_shadow_manager
-# forced to None, so the fragment shader's own u_has_shadows/u_has_
-# movable_shadows both read as 0 too). Baked static lighting is
-# unaffected either way - only the real-time cascades/sampling are
-# skipped. Revert to True when done comparing.
+# CPU wall-clock companion to PROFILE_RENDER above - that one times GPU
+# EXECUTION via timer queries (see Scene._profiled's own docstring), and
+# says nothing about the Python-side cost of just ISSUING each pass's
+# calls, which is what app.py's own PROFILE_CPU "scene.render (cpu
+# submit)" bucket actually measures as one lump sum for this whole
+# method. This breaks THAT lump sum down by render()'s own sub-passes
+# (shadows/main scene/skybox/ssr/transparent) using plain time.
+# perf_counter, same shape as app.py's _profiled_cpu - off by default,
+# a single boolean check per pass when off.
+PROFILE_RENDER_CPU = False
+_render_cpu_samples = {}
+_render_cpu_frame_count = 0
+
+# Temporary perf-comparison switch - set False to skip the real-time
+# shadow pass entirely (_render_shadows never runs, and every
+# bind_frame_uniforms call gets shadow_manager forced to None, so the
+# fragment shader's own u_has_shadows reads as 0 too, which also
+# zeroes calculate_movable_shadow's own result - see that function's
+# own comment on why it reads the same u_has_shadows/u_shadow_maps as
+# calculate_shadow now). Baked static lighting is unaffected either
+# way - only the real-time cascades/sampling are skipped. Revert to
+# True when done comparing.
 ENABLE_SHADOWS = True
 
 
@@ -298,18 +320,58 @@ class Scene:
             """
         )
 
+        # This cascade set holds ONLY dynamic/skeletal (movable) casters
+        # - static geometry's own shadow contribution comes from self.
+        # _static_shadow_texture instead (see _ensure_static_shadow_map/
+        # _render_shadows), a single fixed map built once rather than
+        # redrawn into a cascade every frame. Cheap to render every
+        # frame: only however many dynamic/skeletal objects the scene
+        # actually has - a handful of low-poly meshes, nothing like the
+        # full static map.
+        #
+        # Passed once to bind_frame_uniforms' own shadow_manager param at
+        # every call site - the fragment shader's calculate_shadow AND
+        # calculate_movable_shadow both read straight off the resulting
+        # u_shadow_maps/u_light_mvps (see calculate_cascade_shadow's own
+        # comment), so there's only ever one binding of this cascade's
+        # textures/matrices per bind_frame_uniforms call now. A second,
+        # separately-fit "movable_shadow_manager" cascade set (and a
+        # second GLSL uniform set/binding function to match) used to
+        # exist here, rendering and binding this exact same content a
+        # second time for no actual difference - confirmed as pure
+        # redundant GPU work, and disproportionately expensive for
+        # _render_transparent_objects specifically (a pass with few
+        # objects, where this per-call fixed cost dominated far more
+        # than it did in the main scene loop's many-objects case) - once
+        # static casters were moved out of the main cascade set and into
+        # the fixed static map instead (see git history if the old two-
+        # manager split is ever needed again for some new reason).
         self.shadow_manager = CascadedShadowMap(self.ctx)
-        # A second cascade set containing ONLY dynamic/skeletal
-        # (movable) casters, never static geometry - see pbr_shader.py's
-        # TEX_UNIT_MOVABLE_SHADOW_START for the full reasoning. Cheap to
-        # render every frame despite being a second full cascade pass:
-        # unlike self.shadow_manager (which still has to include every
-        # static object too, so movable objects stay correctly shadowed
-        # by static geometry), this one only ever rasterizes however
-        # many dynamic/skeletal objects the scene actually has - a
-        # handful of low-poly meshes, nothing like the full static map.
-        self.movable_shadow_manager = CascadedShadowMap(self.ctx)
+        # Built lazily, once, the first time _render_shadows runs (see
+        # _ensure_static_shadow_map) - not here, since a Scene
+        # subclass's own static objects haven't been added yet at this
+        # point in __init__.
+        self._static_shadow_texture = None
+        self._static_shadow_light_vp = None
+        # Deliberately higher than shadow_manager's own 2048
+        # (CascadedShadowMap's default) - this single fixed map covers
+        # the WHOLE static scene at once rather than
+        # being tightly re-fit to just the camera's near cascade slice
+        # the way the old per-frame static redraw was, so it needs more
+        # texels to make up for that lost precision.
+        self.static_shadow_resolution = 4096
         self.bake_program = create_bake_program(self.ctx)
+        # See lightmap_baker.py's own dilate_lightmap - fills the empty
+        # padding gap generate_lightmap_uvs leaves around each chart
+        # with a plausible extension of that chart's own nearby baked
+        # color, so bilinear sampling at a chart's own edge doesn't
+        # blend toward the gap's cleared-black default (visible as a
+        # dark seam/border around every lightmapped surface). Created
+        # once here, same as self.bake_program - the geometry (a plain
+        # fullscreen quad) and compiled program never change between
+        # Scene.bake_static_lighting calls or objects.
+        self.dilate_program = create_dilate_program(self.ctx)
+        self.dilate_quad_vao, self.dilate_quad_vbo = create_dilate_quad_vao(self.ctx, self.dilate_program)
         self.skeletal_program = create_skeletal_program(self.ctx)
         self.skeletal_shadow_program = create_skeletal_shadow_program(self.ctx)
 
@@ -334,6 +396,34 @@ class Scene:
         # ambient constant this replaced.
         self.environment_sky_color = (0.025, 0.025, 0.025)
         self.environment_ground_color = (0.025, 0.025, 0.025)
+        # The RAW (pre-ambient_intensity, pre-exposure-for-equirect)
+        # average colors add_skybox/add_equirect_skybox actually derived
+        # from the loaded texture - kept around so set_ambient_intensity
+        # below can be called at any time afterward (even repeatedly, to
+        # re-tune) and recompute environment_sky_color/ground_color from
+        # the real base values, rather than needing the skybox reloaded
+        # from disk just to change this one multiplier.
+        self._base_sky_color = self.environment_sky_color
+        self._base_ground_color = self.environment_ground_color
+        # 1.0 = neutral (today's existing brightness, unchanged) - see
+        # set_ambient_intensity's own docstring.
+        self.ambient_intensity = 1.0
+
+        # See update()'s own comment - drives pbr_shader.py's u_time.
+        self._elapsed_time = 0.0
+        # Plain incrementing frame counter - drives pbr_shader.py's
+        # u_frame_offset, which only exists to vary ssr_reflect's dither
+        # pattern frame to frame (see that uniform's own comment).
+        self._frame_count = 0
+
+        # Set up by enable_screen_space_reflections() - None (the
+        # feature's default-off state) until then. See that method's
+        # own docstring.
+        self._ssr_fbo = None
+        self._ssr_depth_fbo = None
+        self._ssr_color_texture = None
+        self._ssr_depth_texture = None
+        self._ssr_resolution = None
 
     # =============================================================
     # OBJECT LOADING
@@ -365,6 +455,7 @@ class Scene:
                 _release(lightmap_model.get("vao"))
             _release(model.get("texture"))
             _release(model.get("metallic_roughness_texture"))
+            _release(model.get("normal_texture"))
             return None
 
         return {
@@ -382,11 +473,15 @@ class Scene:
             "lightmap_texture": None,
             "texture": model.get("texture"),
             "metallic_roughness_texture": model.get("metallic_roughness_texture"),
+            "normal_texture": model.get("normal_texture"),
             "metallic": model.get("metallic", 0.1),
             "roughness": model.get("roughness", 0.5),
             "emissive": model.get("emissive", [0.0, 0.0, 0.0]),
+            "normal_scale": model.get("normal_scale", 1.0),
+            "double_sided": model.get("double_sided", False),
             "has_texture": model.get("has_texture", 0),
             "has_metallic_roughness_texture": model.get("has_metallic_roughness_texture", 0),
+            "has_normal_texture": model.get("has_normal_texture", 0),
             "alpha_mode": model.get("alpha_mode", "OPAQUE"),
             "alpha_cutoff": model.get("alpha_cutoff", 0.5),
             "base_alpha": model.get("base_alpha", 1.0),
@@ -424,6 +519,7 @@ class Scene:
                 _release(m.get("vao"))
                 _release(m.get("texture"))
                 _release(m.get("metallic_roughness_texture"))
+                _release(m.get("normal_texture"))
             for m in shadow_groups:
                 _release(m.get("vao"))
             return []
@@ -461,11 +557,15 @@ class Scene:
                 "lightmap_texture": None,
                 "texture": model.get("texture"),
                 "metallic_roughness_texture": model.get("metallic_roughness_texture"),
+                "normal_texture": model.get("normal_texture"),
                 "metallic": model.get("metallic", 0.1),
                 "roughness": model.get("roughness", 0.5),
                 "emissive": model.get("emissive", [0.0, 0.0, 0.0]),
+                "normal_scale": model.get("normal_scale", 1.0),
+                "double_sided": model.get("double_sided", False),
                 "has_texture": model.get("has_texture", 0),
                 "has_metallic_roughness_texture": model.get("has_metallic_roughness_texture", 0),
+                "has_normal_texture": model.get("has_normal_texture", 0),
                 "alpha_mode": model.get("alpha_mode", "OPAQUE"),
                 "alpha_cutoff": model.get("alpha_cutoff", 0.5),
                 "base_alpha": model.get("base_alpha", 1.0),
@@ -486,7 +586,11 @@ class Scene:
                     transform=None, metallic=None, roughness=None,
                     collision=False, collision_shape="mesh", collision_mask=CollisionGroup.ALL,
                     collision_exclude_local_bounds=None, physical_material=None,
-                    alpha_mode_overrides=None):
+                    alpha_mode_overrides=None, roughness_overrides=None,
+                    specular_strength_overrides=None, water_overrides=None,
+                    double_sided_overrides=None, ignore_source_double_sided=False,
+                    collision_overrides=None, collision_object_overrides=None,
+                    base_alpha_overrides=None):
         """collision=True registers a collider for this object in
         self.physics, so a CharacterController (or a dynamic object
         with its own collision=True) can stand/collide on it.
@@ -509,6 +613,52 @@ class Scene:
         while standing on it. None falls back to
         footstep_materials.DEFAULT_FOOTSTEP_MATERIAL. Only meaningful
         alongside collision=True.
+
+        collision_overrides: optional {material_name: str_or_None} -
+        per-MATERIAL collision behavior, matched by the same material
+        name alpha_mode_overrides/roughness_overrides use. A string
+        gives every object using that ONE material its own physical_
+        material (footstep sound), independent of the blanket physical_
+        material above; None instead builds NO collider AT ALL for that
+        material's geometry, wherever it's used. A material NOT named
+        here at all just uses the blanket physical_material like before
+        this param existed. Use collision_object_overrides below
+        instead when the thing you actually want to target is a
+        specific OBJECT, not everything sharing one material (the more
+        common case for a real level, where a handful of trim materials
+        get reused across many distinct objects) - e.g. Blender scenes
+        with separate "Water"/"CenterFloor" objects that happen to both
+        use a shared material would need collision_object_overrides,
+        not this, to target just one of them. Only meaningful alongside
+        collision=True and collision_shape="mesh" (see PhysicsWorld.
+        add_static_mesh_by_material, which this switches to internally
+        when given - a "box" collision_shape has no meaningful per-
+        material split, since it's already one single shape covering
+        the whole model's bounds regardless).
+
+        collision_object_overrides: optional {node_name: str_or_None} -
+        the per-OBJECT equivalent of collision_overrides above, matched
+        by each mesh's own NODE name instead (Blender's "Object name",
+        carried through to the glTF node name on export - open the
+        source file in Blender and check the Outliner, or a raw glTF
+        dump's node list, if unsure what an object is actually called;
+        it's frequently NOT the same as its material's name). A string
+        gives that ONE object its own physical_material; None builds no
+        collider at all for just that object, leaving every OTHER
+        object - even ones sharing the exact same material - completely
+        unaffected. This is almost always what you want for "make THIS
+        one thing non-solid" or "THIS one floor sounds different"
+        requests, since real levels rarely give a truly unique material
+        to every individual object. Same collision=True/collision_
+        shape="mesh" requirement as collision_overrides (see PhysicsWorld
+        .add_static_mesh_by_object). If BOTH this and collision_overrides
+        are given for the same add_static call, this one wins OUTRIGHT
+        for the whole model - the two aren't merged triangle-by-triangle
+        (that would need a third, per-(object,material)-pair grouping
+        this doesn't build), so collision_overrides is simply ignored,
+        with a note printed, rather than silently doing something more
+        clever than it actually does. Pass one or the other, not both,
+        for one add_static call.
 
         alpha_mode_overrides: optional {material_name: "OPAQUE" |
         "MASK" | "BLEND"} - forces how ONE specific material (matched
@@ -535,6 +685,163 @@ class Scene:
         (real glass, water) to MASK would just replace smooth edges
         with jagged ones, not fix anything.
 
+        roughness_overrides: optional {material_name: float} - like
+        alpha_mode_overrides above but for ONE specific material's
+        roughnessFactor, rather than `roughness` above which (when
+        given) blanket-overrides EVERY material this model_path contains
+        - use this instead when only one material in a multi-material
+        level needs correcting (a material authored with a placeholder/
+        wrong roughness, or one worth tuning in code without re-
+        exporting the source file) while the rest should keep whatever
+        they were actually authored with. Applied AFTER the blanket
+        `roughness` above, so a material named here always wins over it
+        even if both are given. Matched by the same material_name as
+        alpha_mode_overrides (see its own docstring for exactly what
+        that name is).
+
+        base_alpha_overrides: optional {material_name: float in [0, 1]} -
+        same shape/matching as roughness_overrides above, but for the
+        material's own base_alpha factor (glTF baseColorFactor's alpha
+        channel - see model_loader.py's _extract_material). By itself
+        this does NOTHING VISIBLE for an OPAQUE material (see pbr_
+        shader.py's main() - OPAQUE always outputs full alpha regardless
+        of this factor, and Scene._render_scene never even enables
+        GL_BLEND for the OPAQUE pass to begin with) - real transparency
+        also needs alpha_mode_overrides to switch that same material to
+        "BLEND" (see its own docstring), at which point this is what
+        actually controls how see-through it reads: 1.0 fully opaque
+        (the default - matches every material's behavior before this
+        param existed), lower values progressively more transparent,
+        0.0 fully invisible. A material NOT named here at all keeps
+        whatever base_alpha its own source file was authored with.
+
+        specular_strength_overrides: optional {material_name: float} -
+        same shape/matching as roughness_overrides above, but for
+        u_specular_strength (pbr_shader.py's FRAGMENT_SHADER_BODY -
+        Source's own $phongboost equivalent: a direct multiplier on the
+        specular highlight's intensity, independent of roughness/
+        metallic, which only shape the highlight's SIZE/tint, not how
+        bright it is). No add_static caller sets this at all by default
+        (every material silently gets pbr_shader.py's own 1.0 fallback),
+        which is fine for ordinary matte/semi-glossy props, but a
+        near-mirror-smooth STATIC material (roughness close to 0, e.g.
+        water) needs it explicitly boosted well above 1.0 to actually
+        read as shiny: this shader has no Fresnel edge-brightening term
+        (real water's characteristic grazing-angle glare has no
+        equivalent here at all) and uses a physically-modest F0≈0.04
+        dielectric base reflectance, so the specular contribution is
+        also multiplied by the scene's own light_intensity - in a scene
+        authored with a deliberately dim direct light (mainmap_scene.py
+        uses 0.1, relying on ambient/baked lighting for its overall
+        exposure instead), the resulting highlight at strength=1.0 comes
+        out close to imperceptible even though every other factor
+        (roughness=0, metallic=0) is completely correct - reading as
+        "fully rough" despite nothing being wrong with the material data
+        itself, purely because the highlight is too dim to ever notice.
+
+        water_overrides: optional {material_name: {param: value, ...}} -
+        a Source-water-recipe knob set for ONE specific material, bundled
+        together (unlike the single-value overrides above) since these
+        are naturally authored as a group and Source's own water VMTs
+        (water_dx90 etc.) expose them the same way. Recognized keys, all
+        optional within a material's own dict:
+          "pan1_speed": (u, v) - UV units/second the first normal-map
+            layer scrolls at. Source's own $bumptransform equivalent.
+          "pan2_speed": (u, v) - same, for a SECOND, independently-
+            panned sample of the SAME normal map, blended with the
+            first (see pbr_shader.py's apply_normal_map) - Source's
+            water shaders do exactly this (two bump layers at different
+            speeds/directions) so a repeating ripple tile doesn't read
+            as an obviously-scrolling grid. Both default to (0, 0) -
+            i.e. no panning/animation at all - if this key or the whole
+            water_overrides entry is omitted, matching every material's
+            behavior before this feature existed exactly.
+          "uv_scale": float - tiles BOTH layers' UVs by this factor,
+            applied BEFORE uv2_scale below (which then still means
+            "relative to layer 1's own tiling", not the raw mesh UVs) -
+            a value > 1.0 tiles the texture MORE times across the
+            surface, so the pattern reads SMALLER/denser; < 1.0 tiles it
+            FEWER times, so the pattern reads BIGGER/more spread out
+            (the inverse of what "scale" might suggest at a glance,
+            since this scales UV coordinates, not the visual pattern
+            size directly - want bigger ripples, use a SMALLER number
+            here). Defaults to 1.0 - the mesh's own authored UV density,
+            unmodified, matching every material's behavior before this
+            key existed.
+          "uv2_scale": float - tiles the SECOND layer's UVs by this
+            factor relative to uv_scale/layer 1's own tiling (see above)
+            - a non-1.0, non-integer value (e.g. 2.3) further breaks up
+            the repeat pattern since the two layers' tiling no longer
+            lines back up on a simple cycle. Defaults to 1.0 (same
+            tiling as layer 1).
+          "normal_scale": float - how strongly the normal map perturbs
+            the lighting normal (glTF's own normalTexture.scale -
+            multiplies the sampled tangent-space normal's XY before
+            renormalizing, see pbr_shader.py's apply_normal_map) -
+            higher means MORE pronounced/bumpier-looking ripples, lower
+            means a subtler, closer-to-flat surface. Overrides whatever
+            the source glTF material itself was authored with (this
+            project's own water normal map is authored at 0.3) rather
+            than requiring a re-export just to try a stronger look.
+            Defaults to whatever the material's own file specifies
+            (see model_loader.py's _extract_material) if this key is
+            left out entirely.
+          "reflection_mode": "cheap" (default) or "ssr" - which source
+            main()'s own env_reflection block samples for this material:
+            "cheap" is the plain skybox reflection every near-mirror-
+            smooth material already gets (see specular_strength_
+            overrides above); "ssr" ray-marches the actual rendered
+            scene (Screen-Space Reflections - see Scene.enable_screen_
+            space_reflections, which must be called on this scene for
+            "ssr" to do anything; it silently falls back to "cheap"
+            otherwise) for a real reflection of whatever's actually
+            above the water that moves correctly with the camera -
+            unlike an earlier mirrored-camera approach this project
+            tried first, which only ever looked right from a narrow
+            range of angles and visibly swam otherwise (see pbr_
+            shader.py's ssr_reflect for why SSR doesn't have that
+            problem: it traces the SAME camera's own view, not a
+            separate one, so there's no second projection to line up).
+        Only meaningful alongside a normal_texture the source material
+        already has (see model_loader.py's _extract_material) - pan
+        speeds/uv2_scale have nothing to animate without one, though
+        reflection_mode works on any near-mirror-smooth material
+        regardless.
+
+        double_sided_overrides: optional {material_name: bool} - forces
+        whether ONE specific material back-face culls (False) or not
+        (True), overriding whatever Scene._render_scene would otherwise
+        have decided for it (the glTF's own doubleSided flag for an
+        OPAQUE material - see model_loader.py's _build_mesh_data - or
+        the unconditional double-sided rendering a MASK/BLEND material
+        already gets regardless of this override, since a cutout/
+        translucent material reading wrong lit from one side is the
+        actual reason that rule exists at all). Exists because a
+        source file's own doubleSided authoring isn't always
+        deliberate: many DCC tools (Blender's glTF exporter included)
+        default an ordinary material to doubleSided=true unless
+        "Backface Culling" was explicitly enabled on it - a re-export
+        can silently flip a whole level's worth of OPAQUE materials to
+        double-sided at once with nobody having actually decided that,
+        which reads as broken rendering (extra draw cost, and backface
+        normals/lighting showing through where they shouldn't) far more
+        often than it reads as intentional.
+
+        ignore_source_double_sided: False (default) trusts the source
+        glTF's own doubleSided flag for any OPAQUE material NOT named in
+        double_sided_overrides, exactly as before this pair of params
+        existed. True instead treats every OPAQUE material not
+        explicitly named in double_sided_overrides as back-face culled,
+        full stop, regardless of what the file itself says - the
+        practical fix for the "many materials suddenly double-sided
+        after a re-export, nobody meant that" case above: list ONLY the
+        few materials that genuinely need double-sided rendering in
+        double_sided_overrides, set this to True, and every other
+        material culls normally no matter how the source file's own
+        doubleSided flags happen to be set. MASK/BLEND materials are
+        never affected either way - see double_sided_overrides' own
+        comment for why.
+
         Returns a LIST of the object dicts actually created - one per
         distinct material model_path contains (see _load_objects_by_
         material), almost always length 1 for an ordinary single-
@@ -551,6 +858,35 @@ class Scene:
                 model["roughness"] = roughness
             if alpha_mode_overrides and model.get("material_name") in alpha_mode_overrides:
                 model["alpha_mode"] = alpha_mode_overrides[model["material_name"]]
+            if roughness_overrides and model.get("material_name") in roughness_overrides:
+                model["roughness"] = float(roughness_overrides[model["material_name"]])
+            if base_alpha_overrides and model.get("material_name") in base_alpha_overrides:
+                model["base_alpha"] = float(base_alpha_overrides[model["material_name"]])
+            if specular_strength_overrides and model.get("material_name") in specular_strength_overrides:
+                model["specular_strength"] = float(specular_strength_overrides[model["material_name"]])
+            if water_overrides and model.get("material_name") in water_overrides:
+                params = water_overrides[model["material_name"]]
+                if "pan1_speed" in params:
+                    model["normal_pan1_speed"] = tuple(float(v) for v in params["pan1_speed"])
+                if "pan2_speed" in params:
+                    model["normal_pan2_speed"] = tuple(float(v) for v in params["pan2_speed"])
+                if "uv_scale" in params:
+                    model["normal_uv_scale"] = float(params["uv_scale"])
+                if "uv2_scale" in params:
+                    model["normal_uv2_scale"] = float(params["uv2_scale"])
+                if "normal_scale" in params:
+                    model["normal_scale"] = float(params["normal_scale"])
+                if "reflection_mode" in params:
+                    model["reflection_mode"] = params["reflection_mode"]
+            if double_sided_overrides and model.get("material_name") in double_sided_overrides:
+                model["double_sided"] = bool(double_sided_overrides[model["material_name"]])
+            elif ignore_source_double_sided and model.get("alpha_mode") == "OPAQUE":
+                # Only OPAQUE - a MASK/BLEND material already renders
+                # double-sided unconditionally regardless of this flag
+                # (see Scene._render_scene's own cull-face decision), so
+                # forcing it False here would be silently meaningless for
+                # those, not an actual behavior change worth applying.
+                model["double_sided"] = False
 
             if transform is not None:
                 model["transform"] = glm.mat4(transform)
@@ -558,6 +894,12 @@ class Scene:
                 model["position"] = glm.vec3(position if position is not None else glm.vec3(0.0))
                 model["rotation"] = glm.vec3(rotation if rotation is not None else glm.vec3(0.0))
                 model["scale"] = glm.vec3(scale if scale is not None else glm.vec3(1.0))
+
+            # Precomputed once, here, rather than every frame - see
+            # _get_model_matrix's own comment on why this is safe ONLY
+            # because static geometry is provably never moved by
+            # anything else in the codebase after this point.
+            model["_cached_model_matrix"] = self._get_model_matrix(model)
 
             self.static_objects.append(model)
 
@@ -574,6 +916,7 @@ class Scene:
             self._add_static_collision(
                 model_path, models[0], collision_shape, collision_mask,
                 collision_exclude_local_bounds, physical_material,
+                collision_overrides, collision_object_overrides,
             )
 
         return models
@@ -581,14 +924,46 @@ class Scene:
         return model
 
     def _add_static_collision(self, model_path, model, collision_shape, collision_mask,
-                               exclude_local_bounds=None, physical_material=None):
+                               exclude_local_bounds=None, physical_material=None,
+                               collision_overrides=None, collision_object_overrides=None):
         pos, rot, scl = self._collision_transform_args(model)
-        if collision_shape == "mesh":
+        if collision_overrides and collision_object_overrides:
+            print(
+                f"[Scene] add_static({model_path!r}): both collision_overrides and "
+                f"collision_object_overrides were given - using collision_object_overrides only "
+                f"(see add_static's own docstring for why these can't be merged)."
+            )
+        if collision_shape == "mesh" and collision_object_overrides:
+            # See add_static's own collision_object_overrides docstring -
+            # a SEPARATE collider per OBJECT (glTF node) instead of one
+            # blanket mesh for the whole model_path, so an individual
+            # object can skip collision entirely or use its own
+            # physical_material regardless of what material it shares
+            # with other objects.
+            self.physics.add_static_mesh_by_object(
+                model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
+                object_overrides=collision_object_overrides, default_material=physical_material,
+            )
+        elif collision_shape == "mesh" and collision_overrides:
+            # See add_static's own collision_overrides docstring - same
+            # idea, split by MATERIAL instead of by object.
+            self.physics.add_static_mesh_by_material(
+                model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
+                material_overrides=collision_overrides, default_material=physical_material,
+            )
+        elif collision_shape == "mesh":
             self.physics.add_static_mesh(
                 model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
                 exclude_local_bounds=exclude_local_bounds, material=physical_material,
             )
         elif collision_shape == "box":
+            if collision_overrides or collision_object_overrides:
+                print(
+                    f"[Scene] add_static({model_path!r}): collision_overrides/"
+                    f"collision_object_overrides are ignored for collision_shape='box' (a single box "
+                    f"already covers the whole model's bounds regardless of material/object - see "
+                    f"add_static's own docstring)."
+                )
             self.physics.add_static_box_from_bounds(
                 model_path, position=pos, rotation=rot, scale=scl, collision_mask=collision_mask,
                 material=physical_material,
@@ -1301,8 +1676,9 @@ class Scene:
         # this is a cruder approximation than that path - acceptable
         # for a subtle ambient term on a shader that's already not
         # claiming photometric accuracy (see pbr_shader.py's docstring).
-        self.environment_sky_color = self.skybox_average_colors[2]
-        self.environment_ground_color = self.skybox_average_colors[3]
+        self._base_sky_color = self.skybox_average_colors[2]
+        self._base_ground_color = self.skybox_average_colors[3]
+        self._apply_ambient_intensity()
 
     def add_equirect_skybox(self, path, exposure=1.0):
         """Loads a single equirectangular panorama as the skybox, sampled
@@ -1342,9 +1718,155 @@ class Scene:
         # linear (load_equirect_texture handles LDR gamma-decoding), so
         # just apply the same exposure multiplier the skybox itself
         # renders with, for a consistent look between the visible sky
-        # and its ambient contribution.
-        self.environment_sky_color = tuple(c * exposure for c in sky_color)
-        self.environment_ground_color = tuple(c * exposure for c in ground_color)
+        # and its ambient contribution. exposure is folded into the
+        # BASE here (unlike ambient_intensity below) because it's also
+        # what render_equirect_skybox uses to draw the visible backdrop
+        # itself (see Scene.render) - the two should always agree, so
+        # there's no separate "un-exposed" base worth keeping around the
+        # way there is for ambient_intensity, which deliberately only
+        # ever affects the ambient LIGHTING term, never the visible sky.
+        self._base_sky_color = tuple(c * exposure for c in sky_color)
+        self._base_ground_color = tuple(c * exposure for c in ground_color)
+        self._apply_ambient_intensity()
+
+    def _apply_ambient_intensity(self):
+        """Recomputes environment_sky_color/environment_ground_color -
+        what pbr_shader.py's hemisphere_ambient actually samples every
+        frame (see bind_environment) - from self._base_sky_color/
+        _base_ground_color (whatever add_skybox/add_equirect_skybox last
+        derived from the loaded texture, exposure already folded in for
+        the equirect case - see that method's own comment) times self.
+        ambient_intensity. Called by both skybox loaders after they set
+        a new base, and by set_ambient_intensity whenever the multiplier
+        itself changes - either one alone is a no-op without the other
+        also having run at least once, which is exactly why this is its
+        own small shared step instead of being duplicated inline in
+        three places."""
+        self.environment_sky_color = tuple(c * self.ambient_intensity for c in self._base_sky_color)
+        self.environment_ground_color = tuple(c * self.ambient_intensity for c in self._base_ground_color)
+
+    def set_ambient_intensity(self, multiplier):
+        """Scales the skybox-derived hemisphere ambient term (pbr_
+        shader.py's u_sky_color/u_ground_color - the soft, direction-
+        less "skylight" every surface picks up regardless of the sun/
+        point lights, blended by how much it faces up vs down - see
+        FRAGMENT_SHADER_BODY's own hemisphere_ambient comment) by
+        `multiplier`, WITHOUT touching how bright the skybox itself
+        looks on screen - unlike add_equirect_skybox's own `exposure`,
+        which affects both (see that method's own comment for why the
+        two intentionally don't share one knob). 1.0 is neutral (today's
+        actual brightness, unchanged); > 1.0 brightens just the ambient
+        contribution (useful when a scene's own light_intensity is
+        deliberately dim - e.g. MainMapScene's 0.05 - and surfaces facing
+        away from the sun are reading too dark/flat as a result); < 1.0
+        dims it.
+
+        Safe to call before OR after add_skybox/add_equirect_skybox (or
+        neither, or repeatedly, to re-tune) - always recomputes from
+        whatever base color is currently on file (the dim default gray
+        from __init__ if no skybox has been loaded yet at all), never
+        needs the skybox reloaded from disk just to change this."""
+        self.ambient_intensity = float(multiplier)
+        self._apply_ambient_intensity()
+
+    def enable_screen_space_reflections(self):
+        """Sets up real Screen-Space Reflections (SSR) - a per-frame
+        "grab" of the already-rendered opaque scene's own color+depth
+        (Scene._grab_scene_textures, called automatically from render()
+        once this is enabled), ray-marched by any static material with
+        water_overrides "reflection_mode": "ssr" (see add_static's own
+        docstring) to reflect whatever's ACTUALLY there - the "reflects
+        what's above it" mode, replacing an earlier mirrored-camera
+        planar-reflection approach that visibly swam/drifted as the
+        camera moved (a naive screen-space UV sample only lines up
+        correctly for a perfectly flat, screen-aligned mirror - it isn't
+        a real reflection technique on its own). SSR instead ray-marches
+        the MAIN camera's own depth buffer per reflective fragment - no
+        second camera, no assumption the reflective surface is even
+        flat, and it moves correctly with the camera because it IS the
+        camera's own view, just traced further along a bounced ray. This
+        is the standard, most common real-time approximation (used by
+        Unreal/Unity/etc.) short of full ray tracing - see pbr_shader.
+        py's own ssr_reflect for the actual view-space linear-march +
+        thickness-test + binary-refine algorithm.
+
+        No water_height (or any per-material plane assumption) needed
+        at all, unlike the old planar approach - SSR only ever needs
+        per-pixel depth, which every material contributes automatically.
+
+        Sized to match self.ctx.screen exactly (a grab-and-blit only,
+        not a full second scene render like planar reflection was - see
+        _grab_scene_textures) - no meaningful sharpness/performance
+        trade-off to expose here the way the old resolution param was.
+
+        Calling this again is safe (releases the old textures first) but
+        does nothing useful, since there's nothing left to reconfigure.
+        There is no way to fully disable this again short of building a
+        new Scene; nothing in this project currently needs that.
+
+        _ssr_fbo (color) and _ssr_depth_fbo (depth) are deliberately TWO
+        separate framebuffers, not one with both attachments - see
+        _grab_scene_textures/_render_ssr_depth_prepass's own comments
+        for why: depth is no longer obtained by blitting self.ctx.
+        screen's own depth buffer at all (confirmed as the actual cause
+        of SSR reading as the cheap skybox-only fallback on Intel
+        integrated graphics - see this method's git history for the
+        earlier, wrong "it's MSAA" theory this replaced once real
+        diagnostic data ruled it out: self.ctx.screen.samples was 0)."""
+        if self._ssr_fbo is not None:
+            self._ssr_fbo.release()
+        if self._ssr_depth_fbo is not None:
+            self._ssr_depth_fbo.release()
+        if self._ssr_color_texture is not None:
+            self._ssr_color_texture.release()
+        if self._ssr_depth_texture is not None:
+            self._ssr_depth_texture.release()
+
+        size = tuple(self.ctx.screen.size)
+        # 4 components (RGBA) - matches self.ctx.screen's own typical
+        # format (this texture's own copy_framebuffer SOURCE, see
+        # _grab_scene_textures) more closely than 3 (RGB) does, a real
+        # portability improvement in its own right even though it wasn't
+        # the actual root cause of the Intel bug this method's own
+        # docstring references (that turned out to be depth, not color -
+        # see below). The fragment shader already only ever reads .rgb
+        # back out of u_scene_color (see ssr_reflect), so the extra
+        # alpha channel here is otherwise unused.
+        self._ssr_color_texture = self.ctx.texture(size, 4)
+        self._ssr_color_texture.repeat_x = self._ssr_color_texture.repeat_y = False
+        self._ssr_color_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        # COLOR ONLY - no depth_attachment. self.ctx.screen's own depth
+        # buffer is never explicitly requested at a specific format
+        # (window.py's WindowManager sets no GL_DEPTH_SIZE attribute at
+        # all), so its ACTUAL format is whatever the driver negotiates -
+        # moderngl's own ctx.depth_texture() always creates a 32-bit
+        # FLOATING-POINT depth texture (confirmed via its own .dtype
+        # reading "f4"), which the window's default-framebuffer depth
+        # buffer can basically never match on Windows/WGL (a floating-
+        # point depth buffer for the DEFAULT framebuffer specifically
+        # isn't something standard pixel-format negotiation can even
+        # request - float depth is essentially an FBO-only feature in
+        # practice). glBlitFramebuffer requires an EXACT depth-format
+        # match; Nvidia/AMD's drivers were silently tolerating (or
+        # working around) that mismatch, Intel's driver correctly
+        # rejects it with GL_INVALID_OPERATION per spec - confirmed
+        # directly via this scene's own temporary SSR diagnostic log.
+        # Keeping this FBO color-only sidesteps the mismatch entirely:
+        # there's no depth attachment left for a color blit into it to
+        # ever need to touch.
+        self._ssr_fbo = self.ctx.framebuffer(color_attachments=[self._ssr_color_texture])
+
+        # Populated by a real camera-space depth-only RENDER
+        # (_render_ssr_depth_prepass) every frame instead of a blit from
+        # self.ctx.screen - see that method's own docstring. Still a
+        # moderngl-default (float32) depth texture; the ONLY thing that
+        # changes is HOW it gets filled in, not its own format, since
+        # there's no longer any cross-framebuffer format-matching
+        # requirement to satisfy at all once nothing is blit INTO it.
+        self._ssr_depth_texture = self.ctx.depth_texture(size)
+        self._ssr_depth_texture.repeat_x = self._ssr_depth_texture.repeat_y = False
+        self._ssr_depth_fbo = self.ctx.framebuffer(depth_attachment=self._ssr_depth_texture)
+        self._ssr_resolution = size
 
     # =============================================================
     # POINT LIGHTS
@@ -1402,6 +1924,53 @@ class Scene:
             ))
 
         return added
+
+    def _nearest_point_lights(self, position):
+        """Returns the MAX_POINT_LIGHTS entries of self.point_lights
+        closest to world-space `position`, nearest first - what a real-
+        time-lit draw call (a dynamic/skeletal object, or any static
+        object that somehow has no lightmap - see this method's own call
+        sites in _render_scene/_render_transparent_objects) actually
+        binds via bind_point_lights, instead of an arbitrary first-
+        MAX_POINT_LIGHTS slice by list/insertion order (what a single
+        frame-level bind_point_lights(self.pbr_program, self.
+        point_lights) call - still fine for STATIC lightmapped geometry,
+        which never reads these uniforms at all - would otherwise use
+        for EVERY real-time-lit object regardless of where it actually
+        is).
+
+        MAX_POINT_LIGHTS (pbr_shader.py's own real-time shader array
+        size, currently 4) is a hard, deliberate cap - NOT something to
+        just raise to cover however many lights a level actually has
+        (see pbr_shader.py's own module docstring: a larger per-light
+        uniform array previously caused a real "Constant register limit
+        exceeded" GLSL link error on some hardware once light counts
+        grew). Scene.bake_static_lighting is what lets STATIC geometry
+        see an unlimited number of lights despite this cap by baking
+        them instead; a dynamic/skeletal object has no such option (its
+        transform changes every frame, so nothing about its lighting can
+        be pre-baked) - the best a real-time draw can do within the cap
+        is make sure the few lights it DOES get are the ones that
+        actually matter for wherever it currently is. Confirmed as the
+        actual cause of dynamic/skeletal objects reading far less lit
+        than nearby static geometry in a scene with more point lights
+        than the cap (mainmap.glb has 11; without this, only the same
+        first 4 in file order were EVER used for any real-time draw all
+        game long, regardless of whether those 4 happened to be
+        anywhere near a given dynamic object).
+
+        No-op cost when there are MAX_POINT_LIGHTS or fewer lights in
+        the whole scene to begin with (returns self.point_lights as-is,
+        skipping the sort entirely) - only scenes that actually exceed
+        the cap pay for this at all."""
+        if len(self.point_lights) <= MAX_POINT_LIGHTS:
+            return self.point_lights
+
+        def _distance_sq(light):
+            delta = light["position"] - position
+            return glm.dot(delta, delta)
+
+        return sorted(self.point_lights, key=_distance_sq)[:MAX_POINT_LIGHTS]
 
     def mark_static_dirty(self):
         """No-op. Kept only so existing call sites like add_static() don't
@@ -1540,6 +2109,43 @@ class Scene:
 
         fbo.release()
         return depth_texture, light_vp
+
+    def _ensure_static_shadow_map(self):
+        """Builds this Scene's fixed, whole-level static-only shadow map
+        ONCE, then caches it - see this method's own call site in
+        _render_shadows. The camera-fit cascade set (self.shadow_manager)
+        is tightly re-fit to the camera's current view frustum every
+        frame (CascadedShadowMap.update), so
+        a texture rendered against one of THEIR light_mvps would go
+        stale/misaligned the instant the camera moves - nothing about
+        that scheme can be cached across frames. Static geometry itself
+        never moves though, so a separate, FIXED (camera-independent)
+        ortho volume covering the whole static scene, built once, gets
+        the same result the old per-frame "redraw every static object
+        into every cascade" approach did, at a fraction of the ongoing
+        cost - see Scene._render_shadows' own comment on dropping static
+        objects from that loop.
+
+        Reuses _bake_directional_shadow_map - the exact same fixed-
+        ortho-covering-the-whole-scene logic bake_static_lighting
+        already calls for the sun's OWN shadow-caster pass during
+        baking - just at a HIGHER resolution (self.
+        static_shadow_resolution, not whatever directional_shadow_
+        resolution a bake call used) since this one has to stand in for
+        a tightly-fit near cascade instead of just contributing to a
+        lightmap, and kept alive afterward here instead of released
+        once baking finishes.
+
+        No-op once already built, or if there's no static geometry yet -
+        e.g. called on the very first frame before this is a problem
+        (see this method's own call site: it runs at the top of every
+        _render_shadows call, but only ever does real work exactly
+        once)."""
+        if self._static_shadow_texture is not None or not self.static_objects:
+            return
+        self._static_shadow_texture, self._static_shadow_light_vp = (
+            self._bake_directional_shadow_map(self.static_shadow_resolution)
+        )
 
     def bake_static_lighting(self, lightmap_resolution=256, point_shadow_resolution=1024,
                               directional_shadow_resolution=2048):
@@ -1753,6 +2359,34 @@ class Scene:
             )
         directional_depth.release()
 
+        # Disabled BEFORE dilation, not after (see the old position of
+        # this same disable() call, just after the cache-save loop
+        # below) - GL_BLEND was left enabled additive (ONE, ONE) all the
+        # way from the point/directional light accumulation passes
+        # above, and dilate_lightmap's own ping-pong (see its own
+        # docstring) draws a fresh fullscreen quad into whichever of its
+        # two textures is currently the destination WITHOUT ever
+        # clearing it first between iterations - under leftover additive
+        # blending, each of its 6 iterations didn't overwrite that
+        # texture's previous contents (from 2 iterations ago, since it's
+        # a 2-way ping-pong) but ADDED on top of them, compounding real
+        # brightness growth across every already-correctly-lit interior
+        # texel too, not just the padding gap dilation is actually meant
+        # to fill - confirmed as the actual cause of baked lighting
+        # reading significantly brighter overall after dilation was
+        # added, independent of anything about the padding/margin
+        # amount itself (that stays exactly as tuned - only this leaked
+        # GL state was ever the bug).
+        self.ctx.disable(moderngl.BLEND)
+
+        # Dilate AFTER every light (points + sun) has been baked into
+        # each object's lightmap, and BEFORE the cache-save loop below -
+        # so a cached reload gets the already-dilated result too,
+        # without needing to redo this on every load. See lightmap_
+        # baker.py's dilate_lightmap for what/why.
+        for obj in eligible:
+            dilate_lightmap(self.ctx, self.dilate_program, self.dilate_quad_vao, obj["lightmap_texture"])
+
         for obj, path in zip(eligible, cache_paths):
             texture = obj["lightmap_texture"]
             width, height = texture.size
@@ -1766,7 +2400,6 @@ class Scene:
 
         print(f"[Scene] Baked and saved {len(eligible)} lightmap(s) to {self.lightmap_dir}")
 
-        self.ctx.disable(moderngl.BLEND)
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.screen.use()
         self.ctx.viewport = restore_viewport
@@ -1778,6 +2411,27 @@ class Scene:
     # =============================================================
 
     def _get_model_matrix(self, obj):
+        # Only ever set by add_static (right after building this exact
+        # dict, before it's appended to self.static_objects - see that
+        # method's own comment) - NOT something this method sets on
+        # itself for an arbitrary object, so there's no risk of handing
+        # back a stale matrix for something that can actually move: a
+        # dynamic object's position/rotation get overwritten every frame
+        # by Scene.update's own physics-sync loop, and a skeletal
+        # object's by PlayerModel.update/RemotePlayer.update_transform -
+        # neither of those ever sets this key, so both always fall
+        # through to a live recompute below regardless. Static geometry
+        # has no such mutator anywhere in the codebase once add_static
+        # returns, so precomputing this ONCE there and just returning
+        # the same glm.mat4 every frame after is exactly equivalent to
+        # recomputing it live - confirmed as a real, avoidable per-
+        # object-per-frame cost (glm.translate/rotate x3/scale, each a
+        # real Python/C++ binding call) for however many separate static
+        # mesh groups a level actually has.
+        cached = obj.get("_cached_model_matrix")
+        if cached is not None:
+            return cached
+
         if "transform" in obj:
             return glm.mat4(obj["transform"])
 
@@ -1926,36 +2580,92 @@ class Scene:
             yield
         self._profile_samples[label] = self._profile_samples.get(label, 0) + query.elapsed
 
-    def _report_profile_window(self):
-        """Called once per frame from render() - counts frames and, every
-        _PROFILE_RENDER_WINDOW_FRAMES of them, prints every label from
-        self._profile_samples sorted most-expensive-first (total
-        milliseconds across the whole window, and the per-frame average -
-        the average is usually the more directly useful number, e.g. "is
-        THIS mesh alone costing 2ms of the 16.6ms budget for 60fps"),
-        then resets for the next window. A no-op entirely while
-        PROFILE_RENDER is off."""
-        if not PROFILE_RENDER:
+    # def _report_profile_window(self):
+    #     """Called once per frame from render() - counts frames and, every
+    #     _PROFILE_RENDER_WINDOW_FRAMES of them, prints every label from
+    #     self._profile_samples sorted most-expensive-first (total
+    #     milliseconds across the whole window, and the per-frame average -
+    #     the average is usually the more directly useful number, e.g. "is
+    #     THIS mesh alone costing 2ms of the 16.6ms budget for 60fps"),
+    #     then resets for the next window. A no-op entirely while
+    #     PROFILE_RENDER is off."""
+    #     if not PROFILE_RENDER:
+    #         return
+    #     self._profile_frame_count += 1
+    #     if self._profile_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
+    #         return
+
+    #     frames = self._profile_frame_count
+    #     ranked = sorted(self._profile_samples.items(), key=lambda kv: kv[1], reverse=True)
+    #     print(f"[render profile] over the last {frames} frame(s):")
+    #     for label, total_ns in ranked:
+    #         total_ms = total_ns / 1_000_000.0
+    #         print(f"  {label:40s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
+
+    #     self._profile_samples = {}
+    #     self._profile_frame_count = 0
+
+    @contextlib.contextmanager
+    def _profiled_cpu(self, label):
+        """CPU wall-clock companion to _profiled above - see PROFILE_
+        RENDER_CPU's own module-level comment for why this exists as a
+        separate thing (GPU timer queries measure execution time, not
+        the Python-side cost of issuing the calls in the first place).
+        Same accumulate-then-report shape, module-level dict/counter
+        instead of per-Scene-instance ones since app.py's own
+        _profiled_cpu already established that pattern and there's no
+        strong reason for this one to differ. No-op when PROFILE_RENDER_
+        CPU is off."""
+        if not PROFILE_RENDER_CPU:
+            yield
             return
-        self._profile_frame_count += 1
-        if self._profile_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
+        start = time.perf_counter()
+        yield
+        elapsed = time.perf_counter() - start
+        global _render_cpu_samples
+        _render_cpu_samples[label] = _render_cpu_samples.get(label, 0.0) + elapsed
+
+    def _report_render_cpu_profile_window(self):
+        """Mirrors _report_profile_window exactly, for the CPU-side
+        accumulator above instead of the GPU one - see PROFILE_RENDER_
+        CPU's own comment."""
+        global _render_cpu_frame_count, _render_cpu_samples
+        if not PROFILE_RENDER_CPU:
+            return
+        _render_cpu_frame_count += 1
+        if _render_cpu_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
             return
 
-        frames = self._profile_frame_count
-        ranked = sorted(self._profile_samples.items(), key=lambda kv: kv[1], reverse=True)
-        print(f"[render profile] over the last {frames} frame(s):")
-        for label, total_ns in ranked:
-            total_ms = total_ns / 1_000_000.0
-            print(f"  {label:40s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
+        frames = _render_cpu_frame_count
+        ranked = sorted(_render_cpu_samples.items(), key=lambda kv: kv[1], reverse=True)
+        print(f"[render cpu profile] over the last {frames} frame(s):")
+        for label, total_s in ranked:
+            total_ms = total_s * 1000.0
+            print(f"  {label:20s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
 
-        self._profile_samples = {}
-        self._profile_frame_count = 0
+        _render_cpu_samples = {}
+        _render_cpu_frame_count = 0
 
     # =============================================================
     # UPDATE
     # =============================================================
 
     def update(self, dt):
+        # A plain running clock, seconds - the ONLY thing that drives a
+        # water material's animated dual-layer normal pan (see pbr_
+        # shader.py's u_time/MaterialBlock's own u_normal_pan1_speed/
+        # u_normal_pan2_speed comments) - wrapped well before float32
+        # precision would start to matter (a uniform this size loses
+        # sub-millisecond precision past a few hours; wrapping resets
+        # that budget long before it's ever reached, and pan_speed*time
+        # modulo a period only ever discontinuously JUMPS the visible
+        # scroll phase at the wrap instant if a material's own pan speed
+        # doesn't evenly divide the period - 3600s is comfortably long
+        # enough that this is once-an-hour at worst and imperceptible
+        # for any sane pan speed).
+        self._elapsed_time = (self._elapsed_time + dt) % 3600.0
+        self._frame_count = (self._frame_count + 1) % 1000
+
         # Step collision/physics first so this frame's dynamic-object
         # sync below (and any CharacterController.get_position() calls
         # the caller makes after this) reflect where things just moved.
@@ -2181,15 +2891,21 @@ class Scene:
             self.shadow_program["u_base_alpha"].value = float(obj.get("base_alpha", 1.0))
 
     def _render_shadows(self, camera):
+        # Captured before _ensure_static_shadow_map (which sets its own
+        # temporary viewport for its one-time bake pass and doesn't
+        # restore it) - has to reflect the real screen viewport, not
+        # whatever that lazy build leaves behind on the one frame it
+        # actually runs.
+        old_viewport = self.ctx.viewport
+
+        self._ensure_static_shadow_map()
+
         self.shadow_manager.update(camera, self.light_dir)
-        self.movable_shadow_manager.update(camera, self.light_dir)
 
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = "<="
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "front"
-
-        old_viewport = self.ctx.viewport
 
         resolution = self.shadow_manager.resolution
         for cascade in range(self.shadow_manager.num_cascades):
@@ -2200,43 +2916,26 @@ class Scene:
             self.ctx.viewport = (0, 0, resolution, resolution)
             framebuffer.clear(depth=1.0)
 
-            # Static and dynamic objects share the same (non-skinned)
-            # shadow program, so they're drawn the same way here. This
-            # set includes EVERY caster (static included) - see pbr_
-            # shader.py's TEX_UNIT_MOVABLE_SHADOW_START comment for why
-            # a static surface never actually samples this one back
-            # (only a moving object's own real-time shading does, so it
-            # stays correctly shadowed by static geometry).
-            for obj in (*self.static_objects, *self.dynamic_objects):
-                light_mvp = light_vp * self._get_model_matrix(obj)
-                self.shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
-                self._bind_shadow_alpha(obj)
-                obj["shadow_vao"].render()
-
-            for obj in self.skeletal_objects:
-                if not obj.get("cast_shadow", True):
-                    continue
-                light_mvp = light_vp * self._get_model_matrix(obj)
-                self.skeletal_shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
-                bind_bone_matrices(obj)
-                obj["shadow_vao"].render()
-
-        # Second pass: the SAME dynamic/skeletal objects again, this
-        # time into movable_shadow_manager's own cascades, with static
-        # geometry deliberately left out entirely - this is the set a
-        # static/lightmapped surface samples (see pbr_shader.py's
-        # main()/calculate_movable_shadow), so a static occluder must
-        # never appear in it or a static wall would shadow a static
-        # floor a second time on top of its own already-baked shadow.
-        movable_resolution = self.movable_shadow_manager.resolution
-        for cascade in range(self.movable_shadow_manager.num_cascades):
-            framebuffer = self.movable_shadow_manager.framebuffers[cascade]
-            light_vp = self.movable_shadow_manager.light_mvps[cascade]
-
-            framebuffer.use()
-            self.ctx.viewport = (0, 0, movable_resolution, movable_resolution)
-            framebuffer.clear(depth=1.0)
-
+            # Dynamic/skeletal objects only, NOT static (see this
+            # cascade set's own comment where it's constructed in
+            # __init__) - static geometry's own shadow contribution now
+            # comes from self._static_shadow_texture instead (combined
+            # in via calculate_shadow's own max()), a single fixed map
+            # built once rather than every static object being redrawn
+            # into this camera-fit cascade every single frame regardless
+            # of whether the camera or the static geometry actually
+            # changed - confirmed as a real, avoidable per-frame cost
+            # for even a simple test map.
+            #
+            # This single pass now also stands in for what used to be a
+            # SECOND, separate cascade render here (into a "movable_
+            # shadow_manager" of its own) - that second pass drew this
+            # exact same dynamic/skeletal content, camera-fit the exact
+            # same way, into a second texture set for no actual
+            # difference (see this Scene's own shadow_manager comment in
+            # __init__), so bind_frame_uniforms' own shadow_manager AND
+            # movable_shadow_manager params are both fed this one
+            # manager now instead.
             for obj in self.dynamic_objects:
                 light_mvp = light_vp * self._get_model_matrix(obj)
                 self.shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
@@ -2263,6 +2962,167 @@ class Scene:
     # PBR PASS
     # =============================================================
 
+    def _grab_scene_textures(self, camera):
+        """Populates SSR's two per-frame inputs for pbr_shader.py's
+        ssr_reflect (see enable_screen_space_reflections) - self.
+        _ssr_color_texture (a straight GPU-side blit of self.ctx.
+        screen's just-rendered opaque color - color-only now, see
+        enable_screen_space_reflections' own docstring for why depth
+        is deliberately NOT blit from self.ctx.screen alongside it any
+        more) and self._ssr_depth_texture (populated by a real depth-
+        only re-render instead - see _render_ssr_depth_prepass).
+        No-op if SSR was never enabled this scene (self._ssr_fbo is
+        None) - render() only calls this at all in that case to begin
+        with, so this guard is just defensive.
+
+        Called AFTER the main _render_scene pass (so there's something
+        real to grab) and BEFORE _render_ssr_pass (which needs both of
+        these) - see render()'s own ordering."""
+        if self._ssr_fbo is None:
+            return
+        self.ctx.copy_framebuffer(self._ssr_fbo, self.ctx.screen)
+        self._render_ssr_depth_prepass(camera)
+
+    def _render_ssr_depth_prepass(self, camera):
+        """Renders a real camera-space depth-only pass of every opaque/
+        MASK object into self._ssr_depth_texture (via self.
+        _ssr_depth_fbo) - what pbr_shader.py's ssr_reflect ray-marches
+        against. Replaces what used to be a blit of self.ctx.screen's
+        own depth buffer straight into an SSR-owned depth texture -
+        confirmed via this Scene's own temporary SSR diagnostic log
+        (see enable_screen_space_reflections' own docstring) that this
+        blit reliably raised GL_INVALID_OPERATION on Intel integrated
+        graphics: moderngl's ctx.depth_texture() always creates a 32-bit
+        FLOATING-POINT depth texture, and self.ctx.screen's own depth
+        buffer - never given an explicit format request by window.py's
+        WindowManager - gets whatever the driver negotiates for the
+        DEFAULT framebuffer, which is essentially never floating-point
+        on Windows/WGL (that's practically an FBO-only feature) -
+        glBlitFramebuffer requires an EXACT depth-format match, so
+        Intel's (correctly spec-conformant) driver rejects the blit
+        outright where Nvidia/AMD's more permissive ones didn't. A real
+        render sidesteps the whole problem: this texture's format is
+        entirely self-consistent (moderngl picked it, moderngl reads
+        it back, no cross-framebuffer format negotiation involved at
+        all), at the cost of one extra depth-only redraw of the opaque
+        scene per frame - the exact same cost class as one more shadow
+        cascade (see _render_shadows, which this closely mirrors:
+        same shadow_program/skeletal_shadow_program, same "shadow_vao"
+        per object, just the CAMERA's own view_proj instead of a
+        light's light_mvp, and one fixed view instead of several
+        cascades).
+
+        Must match EXACTLY what _render_scene actually wrote into self.
+        ctx.screen's own depth buffer this frame, or SSR would ray-
+        march against a depth surface that doesn't match what's really
+        on screen: a BLEND object (water) is excluded, same as _render_
+        scene's own main loop never writing depth for one either (see
+        that method's own alpha_mode comment) - including the water's
+        own depth here would otherwise make its own reflection ray
+        immediately self-intersect at distance ~0. A skeletal object
+        with visible_in_color=False (the local player's own first-
+        person-invisible body) is excluded too, for the same "match
+        what _render_scene actually drew" reason - see that method's
+        own skeletal loop, which skips it identically."""
+        if self._ssr_depth_fbo is None:
+            return
+
+        self._ssr_depth_fbo.use()
+        self._ssr_depth_fbo.clear(depth=1.0)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.depth_func = "<"
+        # No culling - same reasoning as _bake_directional_shadow_map's
+        # own shadow-caster pass (a thin, single-sided wall would
+        # otherwise vanish from this depth-only pass entirely on
+        # whichever side gets culled).
+        self.ctx.disable(moderngl.CULL_FACE)
+
+        view_proj = camera.get_projection_matrix() * camera.get_view_matrix()
+
+        for obj in (*self.static_objects, *self.dynamic_objects):
+            if obj.get("alpha_mode") == "BLEND":
+                continue
+            mvp = view_proj * self._get_model_matrix(obj)
+            self.shadow_program["u_light_mvp"].write(mvp.to_bytes())
+            self._bind_shadow_alpha(obj)
+            obj["shadow_vao"].render()
+
+        for obj in self.skeletal_objects:
+            if not obj.get("visible_in_color", True):
+                continue
+            mvp = view_proj * self._get_model_matrix(obj)
+            self.skeletal_shadow_program["u_light_mvp"].write(mvp.to_bytes())
+            bind_bone_matrices(obj)
+            obj["shadow_vao"].render()
+
+        self.ctx.screen.use()
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.cull_face = "back"
+
+    def _render_ssr_pass(self, camera):
+        """Redraws ONLY the OPAQUE/MASK static objects whose material has
+        water_overrides "reflection_mode": "ssr" (see add_static's own
+        docstring), a second time, now with the just-grabbed scene
+        color+depth (_grab_scene_textures) bound so pbr_shader.py's
+        ssr_reflect can actually ray-march real geometry instead of
+        falling back to the plain skybox (which is all the FIRST,
+        main _render_scene pass could do - no grab exists yet that
+        early). Depth func <= (not the normal <) so this redraw passes
+        the depth test at the EXACT same depth the first pass already
+        wrote for this exact geometry, cleanly overwriting just those
+        pixels rather than needing a separate stencil/mask to target
+        them. No-op if SSR was never enabled, or no static object
+        actually uses it (the common case for most scenes, including
+        ones that never touch this feature at all).
+
+        BLEND objects are deliberately excluded here (unlike the OPAQUE/
+        MASK ones this redraws) - they were never drawn by the main
+        _render_scene pass to begin with (see its own alpha_mode
+        comment), so there's no earlier opaque draw of them at this
+        exact depth to overwrite; _render_transparent_objects handles
+        their own SSR-reflected draw instead, later in the frame, with
+        real alpha blending enabled - see that method's own comment."""
+        if self._ssr_fbo is None:
+            return
+        ssr_objects = [
+            o for o in self.static_objects
+            if o.get("reflection_mode") == "ssr" and o.get("alpha_mode") != "BLEND"
+        ]
+        if not ssr_objects:
+            return
+
+        self.ctx.screen.use()
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.depth_func = "<="
+        self.ctx.enable(moderngl.CULL_FACE)
+
+        bind_point_lights(self.pbr_program, self.point_lights)
+        bind_environment(self.pbr_program, self.environment_sky_color, self.environment_ground_color)
+        bind_reflection_environment(
+            self.pbr_program, self.equirect_skybox_texture,
+            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
+        )
+        bind_ssr_textures(self.pbr_program, self._ssr_color_texture, self._ssr_depth_texture)
+        active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
+        view_proj = bind_frame_uniforms(
+            self.pbr_program, camera, self.light_dir, active_shadow_manager,
+            light_color=self.light_color, light_intensity=self.light_intensity,
+            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
+            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
+            static_shadow_light_vp=self._static_shadow_light_vp,
+        )
+        for obj in ssr_objects:
+            if obj.get("double_sided"):
+                self.ctx.disable(moderngl.CULL_FACE)
+            else:
+                self.ctx.enable(moderngl.CULL_FACE)
+                self.ctx.cull_face = "back"
+            model_matrix = self._get_model_matrix(obj)
+            bind_material(self.pbr_program, obj, model_matrix, view_proj)
+            obj["vao"].render()
+
+        self.ctx.depth_func = "<"
+
     def _render_scene(self, camera):
         self.ctx.screen.use()
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -2280,6 +3140,21 @@ class Scene:
         bind_point_lights(self.skeletal_program, self.point_lights)
         bind_environment(self.pbr_program, self.environment_sky_color, self.environment_ground_color)
         bind_environment(self.skeletal_program, self.environment_sky_color, self.environment_ground_color)
+        bind_reflection_environment(
+            self.pbr_program, self.equirect_skybox_texture,
+            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
+        )
+        bind_reflection_environment(
+            self.skeletal_program, self.equirect_skybox_texture,
+            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
+        )
+        # No scene grab exists yet this early in the frame (this IS the
+        # pass that produces one - see _grab_scene_textures/_render_ssr_
+        # pass, called AFTER this) - an "ssr" material just falls back
+        # to the plain skybox reflection on THIS draw; _render_ssr_pass
+        # redraws it a second time, afterward, with the real thing.
+        bind_ssr_textures(self.pbr_program, None, None)
+        bind_ssr_textures(self.skeletal_program, None, None)
         # view/light/shadow uniforms are identical for every object this
         # frame too (same camera, same sun, same shadow cascades) - bound
         # once per program here rather than inside the loops below (see
@@ -2287,16 +3162,19 @@ class Scene:
         # bind_material can cheaply build u_mvp per object without
         # re-deriving the camera's view/projection matrices every draw.
         active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
-        active_movable_shadow_manager = self.movable_shadow_manager if ENABLE_SHADOWS else None
         pbr_view_proj = bind_frame_uniforms(
             self.pbr_program, camera, self.light_dir, active_shadow_manager,
             light_color=self.light_color, light_intensity=self.light_intensity,
-            movable_shadow_manager=active_movable_shadow_manager
+            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
+            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
+            static_shadow_light_vp=self._static_shadow_light_vp,
         )
         skeletal_view_proj = bind_frame_uniforms(
             self.skeletal_program, camera, self.light_dir, active_shadow_manager,
             light_color=self.light_color, light_intensity=self.light_intensity,
-            movable_shadow_manager=active_movable_shadow_manager
+            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
+            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
+            static_shadow_light_vp=self._static_shadow_light_vp,
         )
 
         # Split by alpha_mode (see model_loader.py's _extract_material/
@@ -2341,11 +3219,29 @@ class Scene:
                 # surfaces don't write depth).
                 blended_objects.append((obj, movable))
                 continue
-            if obj.get("alpha_mode") == "MASK":
+            if obj.get("alpha_mode") == "MASK" or obj.get("double_sided"):
+                # double_sided (glTF's own flag, independent of
+                # alpha_mode - see model_loader.py's _build_mesh_data)
+                # covers an OPAQUE material that still wants both sides
+                # rendered, e.g. a water plane authored to be seen from
+                # above and below - MASK already renders double-sided
+                # unconditionally regardless of this flag, so either
+                # condition alone is enough to skip culling.
                 self.ctx.disable(moderngl.CULL_FACE)
             else:
                 self.ctx.enable(moderngl.CULL_FACE)
                 self.ctx.cull_face = "back"
+            # A lightmapped object never reads u_point_lights at all (see
+            # pbr_shader.py's own u_has_lightmap branch), so the once-
+            # per-frame bind above this loop is already correct/ignored
+            # for it - only a movable (dynamic) object, or a static one
+            # that somehow has no lightmap texture (bake_static_lighting
+            # not yet run, or excluded from it), actually needs its OWN
+            # nearest-lights rebind here (see _nearest_point_lights' own
+            # docstring for why "nearest to THIS object" instead of
+            # whatever the frame-level call left bound).
+            if movable or not obj.get("lightmap_texture"):
+                bind_point_lights(self.pbr_program, self._nearest_point_lights(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
             bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
             with self._profiled(f"{prefix}:{obj.get('name', '?')}"):
@@ -2355,7 +3251,8 @@ class Scene:
         # currently renders fully opaque/back-face-culled regardless of
         # alpha_mode (skeletal_loader.py's own pipeline doesn't extract
         # one at all yet), so it needs this project's normal default
-        # state, not whatever the static/dynamic loop above left behind.
+        # state, not whatever a MASK/double_sided static object mid-loop
+        # left CULL_FACE disabled as.
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "back"
 
@@ -2363,6 +3260,14 @@ class Scene:
             if not obj.get("visible_in_color", True):
                 continue
             model_matrix = self._get_model_matrix(obj)
+
+            # Skeletal objects have no lightmapping pipeline at all (see
+            # the CULL_FACE comment just above) - always real-time-lit,
+            # so unlike the static/dynamic loop above this isn't
+            # conditional: every skeletal object needs its OWN nearest-
+            # lights rebind, not whatever the frame-level call (or the
+            # previous skeletal object's own rebind) left bound.
+            bind_point_lights(self.skeletal_program, self._nearest_point_lights(obj["position"]))
 
             # bind_material is fully generic on prog - reused as-is here
             # rather than duplicating a "bind_skeletal_material":
@@ -2465,16 +3370,47 @@ class Scene:
         self.ctx.disable(moderngl.CULL_FACE)
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        # Explicitly (re-)bound here, not left to whatever _render_scene/
+        # _render_ssr_pass happened to leave on self.pbr_program earlier
+        # this same frame - a BLEND material (e.g. transparent water)
+        # with reflection_mode="ssr" needs the real grabbed color/depth
+        # bound for its own env_reflection block to do anything but fall
+        # back to the cheap skybox path (see ssr_reflect's own u_has_
+        # scene_grab check) - relying on _render_ssr_pass's own call to
+        # have already set this correctly would silently break the
+        # moment its own ssr_objects list happened to be empty (e.g. a
+        # scene whose ONLY "ssr" material is this BLEND one), since that
+        # method returns early without touching these uniforms at all in
+        # that case.
+        bind_reflection_environment(
+            self.pbr_program, self.equirect_skybox_texture,
+            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
+        )
+        bind_ssr_textures(self.pbr_program, self._ssr_color_texture, self._ssr_depth_texture)
         # Called once for this whole pass, not per object - see
         # bind_frame_uniforms' own docstring (same reasoning _render_
         # scene already applies to its own static/dynamic/skeletal
-        # loops).
+        # loops). time/near/far/frame added for the same reason as the
+        # reflection/SSR binding above - a BLEND water material's own
+        # animated normal pan (u_time) and SSR ray march (u_near/u_far)
+        # need these to be genuinely fresh for THIS pass, not whatever
+        # an earlier pass happened to leave behind.
+        blend_active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
         blend_view_proj = bind_frame_uniforms(
-            self.pbr_program, camera, self.light_dir, self.shadow_manager if ENABLE_SHADOWS else None,
+            self.pbr_program, camera, self.light_dir, blend_active_shadow_manager,
             light_color=self.light_color, light_intensity=self.light_intensity,
-            movable_shadow_manager=self.movable_shadow_manager if ENABLE_SHADOWS else None
+            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
+            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
+            static_shadow_light_vp=self._static_shadow_light_vp,
         )
         for obj, _movable in blended_objects:
+            # BLEND objects are never lightmapped (see add_static's own
+            # alpha_mode_overrides docstring - baking assumes opaque,
+            # static-lit geometry), so unlike _render_scene's own static/
+            # dynamic loop this isn't conditional on movable/lightmap -
+            # every one of these always needs its own nearest-lights
+            # rebind, same as the skeletal loop above.
+            bind_point_lights(self.pbr_program, self._nearest_point_lights(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
             bind_material(self.pbr_program, obj, model_matrix, blend_view_proj)
             with self._profiled(f"blend:{obj.get('name', '?')}"):
@@ -2494,30 +3430,49 @@ class Scene:
 
     def render(self, camera, prog=None):
         if ENABLE_SHADOWS:
-            with self._profiled("shadows"):
+            with self._profiled("shadows"), self._profiled_cpu("shadows"):
                 self._render_shadows(camera)
-        blended_objects = self._render_scene(camera)
+        with self._profiled_cpu("main_scene"):
+            blended_objects = self._render_scene(camera)
 
         if self.skybox_textures is not None:
-            with self._profiled("skybox"):
+            with self._profiled("skybox"), self._profiled_cpu("skybox"):
                 render_skybox(
                     self.ctx, self.skybox_program, self.skybox_vao, self.skybox_textures,
                     self.skybox_average_colors, camera, edge_fade=self.skybox_edge_fade
                 )
 
         if self.equirect_skybox_texture is not None:
-            with self._profiled("equirect_skybox"):
+            with self._profiled("equirect_skybox"), self._profiled_cpu("equirect_skybox"):
                 render_equirect_skybox(
                     self.ctx, self.equirect_skybox_program, self.equirect_skybox_vao,
                     self.equirect_skybox_texture, camera, exposure=self.equirect_exposure,
                     apply_tonemap=self.equirect_is_hdr
                 )
 
-        # AFTER the skybox specifically - see _render_transparent_
-        # objects' own docstring for exactly why that order matters.
-        self._render_transparent_objects(camera, blended_objects)
+        # AFTER the skybox specifically, same reasoning SSR itself is
+        # placed here for: the just-grabbed color/depth (see _grab_
+        # scene_textures) needs the sky already filled in, or an SSR ray
+        # that reaches open sky would grab a stale/cleared background
+        # instead of an actual reflected sky. No-ops (see their own
+        # docstrings) if enable_screen_space_reflections was never
+        # called this scene, or no static object actually uses
+        # "reflection_mode": "ssr" - free for every scene/material that
+        # doesn't touch this feature at all.
+        with self._profiled("ssr"), self._profiled_cpu("ssr"):
+            self._grab_scene_textures(camera)
+            self._render_ssr_pass(camera)
 
-        self._report_profile_window()
+        # AFTER the skybox (and the SSR redraw above, which needs to be
+        # the LAST thing to touch water's own opaque pixels before
+        # anything transparent composites on top of them) - see _render_
+        # transparent_objects' own docstring for exactly why the skybox
+        # part of this order matters.
+        with self._profiled_cpu("transparent"):
+            self._render_transparent_objects(camera, blended_objects)
+
+        # self._report_profile_window()
+        # self._report_render_cpu_profile_window()
 
     # =============================================================
     # DESTROY
@@ -2542,22 +3497,18 @@ class Scene:
                 pass
             self.shadow_manager = None
 
-        if self.movable_shadow_manager is not None:
-            try:
-                self.movable_shadow_manager.destroy()
-            except Exception:
-                pass
-            self.movable_shadow_manager = None
-
         # Every other GL program/VAO/VBO/texture the Scene itself owns
         # (as opposed to per-object resources, released above) follows
         # the same release-then-clear pattern, so it's just a loop.
         program_and_buffer_attrs = (
             "pbr_program", "shadow_program", "bake_program",
+            "dilate_program", "dilate_quad_vao", "dilate_quad_vbo",
             "skeletal_program", "skeletal_shadow_program",
             "skybox_program", "skybox_vao", "skybox_vbo",
             "equirect_skybox_program", "equirect_skybox_texture",
             "equirect_skybox_vao", "equirect_skybox_vbo",
+            "_ssr_fbo", "_ssr_depth_fbo", "_ssr_color_texture", "_ssr_depth_texture",
+            "_static_shadow_texture",
         )
         for attr in program_and_buffer_attrs:
             _release(getattr(self, attr))
@@ -2584,6 +3535,6 @@ class Scene:
     def _release_object(self, obj):
         for key in (
             "vao", "shadow_vao", "lightmap_vao", "lightmap_texture",
-            "texture", "metallic_roughness_texture", "_material_ubo",
+            "texture", "metallic_roughness_texture", "normal_texture", "_material_ubo",
         ):
             _release(obj.get(key))

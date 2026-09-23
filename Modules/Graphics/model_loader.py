@@ -101,6 +101,86 @@ def _compute_uvs(mesh, vertex_count):
         uvs[:, 1] = 1.0 - uvs[:, 1]
     return uvs
 
+def _compute_tangents(vertices, normals, uvs, faces):
+    """Per-vertex tangent space for normal mapping - a (len(vertices), 4)
+    float32 array, xyz = tangent, w = handedness (+-1, see below) -
+    ready to upload as a vec4 in_tangent vertex attribute (pbr_shader.py
+    reconstructs the bitangent in the fragment shader as cross(N, T) * w,
+    the standard glTF convention, rather than uploading a full 9-float
+    TBN or a separate bitangent attribute).
+
+    Standard per-triangle accumulation (Lengyel's method): for each
+    triangle, solve for the tangent/bitangent directions that would
+    reproduce its own edge vectors from its own UV deltas, then sum that
+    onto each of its 3 vertices (shared vertices end up averaged across
+    every triangle touching them, same spirit as vertex normal
+    smoothing) before normalizing. This SMOOTH per-vertex result (not a
+    per-fragment screen-space-derivative reconstruction, which was tried
+    first here and produces a piecewise-constant basis per triangle,
+    visibly discontinuous at every triangle edge - confirmed as the
+    actual cause of visible seam lines on a normal-mapped surface) is
+    what pbr_shader.py's vertex shader interpolates smoothly across a
+    triangle exactly the way vertex normals already are.
+
+    normals here must already be this mesh's final PER-VERTEX normals
+    (post-smoothing/recompute - see _get_vertex_normals) - each
+    accumulated tangent is Gram-Schmidt orthogonalized against ITS OWN
+    vertex's normal, not re-derived from geometry, so tangent and normal
+    are always perpendicular even where a smoothed normal doesn't
+    exactly match any one triangle's own face normal."""
+    v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
+    uv0, uv1, uv2 = uvs[faces[:, 0]], uvs[faces[:, 1]], uvs[faces[:, 2]]
+
+    edge1, edge2 = v1 - v0, v2 - v0
+    duv1, duv2 = uv1 - uv0, uv2 - uv0
+
+    denom = duv1[:, 0] * duv2[:, 1] - duv2[:, 0] * duv1[:, 1]
+    # A zero-area UV triangle (degenerate/duplicate UVs) has no defined
+    # tangent direction - f=0 makes it contribute nothing to its 3
+    # vertices' accumulation rather than dividing by zero into NaN/Inf.
+    f = np.where(np.abs(denom) > 1e-12, 1.0 / np.where(denom == 0, 1.0, denom), 0.0)
+
+    tri_tangent = f[:, None] * (duv2[:, 1:2] * edge1 - duv1[:, 1:2] * edge2)
+    tri_bitangent = f[:, None] * (duv1[:, 0:1] * edge2 - duv2[:, 0:1] * edge1)
+
+    tangent_accum = np.zeros_like(vertices)
+    bitangent_accum = np.zeros_like(vertices)
+    for i in range(3):
+        np.add.at(tangent_accum, faces[:, i], tri_tangent)
+        np.add.at(bitangent_accum, faces[:, i], tri_bitangent)
+
+    n_dot_t = np.sum(normals * tangent_accum, axis=1, keepdims=True)
+    tangent = tangent_accum - normals * n_dot_t
+    lengths = np.linalg.norm(tangent, axis=1, keepdims=True)
+
+    # A vertex whose accumulated tangent came out (near-)zero (every
+    # triangle touching it was degenerate above) falls back to an
+    # arbitrary axis perpendicular to its normal, picking whichever of
+    # two candidate world axes isn't nearly parallel to that normal so
+    # the Gram-Schmidt below doesn't itself collapse to ~zero.
+    use_alt = np.abs(normals[:, 0]) > 0.9
+    fallback = np.where(
+        use_alt[:, None],
+        np.array([0.0, 0.0, 1.0], dtype="f4"),
+        np.array([1.0, 0.0, 0.0], dtype="f4"),
+    )
+    fallback = fallback - normals * np.sum(normals * fallback, axis=1, keepdims=True)
+    fallback /= np.maximum(np.linalg.norm(fallback, axis=1, keepdims=True), 1e-8)
+
+    safe = lengths[:, 0] > 1e-8
+    tangent = np.where(safe[:, None], tangent / np.maximum(lengths, 1e-8), fallback)
+
+    # Handedness: whether the ACTUAL accumulated bitangent direction
+    # agrees with cross(N, T) or opposes it - needed so a mirrored UV
+    # island (common in real authored assets - e.g. one UV-mirrored half
+    # of a symmetric model) still perturbs the normal in the visually
+    # correct direction rather than inverted on that half.
+    handedness = np.where(
+        np.sum(np.cross(normals, tangent) * bitangent_accum, axis=1) < 0.0, -1.0, 1.0
+    ).astype("f4")
+
+    return np.concatenate([tangent.astype("f4"), handedness[:, None]], axis=1)
+
 def _normalize_color(values):
     col = np.asarray(values[:3], dtype="f4")
     return col / (255.0 if np.max(col) > 1.0 else 1.0)
@@ -234,7 +314,23 @@ def _read_raw_gltf_material_factors(path):
                          # omitted entirely; alphaCutoff's is 0.5,
                          # meaningful only for MASK.
                          "alphaMode": getattr(m, "alphaMode", None) or "OPAQUE",
-                         "alphaCutoff": getattr(m, "alphaCutoff", None)}
+                         "alphaCutoff": getattr(m, "alphaCutoff", None),
+                         # Same story as alphaMode/alphaCutoff above -
+                         # trimesh's own material wrapper doesn't surface
+                         # this either, straight from the raw glTF. glTF
+                         # spec default is False when omitted.
+                         "doubleSided": bool(getattr(m, "doubleSided", False)),
+                         # normalTexture.scale - trimesh's own material
+                         # wrapper flattens normalTexture straight down
+                         # to a bare PIL image (see _extract_material),
+                         # dropping this factor entirely, so it's read
+                         # from the raw glTF like the others above. glTF
+                         # spec default is 1.0 (no extra intensity scale)
+                         # when the texture reference is present but this
+                         # field is omitted.
+                         "normalScale": (
+                             getattr(m.normalTexture, "scale", None) if m.normalTexture else None
+                         )}
                 for m in (gltf.materials or [])}
     except Exception:
         return {}
@@ -256,11 +352,14 @@ def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
     over - once per program - for only one of those three to ever
     sample them)."""
     base_color, metallic, roughness, emissive = np.array([0.8, 0.8, 0.8], dtype="f4"), 1.0, 1.0, np.zeros(3, dtype="f4")
-    base_alpha, alpha_mode, alpha_cutoff = 1.0, "OPAQUE", 0.5
+    base_alpha, alpha_mode, alpha_cutoff, double_sided, normal_scale = 1.0, "OPAQUE", 0.5, False, 1.0
     mat = getattr(mesh.visual, "material", None)
-    if mat is None: return base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, None, None
+    if mat is None:
+        return (base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
+                double_sided, normal_scale, None, None, None)
     if not load_textures:
-        return base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, None, None
+        return (base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
+                double_sided, normal_scale, None, None, None)
 
     for attr in ("main_color", "baseColorFactor", "diffuse"):
         val = getattr(mat, attr, None)
@@ -297,6 +396,17 @@ def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
     if file_factors.get("alphaCutoff") is not None:
         try: alpha_cutoff = float(file_factors["alphaCutoff"])
         except (TypeError, ValueError): pass
+    # doubleSided only ever comes from the raw glTF read too, same
+    # reasoning as alphaMode/alphaCutoff above - Scene._render_scene
+    # reads this back (see this function's own return value and _build_
+    # mesh_data's "double_sided" key) to skip back-face culling for an
+    # otherwise-OPAQUE material that explicitly opts into double-sided
+    # rendering (e.g. a water plane meant to be seen from both above and
+    # below), the same way MASK already unconditionally does.
+    double_sided = bool(file_factors.get("doubleSided", False))
+    if file_factors.get("normalScale") is not None:
+        try: normal_scale = float(file_factors["normalScale"])
+        except (TypeError, ValueError): pass
 
     img = getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
     if img is None and isinstance(scene, trimesh.Scene):
@@ -304,9 +414,23 @@ def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
         if textures:
             img = next(iter(textures.values()))
 
+    # normalTexture - trimesh DOES flatten this straight to a bare PIL
+    # image (unlike alphaMode/alphaCutoff/doubleSided/normalScale above,
+    # which it drops entirely) - see this function's own module-level
+    # confirmation via a live trimesh load. _upload_texture is reused
+    # as-is (not given any special linear/non-sRGB treatment) because
+    # this pipeline never applies a GPU-side sRGB internal format to
+    # BEGIN with - the fragment shader manually un-gammas the base color
+    # sample instead (see pbr_shader.py's pow(raw_albedo, vec3(2.2))) -
+    # so a plain RGBA upload is already correct for normal data too, as
+    # long as the shader does NOT apply that same pow(2.2) to it (it
+    # doesn't - see FRAGMENT_SHADER_BODY's normal-map sampling).
+    normal_tex_obj = _upload_texture(ctx, getattr(mat, "normalTexture", None))
+
     return (
-        base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
-        _upload_texture(ctx, img), _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None)),
+        base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, double_sided,
+        normal_scale, _upload_texture(ctx, img), _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None)),
+        normal_tex_obj,
     )
 
 def _extract_vertex_colors(mesh, base_color, vertex_count):
@@ -376,7 +500,7 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
     file), returns the same dict shape load_glb always has, or None on
     failure (after releasing whatever GL resources this call already
     created, exactly as load_glb's own try/except used to do inline)."""
-    buffers, vao, tex_obj, mr_tex_obj = [], None, None, None
+    buffers, vao, tex_obj, mr_tex_obj, normal_tex_obj = [], None, None, None, None
     try:
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0: raise RuntimeError("Invalid or empty mesh.")
 
@@ -406,7 +530,10 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         # the SHADOW VAO passes load_textures=False explicitly to opt
         # out of that heuristic.
         needs_textures = ("u_texture" in prog) if load_textures is None else load_textures
-        base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, tex_obj, mr_tex_obj = _extract_material(
+        (
+            base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, double_sided,
+            normal_scale, tex_obj, mr_tex_obj, normal_tex_obj,
+        ) = _extract_material(
             mesh, scene, ctx, raw_factors, load_textures=needs_textures
         )
         colors = _extract_vertex_colors(mesh, base_color, len(vertices))
@@ -431,6 +558,17 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             has_lightmap_uv = True
 
         attr_data = {"in_position": (vertices, "3f"), "in_normal": (normals, "3f"), "in_color": (colors, "3f"), "in_uv": (uvs, "2f"), "in_lightmap_uv": (lightmap_uvs, "2f")}
+        # Only pbr_program's own vertex shader declares in_tangent at all
+        # (shadow_program/bake_program use their own separate, unrelated
+        # vertex shaders - see scene_base.py - so _has_attribute is
+        # always False for them here) - same "don't build data a VAO
+        # won't even read" reasoning as needs_textures above, and
+        # _compute_tangents is real per-triangle numpy work, not free.
+        # Computed AFTER the lightmap-UV remap above (not before) so it
+        # always matches whatever the FINAL vertices/faces/uvs/normals
+        # arrays actually are.
+        if _has_attribute(prog, "in_tangent"):
+            attr_data["in_tangent"] = (_compute_tangents(vertices, normals, uvs, faces), "4f")
         vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items() if _has_attribute(prog, name)}
         ibo = ctx.buffer(faces.tobytes())
         buffers = list(vbos.values()) + [ibo]
@@ -443,9 +581,12 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             "vao": vao, "vbo": vbos.get("in_position"), "normal_vbo": vbos.get("in_normal"),
             "color_vbo": vbos.get("in_color"), "uv_vbo": vbos.get("in_uv"),
             "lightmap_uv_vbo": vbos.get("in_lightmap_uv"), "has_lightmap_uv": has_lightmap_uv, "ibo": ibo,
-            "texture": tex_obj, "metallic_roughness_texture": mr_tex_obj,
+            "tangent_vbo": vbos.get("in_tangent"),
+            "texture": tex_obj, "metallic_roughness_texture": mr_tex_obj, "normal_texture": normal_tex_obj,
             "metallic": metallic, "roughness": roughness, "emissive": emissive.tolist(),
+            "normal_scale": normal_scale,
             "has_texture": 1 if tex_obj else 0, "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
+            "has_normal_texture": 1 if normal_tex_obj else 0,
             # "OPAQUE" | "MASK" | "BLEND" (glTF alphaMode - see
             # _extract_material's own docstring) plus the cutoff MASK
             # uses and the material's own base alpha factor (multiplied
@@ -458,12 +599,17 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             # opaque" as "render both sides" - MASK additionally discards
             # below alpha_cutoff in the shader instead of blending; BLEND
             # draws in a separate, depth-write-disabled pass after
-            # every opaque/cutout object, with real alpha blending.
+            # every opaque/cutout object, with real alpha blending. An
+            # OPAQUE material can ALSO ask for double-sided rendering via
+            # glTF's own separate doubleSided flag (e.g. a water plane
+            # meant to be seen from both above and below) - see
+            # "double_sided" below, read independently of alpha_mode.
             "alpha_mode": alpha_mode, "alpha_cutoff": alpha_cutoff, "base_alpha": base_alpha,
+            "double_sided": double_sided,
         }
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
-        for res in [vao, *buffers, tex_obj, mr_tex_obj]:
+        for res in [vao, *buffers, tex_obj, mr_tex_obj, normal_tex_obj]:
             if res: res.release()
         return None
 
@@ -555,6 +701,120 @@ def _flatten_scene_by_material(scene):
             combined.visual = g["representative"].visual
             if all(u is not None for u in g["uvs"]): combined.visual.uv = np.concatenate(g["uvs"], axis=0)
         results.append((combined, g["names"]))
+    return results
+
+def load_mesh_groups_by_material(model_path, scale=None):
+    """Geometry-only per-material split of model_path - no GPU context,
+    no texture/material-factor loading, nothing but (material_name,
+    vertices, faces) triples. Built for PhysicsWorld.add_static_mesh_
+    by_material (see its own docstring): physics_world.py already loads
+    a collision mesh independently through a second, cheap trimesh pass
+    (its own _load_mesh) rather than reusing the GPU-focused render
+    load, and reuses THIS module's own _flatten_scene_by_material to
+    split it by material rather than re-deriving "which triangles
+    belong to which material" a second, potentially-drifting way -
+    exactly the same reasoning load_glb_by_material already follows for
+    the render side.
+
+    scale: optional array-like (anything np.asarray accepts - a glm.vec3
+    works fine despite this module not importing glm itself, same as
+    physics_world.py's own _load_mesh takes a plain array-like rather
+    than requiring a specific vector type) - multiplies every vertex
+    position, matching _load_mesh's own convention.
+
+    Returns a list of (material_name, vertices, faces) tuples, one per
+    distinct material actually present (collision-only nodes excluded,
+    matching every other loader in this file) - material_name is
+    whatever _material_key resolves to (the glTF material's own
+    authored name, an opaque id() for an unnamed one, or None for
+    geometry with no material at all). Empty list if model_path doesn't
+    exist or fails to parse."""
+    path = Path(model_path)
+    if not path.exists():
+        print(f"[Warning] Model file not found: {path.resolve()}")
+        return []
+    try:
+        scene = trimesh.load(str(path), process=False)
+    except Exception as e:
+        print(f"[Error] Failed to parse model {path}: {e}")
+        return []
+
+    scale_arr = np.asarray(scale, dtype="f8") if scale is not None else None
+    results = []
+    for mesh, _node_names in _flatten_scene_by_material(scene):
+        if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            continue
+        vertices = np.asarray(mesh.vertices, dtype="f8")
+        if scale_arr is not None:
+            vertices = vertices * scale_arr
+        results.append((_material_key(mesh), vertices, np.asarray(mesh.faces, dtype="i4")))
+    return results
+
+def load_mesh_groups_by_object(model_path, scale=None):
+    """Geometry-only per-OBJECT (glTF node) split of model_path - like
+    load_mesh_groups_by_material, but keyed by the mesh's own NODE name
+    (Blender's "Object name", carried through to the node name in the
+    exported glTF) instead of its material. A level is very often built
+    by reusing a handful of trim materials across many distinct objects
+    (a shared "concrete" material used by a dozen different floor/wall
+    pieces, say) - collision/gameplay decisions ("this ONE object has no
+    collision", "this ONE object plays a different footstep sound") are
+    naturally per-OBJECT in that case, not per-material, which is why
+    this exists as a genuinely separate function rather than a mode
+    flag on load_mesh_groups_by_material: the two group geometry along
+    completely different axes, and a node's OWN material is irrelevant
+    here (two objects sharing one material still get two independent
+    entries; a single object made of several materials would need
+    load_mesh_groups_by_material instead, or authoring it as separate
+    objects to begin with).
+
+    Never merges across nodes - a node here is already the smallest
+    addressable unit this can name at all, so unlike load_mesh_groups_
+    by_material's per-material merging, there's nothing TO merge.
+    Collision-only nodes are excluded, matching every other loader in
+    this file. scale: same convention as load_mesh_groups_by_material's
+    own (any np.asarray-compatible array-like).
+
+    Returns a list of (node_name, vertices, faces) tuples, one per mesh
+    node actually present. A file with no per-node structure at all (a
+    bare Trimesh/PointCloud, not a trimesh.Scene) falls back to a single
+    (None, vertices, faces) entry, matching _flatten_scene_by_material's
+    own fallback for that case. Empty list if model_path doesn't exist
+    or fails to parse."""
+    path = Path(model_path)
+    if not path.exists():
+        print(f"[Warning] Model file not found: {path.resolve()}")
+        return []
+    try:
+        scene = trimesh.load(str(path), process=False)
+    except Exception as e:
+        print(f"[Error] Failed to parse model {path}: {e}")
+        return []
+
+    scale_arr = np.asarray(scale, dtype="f8") if scale is not None else None
+
+    if not isinstance(scene, trimesh.Scene):
+        if scene is None or len(scene.vertices) == 0:
+            return []
+        vertices = np.asarray(scene.vertices, dtype="f8")
+        if scale_arr is not None:
+            vertices = vertices * scale_arr
+        return [(None, vertices, np.asarray(scene.faces, dtype="i4"))]
+
+    results = []
+    for node_name in scene.graph.nodes_geometry:
+        if _is_collision_only_node(node_name):
+            continue
+        transform, geom_name = scene.graph[node_name]
+        geom = scene.geometry.get(geom_name)
+        if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0:
+            continue
+
+        rot, trans = transform[:3, :3], transform[:3, 3]
+        vertices = np.asarray(geom.vertices, dtype="f8") @ rot.T + trans
+        if scale_arr is not None:
+            vertices = vertices * scale_arr
+        results.append((node_name, vertices, np.asarray(geom.faces, dtype="i4")))
     return results
 
 def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,
