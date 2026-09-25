@@ -66,7 +66,11 @@ class Camera:
         if self.pitch < -89.0:
             self.pitch = -89.0
 
-        # Calculate new front vector
+        self.update_vectors()
+
+    def update_vectors(self):
+        """Recomputes self.front from yaw/pitch (degrees) - call after
+        changing either directly (process_mouse does; so does recoil)."""
         front = glm.vec3()
         front.x = glm.cos(glm.radians(self.yaw)) * glm.cos(glm.radians(self.pitch))
         front.y = glm.sin(glm.radians(self.pitch))

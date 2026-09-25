@@ -22,11 +22,14 @@ share a name with the player rig) when merged onto the target skeleton, so
 e.g. the player's idle pose ends up as "pistol_idle".
 """
 
+import math
+import random
 import time
 
 import glm
 
 from Modules.Graphics.skeletal_loader import _read_glb_json_and_blob
+from Modules.Weapons.recoil import Recoil
 
 _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
 _SPINE4 = "ValveBiped.Bip01_Spine4"
@@ -69,18 +72,36 @@ def _load_state_clip(scene, obj, path, clip_name, skin_index=0):
     return clip_name if clip_name in added else None
 
 
+def _spread_direction(direction, spread_degrees):
+    """`direction` (a unit vector) turned by a random angle within a cone of
+    half-angle spread_degrees around it - uniform over the cone's cross
+    section, so shots cluster no more at the centre than the edge."""
+    direction = glm.normalize(glm.vec3(direction))
+    if spread_degrees <= 0.0:
+        return direction
+    up = glm.vec3(0.0, 1.0, 0.0) if abs(direction.y) < 0.99 else glm.vec3(1.0, 0.0, 0.0)
+    right = glm.normalize(glm.cross(direction, up))
+    true_up = glm.cross(right, direction)
+    polar = math.radians(spread_degrees) * math.sqrt(random.random())
+    azimuth = random.random() * 2.0 * math.pi
+    offset = right * math.cos(azimuth) + true_up * math.sin(azimuth)
+    return glm.normalize(direction * math.cos(polar) + offset * math.sin(polar))
+
+
 class Shot:
     """One trigger pull that went off (see WeaponsBase.fire). hit: the
     PhysicsWorld.RayHit of the line trace along the aim, or None if it hit
     nothing within range. victim: the owner tag of the hitbox it struck (a
     remote player's steam_id), or None if it hit level geometry/nothing.
     damage: what this shot does to a victim."""
-    __slots__ = ("hit", "victim", "damage")
+    __slots__ = ("hit", "victim", "damage", "direction", "spread")
 
-    def __init__(self, hit, damage):
+    def __init__(self, hit, damage, direction=None, spread=0.0):
         self.hit = hit
         self.victim = hit.owner if hit is not None else None
         self.damage = damage
+        self.direction = direction   # the (spread-adjusted) direction the trace actually went
+        self.spread = spread         # the cone half-angle (degrees) it was drawn from
 
 
 class WeaponsBase:
@@ -99,6 +120,33 @@ class WeaponsBase:
     fire_max_distance = 160.0
     fire_interval = 0.0       # minimum seconds between shots (0 = as fast as the owner fires)
     automatic = False         # True: holding the trigger keeps firing; False: one shot per click
+
+    # ---- accuracy ------------------------------------------------------
+    # Shots land within a cone of half-angle "spread" degrees around the aim.
+    # It sits at spread_min while the trigger is rested, grows by
+    # spread_per_shot with each shot (capped at spread_max) and, once the gun
+    # has been quiet for spread_recovery_delay seconds, shrinks back at
+    # spread_recovery degrees per second. So how fast you can shoot decides how
+    # bad it gets: pick spread_per_shot against the gun's realistic rate of
+    # fire - a pistol you can only click a few times a second stays accurate at
+    # that pace and only loses it when spammed.
+    spread_min = 0.4
+    spread_max = 4.0
+    spread_per_shot = 1.0
+    spread_recovery = 5.0
+    spread_recovery_delay = 0.15
+
+    # ---- recoil --------------------------------------------------------
+    # Each shot kicks the owner's camera up by recoil_pitch degrees (plus a
+    # random sideways kick of up to +-recoil_yaw), quickly (recoil_kick_speed
+    # deg/s), then it settles back down by itself at recoil_recovery deg/s.
+    # Shooting faster than it settles stacks the kicks, up to recoil_max
+    # degrees. See Recoil.
+    recoil_pitch = 1.0
+    recoil_yaw = 0.0
+    recoil_max = 6.0
+    recoil_kick_speed = 120.0
+    recoil_recovery = 6.0
 
     # ---- damage --------------------------------------------------------
     damage = 10.0             # health taken from a player each shot hits
@@ -147,6 +195,8 @@ class WeaponsBase:
 
     def __init__(self):
         self._last_fire = float("-inf")
+        self._spread_at_last_shot = self.spread_min
+        self.recoil = Recoil(self)   # the owner's camera kick - see Recoil.apply
         self._fire_channel = None   # the mixer channel the last shot played on
         self._scene = None
         self._player_model = None
@@ -161,27 +211,45 @@ class WeaponsBase:
         now = time.perf_counter() if now is None else now
         return now - self._last_fire >= self.fire_interval
 
+    def spread_degrees(self, now=None):
+        """The weapon's accuracy right now: the half-angle (degrees) of the
+        cone the next shot would land in - see the accuracy settings above.
+        Reads the clock, so a HUD can poll it every frame."""
+        now = time.perf_counter() if now is None else now
+        quiet = now - self._last_fire - self.spread_recovery_delay
+        spread = self._spread_at_last_shot - self.spread_recovery * max(0.0, quiet)
+        return max(self.spread_min, spread)
+
     def fire(self, scene, position, direction=None, now=None, follow=None):
         """Pulls the trigger: plays the gunshot at `position` (world space)
         with this weapon's distance falloff (`follow`, a callable returning the
         owner's current position, keeps it attached to the owner while it
         plays), starts the shoot animations, and - if `direction` (the aim, a
         unit vector) is given - traces a line from `position` along it, up to
-        max_range, through scene.physics. Returns a Shot describing the trace
-        (Shot.victim is a struck player's id), or None - doing nothing - if
-        it fired less than fire_interval ago. What a hit DOES (health, the
-        network message) is the caller's to apply."""
+        max_range, through scene.physics, deflected by a random amount within
+        the current spread (spread_degrees) and then worsening the spread for
+        the next shot. Returns a Shot describing the trace (Shot.victim is a
+        struck player's id), or None - doing nothing - if it fired less than
+        fire_interval ago. What a hit DOES (health, the network message) is the
+        caller's to apply."""
         now = time.perf_counter() if now is None else now
         if not self.can_fire(now):
             return None
+        spread = self.spread_degrees(now)
         self._last_fire = now
+        self._spread_at_last_shot = min(self.spread_max, spread + self.spread_per_shot)
         self.play_fire_sound(scene, position, follow)
         self.play("shoot")
         hit = None
+        aim = None
         if direction is not None:
             origin = glm.vec3(position)
-            hit = scene.physics.raycast(origin, origin + glm.normalize(glm.vec3(direction)) * self.max_range)
-        return Shot(hit, self.damage)
+            aim = _spread_direction(direction, spread)
+            hit = scene.physics.raycast(origin, origin + aim * self.max_range)
+        # After the trace: the shot goes where the camera was pointing when the
+        # trigger was pulled; the kick moves it for the NEXT one.
+        self.recoil.kick()
+        return Shot(hit, self.damage, aim, spread)
 
     def play_fire_sound(self, scene, position, follow=None):
         """The gunshot alone, with no rate limit - for replaying a shot some
@@ -293,6 +361,7 @@ class WeaponsBase:
 
     def unequip(self):
         self.unequip_player()
+        self.recoil.reset()
         if self._viewmodel is not None:
             self._viewmodel.clear_weapon()
             self._viewmodel = None

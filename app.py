@@ -111,7 +111,7 @@ from Modules.Window.window import WindowManager
 from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
-from Modules.UI import Anchor, ProgressBar
+from Modules.UI import Anchor, Crosshair, ProgressBar
 from Modules.UI.nametags import NameTags
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.Camera.camera import Camera
@@ -515,6 +515,8 @@ def main():
         fill_color=(90, 200, 110, 255),
     )
     ui.root.add(health_bar)
+    # Screen-centre crosshair; its gap is the current weapon's real spread.
+    crosshair = ui.root.add(Crosshair(visible=False))
 
     def change_health(delta):
         health["value"] = max(0.0, min(health["max"], health["value"] + delta))
@@ -551,6 +553,7 @@ def main():
         menu_ui.visible = False
         setup_game(map_key)
         health_bar.visible = True
+        crosshair.visible = True
         name_tags.visible = True
         if local_player_model is not None and local_player_model.obj is not None:
             local_player_model.set_hat(net_mgr.local_hat)
@@ -675,6 +678,10 @@ def main():
         else:
             camera.position = eye_position
         # After the camera has its final position/look for this frame.
+        # Recoil moves the camera a little further each frame (see Recoil) -
+        # after mouse look, before anything reads camera.front for this frame.
+        if weapon is not None:
+            weapon.recoil.apply(camera, dt)
         viewmodel.update(camera, not third_person)
 
         # Left mouse fires: one shot per click (every click counts, even two
@@ -683,6 +690,8 @@ def main():
         # counted with the cursor captured (see count_click), so clicking
         # menus/UI never shoots.
         clicks, trigger_clicks[0] = trigger_clicks[0], 0
+        if weapon is not None:
+            crosshair.set_spread(weapon.spread_degrees(), camera.fov)
         if weapon is not None and not ui.cursor_free:
             if weapon.automatic:
                 clicks = 1 if pygame.mouse.get_pressed()[0] else 0

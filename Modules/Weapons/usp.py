@@ -13,6 +13,25 @@ class USP(WeaponsBase):
     fire_sound = "Assets/Audio/Guns/USP/usp_unsil-1.wav"
     damage = 15.0
 
+    # Accuracy: a semi-auto pistol. First shot from rest is tight; each shot
+    # opens the cone by 0.75 degrees, and it closes again at 6 degrees a second
+    # after a short pause - so a steady ~4 shots a second holds its accuracy
+    # (0.75 added per shot vs about 0.8 recovered between them), and only
+    # clicking much faster than that opens it up, slowly, toward the cap.
+    spread_min = 0.4
+    spread_max = 3.5
+    spread_per_shot = 0.75
+    spread_recovery = 6.0
+    spread_recovery_delay = 0.12
+
+    # Recoil: a light kick with a little sideways wander, settling in about a
+    # quarter of a second - a pistol snaps up and comes right back.
+    recoil_pitch = 1.6
+    recoil_yaw = 0.3
+    recoil_max = 6.0
+    recoil_kick_speed = 140.0
+    recoil_recovery = 7.0
+
     # First person: pistol.glb holds the arms (skin 0) and the gun (skin 1). The
     # gun rig is the arms rig plus the weapon bones, so its clips play on both.
     viewmodel_model = f"{_POSE_DIR}/pistol.glb"
