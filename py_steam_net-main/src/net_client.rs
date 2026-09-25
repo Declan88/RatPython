@@ -84,6 +84,17 @@ impl PySteamClient {
                     });
                 });
 
+                // Steam drops a peer's messages until the session is
+                // accepted - sending to them accepts it implicitly, but
+                // a peer that's still loading (and so hasn't sent
+                // anything yet) would have its first packets lost, and
+                // the other side's would too. Accept everything here;
+                // the Python side only trusts senders that are in its
+                // current lobby (NetworkManager.handle_data).
+                networking.session_request_callback(|request| {
+                    request.accept();
+                });
+
                 self.client = Some((client, single));
                 self.messages = Some(networking);
                 Ok(())

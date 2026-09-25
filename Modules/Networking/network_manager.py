@@ -47,6 +47,7 @@ class NetworkManager:
 
     # Movement packets: at most this often, plus a heartbeat when idle.
     SEND_INTERVAL = 1.0 / 30.0
+    RECEIVE_BATCH = 256  # max packets read per frame - drains a backlog after a map load
     HEARTBEAT_INTERVAL = 0.25
 
     def __init__(self, camera, scene=None):
@@ -64,6 +65,8 @@ class NetworkManager:
         self._last_send_time = 0.0
         self._last_update_time = 0.0
         self._last_prune_time = 0.0
+        self._members = set()
+        self._members_checked = 0.0
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
         self._pending_host = None
         self._pending_join = None
@@ -96,6 +99,11 @@ class NetworkManager:
         self.client.run_callbacks()
         self._run_deferred()
         if self.in_game:
+            # handle_data only ever runs from here: py_steam_net hands over
+            # incoming packets when (and only when) they're polled for. Nothing
+            # polled before this - other players could join the lobby but their
+            # positions were never read, so their models never appeared.
+            self.client.receive_messages(0, self.RECEIVE_BATCH)
             now = time.perf_counter()
             dt = now - self._last_update_time if self._last_update_time else 0.0
             self._last_update_time = now
@@ -366,18 +374,41 @@ class NetworkManager:
 
     def _prune_remote_players(self):
         """Removes the model/hitbox of any peer no longer in the lobby."""
-        try:
-            members = set(self.client.get_lobby_members(self.current_lobby_id))
-        except Exception:
+        members = self._refresh_members()
+        if members is None:
             return
         for steam_id in list(self.remote_players):
             if steam_id not in members:
                 print(f"\n--> Peer left the lobby: {steam_id}")
                 self.remote_players.pop(steam_id).destroy()
 
+    def _refresh_members(self):
+        """Re-reads the current lobby's member ids. Returns the set, or None
+        if it couldn't be read (left as-is in that case)."""
+        try:
+            self._members = set(self.client.get_lobby_members(self.current_lobby_id))
+        except Exception:
+            return None
+        self._members_checked = time.perf_counter()
+        return self._members
+
+    def _is_lobby_member(self, steam_id):
+        """py_steam_net accepts every incoming Steam session (see its
+        session_request_callback), and App 480 is shared by countless
+        unrelated test projects - so only trust packets from people who are
+        actually in OUR lobby. Refreshed at most once a second, so a stranger
+        spamming packets can't make this a per-packet lobby query."""
+        if steam_id in self._members:
+            return True
+        if time.perf_counter() - self._members_checked >= 1.0:
+            self._refresh_members()
+        return steam_id in self._members
+
     def handle_data(self, sender_id, ch, msg_bytes):
         if self.scene is None:
             return  # a peer's packet arrived before our map finished loading
+        if not self._is_lobby_member(sender_id):
+            return
         try:
             state = json.loads(msg_bytes.decode("utf-8"))
             if "p" not in state or "y" not in state:
