@@ -165,8 +165,19 @@ class NetworkManager:
         if self.current_lobby_id:
             self._schedule(0.3, self.print_session_roster)
 
+    # How many times setup_networking_mode retries an empty/failed
+    # search before giving up and hosting - see that method's own
+    # comment on why a single one-shot search isn't reliable. Spaced
+    # _LOBBY_SEARCH_RETRY_DELAY_SECONDS apart, so worst case this adds
+    # (_LOBBY_SEARCH_MAX_ATTEMPTS - 1) * _LOBBY_SEARCH_RETRY_DELAY_
+    # SECONDS to how long a client with genuinely no one else to find
+    # waits before hosting on its own.
+    _LOBBY_SEARCH_MAX_ATTEMPTS = 5
+    _LOBBY_SEARCH_RETRY_DELAY_SECONDS = 2.0
+
     def setup_networking_mode(self):
         print("\n--- Scanning for Open RatWar Lobbies ---")
+        search_attempt = [0]  # list, not a plain int, so the nested closure below can mutate it
 
         def handle_lobby_list(lobbies, error):
             # create_lobby/join_lobby are deliberately NOT called
@@ -208,8 +219,39 @@ class NetworkManager:
             if open_lobby_id:
                 print(f"Found valid open lobby {open_lobby_id}. Joining automatically...")
                 self._schedule(0, lambda: self.client.join_lobby(open_lobby_id, self.on_lobby_joined))
+                return
+
+            # No match THIS attempt - retry a few times, spaced out,
+            # before giving up and hosting. A lobby another client just
+            # created (or just tagged, via the separate set_lobby_data
+            # call in on_lobby_created - see its own comment) isn't
+            # guaranteed to be immediately visible to a DIFFERENT
+            # client's RequestLobbyList: Steam's matchmaking list is
+            # backed by its own server-side cache, and a fresh write
+            # from one client reaching another client's next query is
+            # a real (if usually brief) propagation delay, not
+            # instantaneous - confirmed as a real-world issue via two
+            # actual separate PCs, one hosting and staying up the whole
+            # time, the other's very first (and previously ONLY) search
+            # still coming back with zero results. A single one-shot
+            # search has no way to recover from that even when everyone
+            # involved is doing everything right; retrying does.
+            search_attempt[0] += 1
+            if search_attempt[0] < self._LOBBY_SEARCH_MAX_ATTEMPTS:
+                print(
+                    f"No open RatWar lobbies found yet (attempt "
+                    f"{search_attempt[0]}/{self._LOBBY_SEARCH_MAX_ATTEMPTS}) - "
+                    f"retrying in {self._LOBBY_SEARCH_RETRY_DELAY_SECONDS:.0f}s..."
+                )
+                self._schedule(
+                    self._LOBBY_SEARCH_RETRY_DELAY_SECONDS,
+                    lambda: self.client.get_lobby_list(handle_lobby_list),
+                )
             else:
-                print("No open RatWar lobbies found. Hosting a new lobby...")
+                print(
+                    f"No open RatWar lobbies found after "
+                    f"{self._LOBBY_SEARCH_MAX_ATTEMPTS} attempts. Hosting a new lobby..."
+                )
                 self._schedule(0, lambda: self.client.create_lobby(2, 4, self.on_lobby_created))
 
         try:

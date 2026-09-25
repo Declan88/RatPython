@@ -238,6 +238,13 @@ impl PySteamClient {
             // even this game). Every lobby create_lobby produces is
             // already tagged with the same key/value (see its own
             // comment), so this is the read-side half of that pairing.
+            // Confirmed via a temporary unfiltered-search diagnostic
+            // that RequestLobbyList itself works fine and this exact
+            // string filter was the actual problem - see this crate's
+            // own [patch.crates-io] comment in Cargo.toml for the real
+            // bug (steamworks 0.11.0's own filter functions never
+            // null-terminated the strings they handed to Steam's C
+            // API) and vendor/steamworks-0.11.0 for the fix.
             matchmaking.add_request_lobby_list_string_filter(StringFilter(
                 LobbyKey::new(GAME_IDENTITY_KEY),
                 GAME_IDENTITY_VALUE,

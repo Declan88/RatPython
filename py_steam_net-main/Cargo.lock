@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "py_steam_net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pyo3",
  "steamworks",
@@ -150,8 +150,6 @@ dependencies = [
 [[package]]
 name = "steamworks"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a79d6f059322f73a4586cc2d0ca595ce1583104b2b1574ae1bb87f2c05bf4c67"
 dependencies = [
  "bitflags",
  "lazy_static",

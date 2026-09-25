@@ -1,6 +1,6 @@
 [package]
 name = "py_steam_net"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,3 +11,20 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = "0.25.1"
 steamworks = "0.11.0"
+
+# PERMANENT patch, not a diagnostic leftover - steamworks 0.11.0's own
+# add_request_lobby_list_string_filter/_numerical_filter/_near_value_
+# filter pass a raw &str.as_ptr() (no null terminator - Rust strings
+# aren't C strings) straight to a Steamworks C API that reads a
+# null-terminated C string, which is undefined behavior and in practice
+# made every filtered lobby search silently match nothing - confirmed
+# by comparing a filtered vs. completely unfiltered RequestLobbyList
+# against the exact same live lobby: unfiltered found it every time,
+# filtered never did. set_lobby_data/delete_lobby_data/lobby_data
+# elsewhere in the SAME upstream file already wrap their key/value
+# strings in CString::new(...) correctly - vendor/steamworks-0.11.0
+# is an unmodified copy of the crate except bringing those three filter
+# functions in line with that existing, correct pattern. Safe to drop
+# this patch (and vendor/) once a steamworks release upstream fixes it.
+[patch.crates-io]
+steamworks = { path = "vendor/steamworks-0.11.0" }

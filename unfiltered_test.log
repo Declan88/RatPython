@@ -1,0 +1,70 @@
+pygame-ce 2.5.8 (SDL 2.32.10, Python 3.14.7)
+Pre-loaded steam_api64.dll from: C:\RatPython\RatPython\steam_api64.dll
+Yo wsg
+[gltf_lights] Found 11 punctual light(s) in Assets/Models/Map/mainmap.glb
+[Scene] Baking lighting for 30 static object(s)...
+[Scene] Baked and saved 30 lightmap(s) to Assets\Lightmaps\MainMapScene
+[skeletal_loader] Assets/Models/rat.glb: hiding by default (name convention): ['hat_bbqhat', 'hat_clownhair', 'hat_cowboy', 'hat_krustykrab', 'hat_libertycrown', 'hat_minecraft', 'hat_press', 'hat_witch']
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkNW.glb: clip 'New-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSE.glb: clip 'New-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-reload_pistol' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-aimlayer_magic' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-reload_pistol.001' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-death_01' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-swim_s' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-runW' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-crouch_idle' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-jump' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_RunSW' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_aimlayer_ar2_mid_center' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_jump_ar2' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_jump_melee' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-jump_ar2' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-reload_ar2' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-reload_ar2_original' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-idle_ar2' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_range_ar2' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_walking_walk_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-idle_ar2.001' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_range_ar2_fire_standalone' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-taunt_dance' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-taunt_dance_base' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_walking_walk_ar2_S' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_walking_walk_ar2_N.001' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_WalkSW' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_CrouchWalking_cwalk_ar2_C' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_walking_walk_ar2_S.001' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_running_run_ar2_E' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_running_run_ar2_W' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'Diag-a_running_run_ar2_N.001' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Rifle/RifleWalkSW.glb: clip 'New-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Shotgun/ShotgunIdle.glb: clip 'New-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+[skeletal_loader] Assets/Animations/Poses/Pistol/pistolidle.glb: clip 'New-a_running_run_ar2_N' already exists on this skeleton - overwriting with the one from this file.
+Setting breakpad minidump AppID = 480
+SteamInternal_SetMinidumpSteamID:  Caching Steam ID:  76561198283674475 [API loaded no]
+Steam P2P initialized successfully. Ready: True
+Your Steam ID: 76561198283674475
+
+--- Scanning for Open RatWar Lobbies ---
+[DEBUG] raw lobbies from get_lobby_list: [109775242699777352, 109775242734199079, 109775242734199081, 109775242732801944, 109775242732801943, 109775242735568280, 109775242736953904, 109775242734200285, 109775242736951948, 109775242735568200, 109775242734199697, 109775242732798232, 109775242736954641, 109775242734200581, 109775242734200582, 109775242729753163, 109775242735567757, 109775242736952387, 109775242736952385, 109775242735566897, 109775242732800662, 109775242732800663, 109775242714909993, 109775242723755470, 109775242723755469, 109775242719809317, 109775242719809360, 109775242734201126, 109775242726696479, 109775242717187858, 109775242736952104, 109775242735570210, 109775242735570365, 109775242735566871, 109775242732800514, 109775242729751160, 109775242729751164, 109775242735570481, 109775242732801790, 109775242732801777, 109775242731192582, 109775242731192585, 109775242734202281, 109775242736953932, 109775242736953658, 109775242718380414, 109775242718380410, 109775242732799792, 109775242726698089, 109775242734201090] error=None
+[DEBUG] lobby 109775242699777352 members=[0]
+Found valid open lobby 109775242699777352. Joining automatically...
+[FPS] 476.2
+
+--> SUCCESS! Joined Lobby ID: 109775242699777352
+[FPS] 454.5
+
+===============================
+       SESSION ROSTER          
+===============================
+ Active Lobby ID: 109775242699777352
+-------------------------------
+ - Steam ID: 76561197993179057 [HOST]
+ - Steam ID: 76561198283674475 (You) [CLIENT]
+===============================
+
+[FPS] 454.5
+src\steamnetworkingsockets\clientlib\steamnetworkingsockets_socketthread.cpp (3918) : Trying to close low level socket support, but we still have sockets open!
+src\steamnetworkingsockets\clientlib\steamnetworkingsockets_socketthread.cpp (3918) : Trying to close low level socket support, but we still have sockets open!
