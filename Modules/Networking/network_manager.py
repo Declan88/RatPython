@@ -66,6 +66,7 @@ class NetworkManager:
         self._last_update_time = 0.0
         self._last_prune_time = 0.0
         self._members = set()
+        self._last_hello_time = 0.0
         self._members_checked = 0.0
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
         self._pending_host = None
@@ -98,6 +99,8 @@ class NetworkManager:
             return
         self.client.run_callbacks()
         self._run_deferred()
+        if self.current_lobby_id:
+            self._send_hellos(time.perf_counter())
         if self.in_game:
             # handle_data only ever runs from here: py_steam_net hands over
             # incoming packets when (and only when) they're polled for. Nothing
@@ -341,6 +344,35 @@ class NetworkManager:
             "d": [round(move_direction.x, 2), round(move_direction.z, 2)],
             "j": self._jump_count,
         }
+
+    HELLO_INTERVAL = 0.5
+    HELLO_FLAGS = 8 | 32  # Reliable | AutoRestartBrokenSession
+
+    def _send_hellos(self, now):
+        """Opens (and keeps retrying) a Steam session with every lobby member
+        we haven't heard a movement packet from yet. The movement stream is
+        UNRELIABLE, and Steam drops unreliable messages while a session is
+        still being negotiated (relay handshake - seconds, not ms), which is
+        why players used to take ~10s to appear on each other's screens. A
+        RELIABLE message is queued until the session is up, then delivered,
+        so it both forces the handshake immediately (even while the map is
+        still loading) and can't be lost. Stops per-peer as soon as they show
+        up in remote_players."""
+        if now - self._last_hello_time < self.HELLO_INTERVAL:
+            return
+        self._last_hello_time = now
+        members = self._refresh_members()
+        if not members:
+            return
+        state = self._local_state if self.in_game and self._local_state is not None else {"hello": 1}
+        payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+        for member_id in members:
+            if member_id == self.local_steam_id or member_id in self.remote_players:
+                continue
+            try:
+                self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
+            except Exception:
+                pass
 
     def _broadcast_transform(self, now):
         if not self.current_lobby_id or self._local_state is None:

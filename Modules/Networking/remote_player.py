@@ -68,6 +68,22 @@ _POSE_FILES = {
     "Assets/Animations/Poses/Rifle/rifleidle.glb": ({"New": "rifle_idle"}, _RAT_ANIM_TIME_SCALE),
     "Assets/Animations/Poses/Rifle/RifleWalkN.glb": ({"New": "rifle_walk"}, 1.0),
     "Assets/Animations/Poses/Rifle/RifleRunN.glb": ({"New": "rifle_run"}, 1.0),
+    "Assets/Animations/Poses/Rifle/RifleJump.glb": ({"New": "rifle_jump"}, 1.0),
+    "Assets/Animations/Poses/Rifle/RifleCrouch.glb": ({"New": "rifle_crouch"}, 1.0),
+    "Assets/Animations/Poses/Rifle/RifleWalkS.glb": ({"New": "rifle_walk_s"}, 1.0),
+    "Assets/Animations/Poses/Rifle/RifleWalkE.glb": ({"New": "rifle_walk_e"}, 1.0),
+    "Assets/Animations/Poses/Rifle/RifleWalkW.glb": ({"New": "rifle_walk_w"}, _RAT_ANIM_TIME_SCALE),
+    "Assets/Animations/Poses/Rifle/RifleWalkNE.glb": ({"New": "rifle_walk_ne"}, _RAT_ANIM_TIME_SCALE),
+    "Assets/Animations/Poses/Rifle/RifleWalkNW.glb": ({"New": "rifle_walk_nw"}, _RAT_ANIM_TIME_SCALE),
+    "Assets/Animations/Poses/Rifle/RifleWalkSE.glb": ({"New": "rifle_walk_se"}, _RAT_ANIM_TIME_SCALE),
+    "Assets/Animations/Poses/Rifle/RifleWalkSW.glb": ({"New": "rifle_walk_sw"}, _RAT_ANIM_TIME_SCALE),
+}
+# Same facing-relative walk clips the local player uses (see app.py).
+_DIRECTIONAL_CLIPS = {
+    "walk": {
+        "N": "rifle_walk", "S": "rifle_walk_s", "E": "rifle_walk_e", "W": "rifle_walk_w",
+        "NE": "rifle_walk_ne", "NW": "rifle_walk_nw", "SE": "rifle_walk_se", "SW": "rifle_walk_sw",
+    },
 }
 # A static box approximation of the player capsule - placeholder
 # "groundwork" per this feature's scope (no damage/weapon system exists
@@ -94,6 +110,8 @@ class RemotePlayer:
             visible_in_color=True, cast_shadow=True,
             states=animation_states, forward_offset_degrees=forward_offset_degrees,
             scale=scale, time_scale=_RAT_ANIM_TIME_SCALE,
+            directional_clips=_DIRECTIONAL_CLIPS,
+            jump_animation="rifle_jump", crouch_animation="rifle_crouch",
         )
         # Matches torus_scene.py's own decorative rat.glb character's
         # shading exactly (same flat "character["specular_strength"] = 0"
