@@ -32,6 +32,7 @@ pub struct PySteamClient {
     cb_conn_failed: Arc<Mutex<Option<Py<PyAny>>>>,
     cb_lobby_changed: Arc<Mutex<Option<Py<PyAny>>>>,
     cb_message_recv: Arc<Mutex<Option<Py<PyAny>>>>,
+    send_errors: Mutex<std::collections::HashMap<u64, u32>>,
 }
 
 #[pymethods]
@@ -44,6 +45,7 @@ impl PySteamClient {
             cb_conn_failed: Arc::new(Mutex::new(None)),
             cb_lobby_changed: Arc::new(Mutex::new(None)),
             cb_message_recv: Arc::new(Mutex::new(None)),
+            send_errors: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -340,12 +342,21 @@ impl PySteamClient {
     ) {
         if let Some(networking) = &self.messages {
             let flags = SendFlags::from_bits(message_type).unwrap_or(SendFlags::RELIABLE);
-            let _ = networking.send_message_to_user(
+            // Only a FAILED send is worth printing (and only the first few
+            // per peer, so a dead session can't flood the terminal).
+            if let Err(e) = networking.send_message_to_user(
                 NetworkingIdentity::new_steam_id(SteamId::from_raw(steam_id)),
                 flags,
                 message,
                 channel,
-            );
+            ) {
+                let mut counts = self.send_errors.lock().unwrap();
+                let n = counts.entry(steam_id).or_insert(0u32);
+                *n += 1;
+                if *n <= 5 {
+                    eprintln!("[py_steam_net] send to {} failed: {:?} (flags {})", steam_id, e, message_type);
+                }
+            }
         }
     }
 

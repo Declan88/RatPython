@@ -85,6 +85,8 @@ class NetworkManager:
 
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
+            self.client.set_connection_failed_callback(
+                lambda steam_id: print(f"[Net] Steam P2P session to {steam_id} FAILED"))
         except Exception as e:
             print(f"Steam initialization failed: {e}. Make sure Steam client is running.")
             self.client = None
