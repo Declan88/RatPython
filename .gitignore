@@ -2,3 +2,13 @@ build/app/app.pkg
 build/RatWar/RatWar.pkg
 dist/RatWar.exe
 build_nuitka/
+
+# py_steam_net-main's own Rust build output (target/, ~250MB+ of
+# incremental compile artifacts) and its bundled maturin/pip venv -
+# neither is source, both regenerate from src/+Cargo.toml via
+# `maturin build --release --target x86_64-pc-windows-gnu`. Only the
+# built wheel (py_steam_net-0.1.0-*.whl, tracked at the repo root) is
+# what the game actually depends on at runtime.
+py_steam_net-main/target/
+py_steam_net-main/.venv/
+py_steam_net-main/dist/

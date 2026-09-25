@@ -237,6 +237,27 @@ class PhysicsWorld:
         Fiedler's "Fix Your Timestep!")."""
         return self._accumulator / _PHYSICS_FIXED_TIMESTEP
 
+    def line_of_sight(self, from_pos, to_pos, collision_mask=CollisionGroup.STATIC):
+        """True if nothing in collision_mask (STATIC level geometry by
+        default) sits between from_pos and to_pos, both render-space.
+
+        A single Bullet rayTestClosest against just the STATIC group -
+        cheap (one BVH query, no shape allocation) and safe to call
+        several times per frame per dynamic object, e.g. once per nearby
+        point light to approximate real-time point-light shadowing
+        without the per-light shadow-map/cubemap approach this project
+        deliberately removed (see pbr_shader.py's module docstring - that
+        blew a legacy GLSL register limit as light counts grew). Doing
+        the occlusion test here on the CPU against the same collision
+        mesh already built for player collision instead sidesteps that
+        limit entirely: cost scales with (dynamic objects) x (nearby
+        lights), not with total scene light count, and neither shaders
+        nor GPU shadow-map memory are involved at all."""
+        hit = self.world.rayTestClosest(
+            to_physics_pos(from_pos), to_physics_pos(to_pos), collision_mask,
+        )
+        return not hit.hasHit()
+
     # ---------------------------------------------------------------
     # STATIC COLLIDERS (mass = 0, never move - level geometry)
     # ---------------------------------------------------------------

@@ -135,6 +135,16 @@ TEX_UNIT_SSR_DEPTH = TEX_UNIT_REFLECTION_ENV + 2  # = 12
 # every static object into every cascade, every single frame.
 TEX_UNIT_STATIC_SHADOW = TEX_UNIT_SSR_DEPTH + 1  # = 13
 
+# A static object's SUN-ONLY baked lightmap (see Scene.bake_static_
+# lighting's own sun_lightmap_texture comment and calculate_shadow's
+# call site in main() below) - same resolution/format/UVs as u_lightmap,
+# baked from ONLY bake_directional_light (never additively combined with
+# any point light), so a moving object's own shadow (which only ever
+# blocks the SUN) can subtract exactly its own known contribution back
+# out of u_lightmap's combined sun+point total, instead of darkening the
+# point-light portion too.
+TEX_UNIT_SUN_LIGHTMAP = TEX_UNIT_STATIC_SHADOW + 1  # = 14
+
 # Uniform-buffer binding point for MaterialBlock (see bind_material's
 # own docstring for why this replaced 9 individual per-object uniform
 # writes) - distinct from skeletal_shader.py's BONE_UBO_BINDING (0) so
@@ -347,8 +357,25 @@ uniform vec3 u_point_light_pos[MAX_POINT_LIGHTS];
 uniform vec3 u_point_light_color[MAX_POINT_LIGHTS];
 uniform float u_point_light_radius[MAX_POINT_LIGHTS];
 
+// Combined, precomputed diffuse irradiance from EVERY point light in
+// the scene (not just the MAX_POINT_LIGHTS nearest ones above),
+// trilinearly interpolated from Scene.light_probe_grid at this specific
+// object's current position - see light_probes.py's own module
+// docstring and calculate_point_light_specular's comment. Bound per-
+// object (bind_probe_irradiance), not once per frame - unlike the sun's
+// u_light_color/u_light_intensity, this genuinely varies by world
+// position, which is different for every real-time-lit object drawn
+// this frame. (0,0,0) is a safe default (no point lights / no probe
+// grid yet) - matches point_light_sum's own zero-initialized default.
+uniform vec3 u_probe_irradiance;
+
 uniform sampler2D u_lightmap;
 uniform int u_has_lightmap;
+// See TEX_UNIT_SUN_LIGHTMAP's own comment - only meaningful (and only
+// bound) when u_has_lightmap is also 1; no separate u_has_sun_lightmap
+// flag needed since the two textures are always baked/bound together
+// (see Scene.bake_static_lighting and _bind_lightmap).
+uniform sampler2D u_sun_lightmap;
 
 // Hemisphere ("skylight"-style) ambient - see bind_environment() and
 // Scene.add_equirect_skybox/add_skybox for where these come from.
@@ -577,11 +604,22 @@ float calculate_movable_shadow(vec3 world_pos, float view_depth, vec3 normal, ve
 
 // Point lights are always unshadowed in real time - see the module
 // docstring for why (shadowed contributions are baked instead).
-// Blinn-Phong: diffuse is plain Lambertian (albedo * NdotL, no PI
-// normalization - Source's model isn't energy-conserving, it's an
-// artist-tuned look), specular is pow(NdotH, shininess) tinted by
-// specular_color, gated by NdotL so it doesn't light backfacing spots.
-vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float shininess, vec3 specular_color, vec3 world_pos) {
+//
+// SPECULAR ONLY - this used to also return a diffuse (albedo * NdotL)
+// term, added on top of the same per-light sum this function still
+// feeds. That diffuse term is now u_probe_irradiance instead (see
+// main()'s own u_has_lightmap==0 branch and light_probes.py's module
+// docstring) - a single value, precomputed and static-shadow-tested
+// against EVERY point light in the scene, not just the MAX_POINT_LIGHTS
+// nearest ones this function is still capped to. Keeping a real diffuse
+// term here IN ADDITION to the probe's would double-count exactly the
+// nearest few lights' contribution (counted once by the probe, a
+// second time by this loop), so it was removed rather than kept
+// redundant - what's left here is purely the live specular highlight
+// (a genuinely view-dependent term the probe's single interpolated
+// value can't represent), gated by NdotL so it doesn't light backfacing
+// spots. Blinn-Phong: pow(NdotH, shininess) tinted by specular_color.
+vec3 calculate_point_light_specular(int i, vec3 N, vec3 V, float shininess, vec3 specular_color, vec3 world_pos) {
     vec3 light_vec = u_point_light_pos[i] - world_pos;
     float dist = length(light_vec);
     vec3 L = light_vec / max(dist, 0.0001);
@@ -594,10 +632,9 @@ vec3 calculate_point_light(int i, vec3 N, vec3 V, vec3 albedo, float shininess, 
     float NdotL = max(dot(N, L), 0.0);
     float spec = pow(max(dot(N, H), 0.0), shininess);
 
-    vec3 diffuse = albedo * NdotL;
     vec3 specular = specular_color * spec * NdotL * u_specular_strength;
 
-    return (diffuse + specular) * u_point_light_color[i] * atten;
+    return specular * u_point_light_color[i] * atten;
 }
 
 // Perturbs a geometric normal with the material's own tangent-space
@@ -1027,12 +1064,76 @@ void main() {
         // to still show a moving object's shadow falling across static
         // ground, without re-darkening for a static occluder that's
         // already baked in.
+        // Gate the dynamic caster's darkening by whether the sun could
+        // even reach this texel in the first place (calculate_static_
+        // shadow - the same single fixed map calculate_shadow above
+        // uses). Without this, a moving object standing somewhere the
+        // sun is already fully blocked by static geometry (under a
+        // roof/canopy) still visibly darkens `baked` here - which is
+        // wrong on two counts: baked can include real, unshadowed point-
+        // light irradiance at that same texel that has nothing to do
+        // with the sun, and even the sun-derived portion of baked is
+        // already 0 there, so there is no sunlight left for the moving
+        // object to plausibly be blocking. calculate_static_shadow is a
+        // single cheap 3x3 tap against a texture already bound every
+        // frame regardless (see u_static_shadow_map), so this costs one
+        // extra lookup only in the branch that needs it.
+        //
+        // Which PART of `baked` a moving object's shadow is even allowed
+        // to darken matters too, not just whether it's allowed to at
+        // all: `baked` is sun+point combined, but a moving object only
+        // ever blocks the SUN (it has no real-time point-light shadow of
+        // its own - see pbr_shader.py's module docstring). Naively
+        // scaling the WHOLE of `baked` down here would also dim any
+        // point-light contribution baked into this same texel, even
+        // though the moving object standing between here and the sun has
+        // nothing to do with whatever point light is also reaching this
+        // spot - a floor patch lit by both the sun AND a nearby lamp
+        // should stay lamp-lit while a passing character's shadow crosses
+        // it, not go dark. u_sun_lightmap holds exactly the sun's own
+        // isolated contribution to this same texel (see TEX_UNIT_SUN_
+        // LIGHTMAP's own comment) - only that known amount is ever
+        // subtracted back out, leaving whatever came from point lights
+        // untouched. max(..., 0.0) guards the rare texel where dilation
+        // pushed u_sun_lightmap's padding slightly past u_lightmap's own
+        // (each dilates from its own, independently-shaped valid region)
+        // from going negative.
+        // calculate_static_shadow is a SECOND full 9-tap PCF lookup, on
+        // top of calculate_movable_shadow's own - only actually needed
+        // to compute sun_reaches, which only matters when a moving
+        // object is actually casting a shadow on THIS texel
+        // (movable_shadow > 0) in the first place: removable is scaled
+        // by movable_shadow regardless, so sun_reaches's value is
+        // irrelevant whenever movable_shadow is already 0 (the vast
+        // majority of lightmapped fragments, most frames - nothing
+        // moving is anywhere near most of a static scene's surface).
+        // Skipping the second PCF tap entirely in that case (rather
+        // than computing it unconditionally and multiplying by zero)
+        // is what actually matters here - confirmed via GPU profiling
+        // that this branch (taken for most of a frame's pixels - see
+        // this whole block's own opening comment) had become the
+        // single largest GPU cost in the renderer once this shadow-
+        // fill fix added a second PCF tap AND a second texture sample
+        // to what used to be lightmapped rendering's whole fast-path
+        // point.
         float movable_shadow = calculate_movable_shadow(v_position, view_depth, N, L);
-        point_light_sum = baked * (1.0 - movable_shadow);
+        vec3 removable = vec3(0.0);
+        if (movable_shadow > 0.0) {
+            float sun_reaches = 1.0 - calculate_static_shadow(v_position, N);
+            vec3 baked_sun_only = texture(u_sun_lightmap, v_lightmap_uv).rgb * albedo;
+            removable = baked_sun_only * (movable_shadow * sun_reaches);
+        }
+        point_light_sum = max(baked - removable, vec3(0.0));
     } else {
+        // u_probe_irradiance carries the diffuse point-light contribution
+        // for this moving object - see calculate_point_light_specular's
+        // own comment for why the per-light loop below no longer adds
+        // its own diffuse term.
+        point_light_sum = albedo * u_probe_irradiance;
+
         int num_points = min(u_num_point_lights, MAX_POINT_LIGHTS);
         for (int i = 0; i < num_points; i++) {
-            point_light_sum += calculate_point_light(i, N, V, albedo, shininess, specular_color, v_position);
+            point_light_sum += calculate_point_light_specular(i, N, V, shininess, specular_color, v_position);
         }
     }
 
@@ -1129,7 +1230,7 @@ def bind_material_block(prog):
     (and therefore declare MaterialBlock) verbatim. Called once at
     program creation, not per frame - a program's block-to-binding-point
     mapping doesn't change after that."""
-    if "MaterialBlock" in prog:
+    if _has_uniform(prog, "MaterialBlock"):
         prog["MaterialBlock"].binding = MATERIAL_UBO_BINDING
     return prog
 
@@ -1140,9 +1241,33 @@ def create_program(ctx):
     )
 
 
+def _has_uniform(prog, name):
+    """name in prog, but not literally that - moderngl's Program class
+    defines __iter__ (yields from its own internal self._members dict)
+    and __getitem__, but NO __contains__, so Python's `in` operator
+    falls back to the generic __iter__-based membership test: a full
+    LINEAR SCAN through every uniform/block this program declares,
+    comparing each one against `name`, every single time. Confirmed via
+    cProfile as the single largest CPU cost in the entire renderer -
+    moderngl's own Program.__iter__ (called wherever `in prog` appears)
+    outweighed even _write_uniform's own uniform-setting calls, at
+    ~1.5 million calls across a 300-frame profiling run of a ~30-object
+    scene. self._members is the exact same dict __iter__ already yields
+    from and __getitem__ already indexes into - going through it
+    directly here is an ordinary O(1) dict lookup instead, doing exactly
+    the same check moderngl's own __contains__ would have done had it
+    defined one. Every `name in prog`/`name in some_program` in this
+    codebase's per-frame/per-object hot path should go through this
+    instead - see this file's own _write_uniform/_bind_material_
+    textures/_bind_lightmap/bind_point_lights, scene_base.py's
+    _bind_shadow_alpha, and skeletal_shader.py's bind_bone_matrices for
+    the actual fixes."""
+    return name in prog._members
+
+
 def _write_uniform(prog, name, value):
     """Set a uniform whether it needs .write() (matrices) or .value = (scalars/vectors)."""
-    if name not in prog:
+    if not _has_uniform(prog, name):
         return
     if isinstance(value, (bytes, bytearray)):
         prog[name].write(value)
@@ -1166,7 +1291,7 @@ def _bind_material_textures(prog, item_data):
     ):
         tex = item_data.get(key)
         uniform_name = f"u_{key}"
-        if tex and uniform_name in prog:
+        if tex and _has_uniform(prog, uniform_name):
             tex.use(location=unit)
             prog[uniform_name].value = unit
 
@@ -1180,7 +1305,7 @@ def _bind_shadow_uniforms(prog, shadow_manager):
         tex.use(location=TEX_UNIT_SHADOW_START + i)
 
     _write_uniform(prog, "u_has_shadows", 1)
-    if "u_shadow_maps" in prog:
+    if _has_uniform(prog, "u_shadow_maps"):
         units = tuple(TEX_UNIT_SHADOW_START + i for i in range(MAX_SHADOW_CASCADES))
         prog["u_shadow_maps"].value = units
 
@@ -1202,10 +1327,21 @@ def _bind_shadow_uniforms(prog, shadow_manager):
 
 def _bind_lightmap(prog, item_data):
     texture = item_data.get("lightmap_texture")
-    if texture is not None and "u_lightmap" in prog:
+    if texture is not None and _has_uniform(prog, "u_lightmap"):
         texture.use(location=TEX_UNIT_LIGHTMAP)
         prog["u_lightmap"].value = TEX_UNIT_LIGHTMAP
         _write_uniform(prog, "u_has_lightmap", 1)
+
+        # See TEX_UNIT_SUN_LIGHTMAP's own comment. Always present
+        # whenever "lightmap_texture" is (Scene.bake_static_lighting
+        # bakes/caches both together for every eligible object - there's
+        # no "has a combined lightmap but no sun-only one" state), so
+        # this doesn't need its own has-texture guard the way the
+        # combined lightmap above does.
+        sun_texture = item_data.get("sun_lightmap_texture")
+        if sun_texture is not None and _has_uniform(prog, "u_sun_lightmap"):
+            sun_texture.use(location=TEX_UNIT_SUN_LIGHTMAP)
+            prog["u_sun_lightmap"].value = TEX_UNIT_SUN_LIGHTMAP
     else:
         _write_uniform(prog, "u_has_lightmap", 0)
 
@@ -1504,15 +1640,26 @@ def bind_point_lights(prog, point_lights):
     def _padded(values, length):
         return values + [0.0] * (length - len(values))
 
-    if "u_point_light_pos" in prog:
+    if _has_uniform(prog, "u_point_light_pos"):
         prog["u_point_light_pos"].write(
             np.array(_padded(positions, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes()
         )
-    if "u_point_light_color" in prog:
+    if _has_uniform(prog, "u_point_light_color"):
         prog["u_point_light_color"].write(
             np.array(_padded(colors, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes()
         )
-    if "u_point_light_radius" in prog:
+    if _has_uniform(prog, "u_point_light_radius"):
         prog["u_point_light_radius"].write(
             np.array(_padded(radii, MAX_POINT_LIGHTS), dtype=np.float32).tobytes()
         )
+
+
+def bind_probe_irradiance(prog, irradiance):
+    """u_probe_irradiance - see that uniform's own comment. Call once
+    PER OBJECT (not once per frame - this genuinely varies with world
+    position), right alongside that object's own bind_point_lights call
+    (see Scene._render_scene/_render_transparent_objects).
+
+    irradiance: a length-3 iterable (Scene._sample_probe_irradiance's
+    return value - a numpy array, but any length-3 iterable works)."""
+    _write_uniform(prog, "u_probe_irradiance", tuple(float(c) for c in irradiance))

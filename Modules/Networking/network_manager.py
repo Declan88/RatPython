@@ -133,9 +133,19 @@ class NetworkManager:
             self.current_lobby_id = lobby_id
             print(f"\n--> SUCCESS! Lobby Created ID: {self.current_lobby_id}")
 
-            # Tag the lobby specifically for your game so strangers' Spacewar lobbies are ignored
+            # Tag the lobby specifically for this game, matching the
+            # exact key/value py_steam_net's own get_lobby_list now
+            # filters by server-side (see net_client.rs's own
+            # GAME_IDENTITY_KEY/GAME_IDENTITY_VALUE comment) - a lobby
+            # created here that DIDN'T get this tag would be invisible
+            # to every future search, including this same client's own,
+            # so this isn't just cosmetic. Previously "gname"=
+            # "RatWarGame" was set here but never actually filtered on
+            # anywhere (handle_lobby_list below just took whatever
+            # get_lobby_list returned, unfiltered) - the tag existed but
+            # did nothing; this key/value pairing is what makes it real.
             try:
-                self.client.set_lobby_data(lobby_id, "gname", "RatWarGame")
+                self.client.set_lobby_data(lobby_id, "GameIdentity", "Rat King")
             except Exception as e:
                 print(f"Failed to set custom lobby tag: {e}")
 

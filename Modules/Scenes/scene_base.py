@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from pathlib import Path
 
@@ -16,7 +17,9 @@ from Modules.Graphics.pbr_shader import (
     bind_material,
     bind_frame_uniforms,
     bind_point_lights,
+    bind_probe_irradiance,
     bind_environment,
+    _has_uniform,
     bind_reflection_environment,
     bind_ssr_textures,
     MAX_POINT_LIGHTS,
@@ -35,7 +38,14 @@ from Modules.Graphics.lightmap_baker import (
     dilate_lightmap,
 )
 from Modules.Graphics.model_loader import load_glb, load_glb_by_material
+from Modules.Graphics.lightmap_uv_generator import (
+    DEFAULT_RESOLUTION as _LIGHTMAP_UV_DEFAULT_RESOLUTION,
+    DEFAULT_PADDING_TEXELS as _LIGHTMAP_UV_DEFAULT_PADDING_TEXELS,
+)
 from Modules.Graphics import lightmap_cache_io
+from Modules.Graphics.light_probes import (
+    build_light_probe_grid, sample_light_probe_visibility, sample_light_probe_irradiance,
+)
 from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao, load_animation_clips
 from Modules.Graphics.skeletal_shader import (
     create_skeletal_program,
@@ -98,6 +108,16 @@ _render_cpu_frame_count = 0
 # way - only the real-time cascades/sampling are skipped. Revert to
 # True when done comparing.
 ENABLE_SHADOWS = True
+
+# Mirrors pbr_shader.py's own (private) _ALPHA_MODE_TO_INT - kept as a
+# separate constant here rather than importing that one, since it's a
+# plain literal with no real shared-ownership concern, and reaching into
+# another module's underscore-prefixed name for a 3-entry dict isn't
+# worth the coupling. Used by _bind_shadow_alpha, called once per
+# shadow-casting object per cascade - hoisted out of that method (which
+# used to rebuild this same dict literal on every single call) as a
+# small bonus cleanup alongside the _has_uniform fix in the same method.
+_SHADOW_ALPHA_MODE_TO_INT = {"OPAQUE": 0, "MASK": 1, "BLEND": 2}
 
 
 def _release(resource):
@@ -220,6 +240,12 @@ class Scene:
         self.dynamic_objects = []
         self.skeletal_objects = []
         self.point_lights = []
+        # Built by _build_light_probe_grid (called from bake_static_
+        # lighting) - see light_probes.py's own docstring for what this
+        # is and why _nearest_point_lights samples it instead of doing a
+        # live physics raycast per light per frame. None until then, and
+        # None permanently for a scene with no point lights.
+        self.light_probe_grid = None
         self.sound_manager = SoundManager()
         self.physics = PhysicsWorld()
 
@@ -471,6 +497,11 @@ class Scene:
             "lightmap_vao": lightmap_model["vao"] if lightmap_model else None,
             "has_lightmap_uv": model.get("has_lightmap_uv", False),
             "lightmap_texture": None,
+            # See TEX_UNIT_SUN_LIGHTMAP's own comment in pbr_shader.py -
+            # set alongside lightmap_texture by bake_static_lighting,
+            # None here until then (or forever, for an object that never
+            # gets baked at all).
+            "sun_lightmap_texture": None,
             "texture": model.get("texture"),
             "metallic_roughness_texture": model.get("metallic_roughness_texture"),
             "normal_texture": model.get("normal_texture"),
@@ -555,6 +586,7 @@ class Scene:
                 "lightmap_vao": lightmap_model["vao"] if lightmap_model else None,
                 "has_lightmap_uv": model.get("has_lightmap_uv", False),
                 "lightmap_texture": None,
+                "sun_lightmap_texture": None,
                 "texture": model.get("texture"),
                 "metallic_roughness_texture": model.get("metallic_roughness_texture"),
                 "normal_texture": model.get("normal_texture"),
@@ -1886,6 +1918,15 @@ class Scene:
             "intensity": float(intensity),
             "radius": float(radius),
             "bake_shadows": bool(cast_shadows),
+            # Stable index into self.point_lights at the time this light
+            # was added - what _build_light_probe_grid's visibility array
+            # is indexed by, and what _nearest_point_lights looks its
+            # light back up by (see light_probes.py's own docstring).
+            # Assumes point lights are only ever added before
+            # bake_static_lighting runs, same assumption
+            # bake_static_lighting's own point-light bake loop already
+            # makes.
+            "_probe_index": len(self.point_lights),
         }
         self.point_lights.append(light)
         return light
@@ -1959,18 +2000,43 @@ class Scene:
         game long, regardless of whether those 4 happened to be
         anywhere near a given dynamic object).
 
-        No-op cost when there are MAX_POINT_LIGHTS or fewer lights in
-        the whole scene to begin with (returns self.point_lights as-is,
-        skipping the sort entirely) - only scenes that actually exceed
-        the cap pay for this at all."""
-        if len(self.point_lights) <= MAX_POINT_LIGHTS:
-            return self.point_lights
-
+        Each returned light's "color" is additionally scaled by how much
+        of it self.light_probe_grid says actually reaches `position` -
+        see light_probes.py's own module docstring for why this reads a
+        precomputed, trilinearly-interpolated grid instead of testing
+        that live (a static-geometry raycast) every frame: a moving
+        object crossing directly behind a wall from a light used to
+        flicker hard as consecutive frames' live raycasts landed on
+        opposite sides of the wall's exact silhouette edge, and the
+        interpolated grid has no such single frame-to-frame disagreement
+        to flicker from. Only allocates a modified copy of a light dict
+        when its factor is actually less than fully visible - the common
+        fully-lit case still returns the exact same dicts self.
+        point_lights holds, same as before this existed."""
         def _distance_sq(light):
             delta = light["position"] - position
             return glm.dot(delta, delta)
 
-        return sorted(self.point_lights, key=_distance_sq)[:MAX_POINT_LIGHTS]
+        if len(self.point_lights) <= MAX_POINT_LIGHTS:
+            candidates = self.point_lights
+        else:
+            candidates = sorted(self.point_lights, key=_distance_sq)[:MAX_POINT_LIGHTS]
+
+        if self.light_probe_grid is None:
+            return candidates
+
+        visibility = sample_light_probe_visibility(
+            self.light_probe_grid, position, len(self.point_lights)
+        )
+
+        result = []
+        for light in candidates:
+            factor = float(visibility[light["_probe_index"]])
+            if factor >= 0.999:
+                result.append(light)
+            else:
+                result.append({**light, "color": light["color"] * factor})
+        return result
 
     def mark_static_dirty(self):
         """No-op. Kept only so existing call sites like add_static() don't
@@ -2147,6 +2213,51 @@ class Scene:
             self._bake_directional_shadow_map(self.static_shadow_resolution)
         )
 
+    def _build_light_probe_grid(self):
+        """Builds self.light_probe_grid (see light_probes.py's own
+        module docstring for what it's for and how _nearest_point_lights/
+        _sample_probe_irradiance use it) from every static object's OWN
+        world-space AABB (not one box combined across all of them - see
+        light_probes.py's GRID SCOPE section for why that distinction is
+        what lets a small, disconnected structure like a tunnel get real
+        probe coverage regardless of how large the rest of the map is),
+        using self.physics.line_of_sight as the per-cell/per-light
+        occlusion test - safe to call here because add_static's collision
+        geometry is already attached to self.physics by the time a Scene
+        subclass's __init__ calls bake_static_lighting (every existing
+        caller adds all its static objects first).
+
+        Called unconditionally from bake_static_lighting, including on a
+        cache-hit (lightmap textures loaded straight from disk) - unlike
+        the lightmap bake itself, building this grid is cheap enough
+        (see light_probes.py's own docstring) that there's no need for a
+        matching disk cache/staleness-check scheme; it's just rebuilt
+        fresh every load."""
+        self.light_probe_grid = None
+        if not self.point_lights or not self.static_objects:
+            return
+
+        aabbs = []
+        for obj in self.static_objects:
+            aabb = self._get_world_aabb(obj, movable=False)
+            if aabb is not None:
+                aabbs.append(aabb)
+        if not aabbs:
+            return
+
+        self.light_probe_grid = build_light_probe_grid(
+            aabbs, self.point_lights, self.physics.line_of_sight,
+        )
+
+    def _sample_probe_irradiance(self, position):
+        """The combined, unlimited-light-count diffuse point-light term
+        for a real-time-lit object at world-space `position` - see
+        light_probes.py's module docstring's "irradiance" bullet and
+        pbr_shader.py's u_probe_irradiance. (0, 0, 0) (light_probes.py's
+        own no-grid default) when there's no point light in the scene at
+        all, or bake_static_lighting hasn't run yet."""
+        return sample_light_probe_irradiance(self.light_probe_grid, position)
+
     def bake_static_lighting(self, lightmap_resolution=256, point_shadow_resolution=1024,
                               directional_shadow_resolution=2048):
         """Call this once, after adding all static objects and point
@@ -2178,7 +2289,16 @@ class Scene:
         frame) still compute the sun's shading live.
 
         Point lights added with cast_shadows=False are not baked at all;
-        they stay real-time-unshadowed only (see add_point_light)."""
+        they stay real-time-unshadowed only (see add_point_light).
+
+        Also (re)builds self.light_probe_grid (see
+        _build_light_probe_grid) - unconditionally, even if every
+        lightmap below turns out to be a cache hit, since a dynamic/
+        skeletal object's real-time point-light visibility depends on
+        this grid regardless of whether any STATIC lightmap needed
+        rebaking."""
+        self._build_light_probe_grid()
+
         eligible = [
             obj for obj in self.static_objects
             if obj.get("has_lightmap_uv") and obj.get("lightmap_vao") is not None
@@ -2222,15 +2342,24 @@ class Scene:
             lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, name)
             for name in cache_names
         ]
+        # A second, separate cache file per object - see TEX_UNIT_SUN_
+        # LIGHTMAP's own comment in pbr_shader.py for what this holds
+        # (the sun's own isolated contribution, never combined with any
+        # point light) and why it needs to exist as its own texture/
+        # cache entry rather than being derivable from the combined one.
+        sun_cache_paths = [
+            lightmap_cache_io.lightmap_cache_path(self.lightmap_dir, f"{name}_sun")
+            for name in cache_names
+        ]
 
-        def _load_cache():
-            """Returns the loaded arrays if every cache file exists AND
-            matches the resolutions currently being requested, else None.
-            This check is what stops the cache from silently reusing
-            stale data when lightmap_resolution or point_shadow_resolution
-            change between runs."""
+        def _load_cache(paths):
+            """Returns the loaded arrays if every cache file in `paths`
+            exists AND matches the resolutions currently being requested,
+            else None. This check is what stops the cache from silently
+            reusing stale data when lightmap_resolution or point_shadow_
+            resolution change between runs."""
             loaded = []
-            for path in cache_paths:
+            for path in paths:
                 array = lightmap_cache_io.load_lightmap_cache(
                     path, lightmap_resolution, point_shadow_resolution,
                     directional_shadow_resolution
@@ -2240,31 +2369,36 @@ class Scene:
                 loaded.append(array)
             return loaded
 
-        if not self.recalculate_shadows:
-            cached_arrays = _load_cache()
-            if cached_arrays is not None:
-                for obj, array in zip(eligible, cached_arrays):
-                    _release(obj.get("lightmap_texture"))
+        def _texture_from_cache_array(array):
+            # .astype/.tobytes() rather than relying on the loaded
+            # array's dtype directly - guards against a cache file
+            # ever ending up float32 (e.g. from a different numpy
+            # version) not matching the f2 (half-float) texture
+            # format below.
+            #
+            # 3 components (RGB), not 4: the RGBA requirement only
+            # applied during baking, because GL_RGB16F isn't a
+            # guaranteed-renderable framebuffer format. This
+            # texture is only ever sampled at runtime, never
+            # rendered into again, so that constraint doesn't
+            # apply here - no reason to carry a wasted alpha
+            # channel through disk storage and back.
+            array = array.astype(np.float16)
+            texture = self.ctx.texture(
+                (array.shape[1], array.shape[0]), 3, array.tobytes(), dtype="f2"
+            )
+            texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            return texture
 
-                    # .astype/.tobytes() rather than relying on the loaded
-                    # array's dtype directly - guards against a cache file
-                    # ever ending up float32 (e.g. from a different numpy
-                    # version) not matching the f2 (half-float) texture
-                    # format below.
-                    #
-                    # 3 components (RGB), not 4: the RGBA requirement only
-                    # applied during baking, because GL_RGB16F isn't a
-                    # guaranteed-renderable framebuffer format. This
-                    # texture is only ever sampled at runtime, never
-                    # rendered into again, so that constraint doesn't
-                    # apply here - no reason to carry a wasted alpha
-                    # channel through disk storage and back.
-                    array = array.astype(np.float16)
-                    texture = self.ctx.texture(
-                        (array.shape[1], array.shape[0]), 3, array.tobytes(), dtype="f2"
-                    )
-                    texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    obj["lightmap_texture"] = texture
+        if not self.recalculate_shadows:
+            cached_arrays = _load_cache(cache_paths)
+            cached_sun_arrays = _load_cache(sun_cache_paths) if cached_arrays is not None else None
+            if cached_arrays is not None and cached_sun_arrays is not None:
+                for obj, array, sun_array in zip(eligible, cached_arrays, cached_sun_arrays):
+                    _release(obj.get("lightmap_texture"))
+                    _release(obj.get("sun_lightmap_texture"))
+                    obj["lightmap_texture"] = _texture_from_cache_array(array)
+                    obj["sun_lightmap_texture"] = _texture_from_cache_array(sun_array)
 
                 return
 
@@ -2277,7 +2411,9 @@ class Scene:
 
         for obj in eligible:
             _release(obj.get("lightmap_texture"))
+            _release(obj.get("sun_lightmap_texture"))
             obj["lightmap_texture"] = create_lightmap(self.ctx, lightmap_resolution)
+            obj["sun_lightmap_texture"] = create_lightmap(self.ctx, lightmap_resolution)
 
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = "<="
@@ -2357,6 +2493,23 @@ class Scene:
                 directional_depth, directional_light_vp,
                 directional_shadow_resolution,
             )
+            # ALSO baked into its own separate texture, in isolation from
+            # every point light baked above - see TEX_UNIT_SUN_LIGHTMAP's
+            # own comment for why a moving object's shadow needs this
+            # (the sun's own known contribution, never combined with a
+            # point light's) to subtract back out of the combined
+            # lightmap_texture correctly. bake_directional_light only
+            # ever reads/writes whatever's under "lightmap_texture" on
+            # the dict it's given, so a shallow copy with that one key
+            # swapped is all this needs - no change to bake_directional_
+            # light itself.
+            bake_directional_light(
+                self.ctx, self.bake_program, {**obj, "lightmap_texture": obj["sun_lightmap_texture"]},
+                self._get_model_matrix(obj),
+                self.light_dir, self.light_color, self.light_intensity,
+                directional_depth, directional_light_vp,
+                directional_shadow_resolution,
+            )
         directional_depth.release()
 
         # Disabled BEFORE dilation, not after (see the old position of
@@ -2384,11 +2537,32 @@ class Scene:
         # so a cached reload gets the already-dilated result too,
         # without needing to redo this on every load. See lightmap_
         # baker.py's dilate_lightmap for what/why.
+        #
+        # iterations scaled to THIS bake's own real lightmap_resolution,
+        # not dilate_lightmap's own default (which only ever matches
+        # generate_lightmap_uvs' internal DEFAULT_RESOLUTION assumption,
+        # 256) - see both functions' own docstrings for the full
+        # reasoning. +4 texels of slack past the exact scaled-up margin,
+        # matching the same "a bit more than the minimum" cushion the
+        # original 6-vs-4 default already used, so two dilation fronts
+        # growing toward each other from opposite edges of a chart's own
+        # margin comfortably meet in the middle rather than just barely
+        # touching.
+        dilate_iterations = math.ceil(
+            _LIGHTMAP_UV_DEFAULT_PADDING_TEXELS
+            * (lightmap_resolution / _LIGHTMAP_UV_DEFAULT_RESOLUTION)
+        ) + 4
         for obj in eligible:
-            dilate_lightmap(self.ctx, self.dilate_program, self.dilate_quad_vao, obj["lightmap_texture"])
+            dilate_lightmap(
+                self.ctx, self.dilate_program, self.dilate_quad_vao, obj["lightmap_texture"],
+                iterations=dilate_iterations,
+            )
+            dilate_lightmap(
+                self.ctx, self.dilate_program, self.dilate_quad_vao, obj["sun_lightmap_texture"],
+                iterations=dilate_iterations,
+            )
 
-        for obj, path in zip(eligible, cache_paths):
-            texture = obj["lightmap_texture"]
+        def _save_texture_cache(texture, path):
             width, height = texture.size
             array = np.frombuffer(texture.read(), dtype=np.float16).reshape(height, width, 4)
             # Drop the alpha channel before persisting - it's unused dead
@@ -2397,6 +2571,10 @@ class Scene:
                 path, array[:, :, :3], lightmap_resolution, point_shadow_resolution,
                 directional_shadow_resolution
             )
+
+        for obj, path, sun_path in zip(eligible, cache_paths, sun_cache_paths):
+            _save_texture_cache(obj["lightmap_texture"], path)
+            _save_texture_cache(obj["sun_lightmap_texture"], sun_path)
 
         print(f"[Scene] Baked and saved {len(eligible)} lightmap(s) to {self.lightmap_dir}")
 
@@ -2580,27 +2758,30 @@ class Scene:
             yield
         self._profile_samples[label] = self._profile_samples.get(label, 0) + query.elapsed
 
-    # def _report_profile_window(self):
-    #     """Called once per frame from render() - counts frames and, every
-    #     _PROFILE_RENDER_WINDOW_FRAMES of them, prints every label from
-    #     self._profile_samples sorted most-expensive-first (total
-    #     milliseconds across the whole window, and the per-frame average -
-    #     the average is usually the more directly useful number, e.g. "is
-    #     THIS mesh alone costing 2ms of the 16.6ms budget for 60fps"),
-    #     then resets for the next window. A no-op entirely while
-    #     PROFILE_RENDER is off."""
-    #     if not PROFILE_RENDER:
-    #         return
-    #     self._profile_frame_count += 1
-    #     if self._profile_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
-    #         return
+    def _report_profile_window(self):
+        """Called once per frame from render() - counts frames and, every
+        _PROFILE_RENDER_WINDOW_FRAMES of them, prints every label from
+        self._profile_samples sorted most-expensive-first (total
+        milliseconds across the whole window, and the per-frame average -
+        the average is usually the more directly useful number, e.g. "is
+        THIS mesh alone costing 2ms of the 16.6ms budget for 60fps"),
+        then resets for the next window. A no-op entirely while
+        PROFILE_RENDER is off."""
+        if not PROFILE_RENDER:
+            return
+        self._profile_frame_count += 1
+        if self._profile_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
+            return
 
-    #     frames = self._profile_frame_count
-    #     ranked = sorted(self._profile_samples.items(), key=lambda kv: kv[1], reverse=True)
-    #     print(f"[render profile] over the last {frames} frame(s):")
-    #     for label, total_ns in ranked:
-    #         total_ms = total_ns / 1_000_000.0
-    #         print(f"  {label:40s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
+        frames = self._profile_frame_count
+        ranked = sorted(self._profile_samples.items(), key=lambda kv: kv[1], reverse=True)
+        print(f"[render profile] over the last {frames} frame(s):")
+        for label, total_ns in ranked:
+            total_ms = total_ns / 1_000_000.0
+            print(f"  {label:40s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
+
+        self._profile_samples = {}
+        self._profile_frame_count = 0
 
     #     self._profile_samples = {}
     #     self._profile_frame_count = 0
@@ -2875,19 +3056,27 @@ class Scene:
         lighting's own per-point-light shadow cube) needs this, since
         an object's alpha factors otherwise stay at whatever the LAST
         different object left the program's uniforms holding."""
+        # _has_uniform, not the bare `"name" in self.shadow_program`
+        # this used to be - moderngl's Program has no __contains__, so
+        # the bare form falls back to a full linear scan of every
+        # uniform the program declares (see _has_uniform's own
+        # docstring). This method alone showed up as the second-largest
+        # single cost in a CPU profile of the whole renderer (called
+        # once per shadow-casting object per cascade), almost entirely
+        # from these 5 membership checks.
         tex = obj.get("texture")
-        if tex is not None and "u_texture" in self.shadow_program:
+        if tex is not None and _has_uniform(self.shadow_program, "u_texture"):
             tex.use(location=0)
             self.shadow_program["u_texture"].value = 0
-        if "u_has_texture" in self.shadow_program:
+        if _has_uniform(self.shadow_program, "u_has_texture"):
             self.shadow_program["u_has_texture"].value = obj.get("has_texture", 0)
-        if "u_alpha_mode" in self.shadow_program:
-            self.shadow_program["u_alpha_mode"].value = {"OPAQUE": 0, "MASK": 1, "BLEND": 2}.get(
+        if _has_uniform(self.shadow_program, "u_alpha_mode"):
+            self.shadow_program["u_alpha_mode"].value = _SHADOW_ALPHA_MODE_TO_INT.get(
                 obj.get("alpha_mode", "OPAQUE"), 0
             )
-        if "u_alpha_cutoff" in self.shadow_program:
+        if _has_uniform(self.shadow_program, "u_alpha_cutoff"):
             self.shadow_program["u_alpha_cutoff"].value = float(obj.get("alpha_cutoff", 0.5))
-        if "u_base_alpha" in self.shadow_program:
+        if _has_uniform(self.shadow_program, "u_base_alpha"):
             self.shadow_program["u_base_alpha"].value = float(obj.get("base_alpha", 1.0))
 
     def _render_shadows(self, camera):
@@ -3038,9 +3227,27 @@ class Scene:
         self.ctx.disable(moderngl.CULL_FACE)
 
         view_proj = camera.get_projection_matrix() * camera.get_view_matrix()
+        # Same camera as _render_scene's own main pass, so the same
+        # frustum test applied there is exactly correct here too - not
+        # just an optimization shortcut: an object _render_scene culled
+        # never wrote color OR depth to self.ctx.screen this frame
+        # either, so redrawing it into the SSR depth texture anyway was
+        # pure waste (a real, unconditional draw call - matrix build,
+        # uniform writes, shadow_vao.render() - for geometry that can
+        # never actually be ray-marched against, since nothing on
+        # screen is behind it to reflect). Confirmed via CPU profiling
+        # as a real cost: this pass previously redrew EVERY static
+        # object every time SSR was active, regardless of how much of
+        # the level was actually in view.
+        frustum_planes = extract_frustum_planes(view_proj)
 
-        for obj in (*self.static_objects, *self.dynamic_objects):
+        for obj, movable in (
+            *((o, False) for o in self.static_objects),
+            *((o, True) for o in self.dynamic_objects),
+        ):
             if obj.get("alpha_mode") == "BLEND":
+                continue
+            if not self._is_visible(obj, frustum_planes, movable=movable):
                 continue
             mvp = view_proj * self._get_model_matrix(obj)
             self.shadow_program["u_light_mvp"].write(mvp.to_bytes())
@@ -3049,6 +3256,13 @@ class Scene:
 
         for obj in self.skeletal_objects:
             if not obj.get("visible_in_color", True):
+                continue
+            # No-op for a skeletal object in practice (_is_visible
+            # always returns True for one - see its own docstring, no
+            # cached AABB available), kept here anyway so this stays
+            # correct/consistent if that ever changes rather than
+            # silently relying on the exemption.
+            if not self._is_visible(obj, frustum_planes, movable=True):
                 continue
             mvp = view_proj * self._get_model_matrix(obj)
             self.skeletal_shadow_program["u_light_mvp"].write(mvp.to_bytes())
@@ -3059,7 +3273,7 @@ class Scene:
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "back"
 
-    def _render_ssr_pass(self, camera):
+    def _render_ssr_pass(self, camera, pbr_view_proj):
         """Redraws ONLY the OPAQUE/MASK static objects whose material has
         water_overrides "reflection_mode": "ssr" (see add_static's own
         docstring), a second time, now with the just-grabbed scene
@@ -3096,21 +3310,12 @@ class Scene:
         self.ctx.depth_func = "<="
         self.ctx.enable(moderngl.CULL_FACE)
 
-        bind_point_lights(self.pbr_program, self.point_lights)
-        bind_environment(self.pbr_program, self.environment_sky_color, self.environment_ground_color)
-        bind_reflection_environment(
-            self.pbr_program, self.equirect_skybox_texture,
-            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
-        )
+        # Point lights/environment/reflection/camera/light/shadow
+        # uniforms were already bound once this frame by _bind_pbr_
+        # frame_uniforms (see its own docstring - nothing here changed
+        # since then) - only the just-grabbed SSR color/depth are
+        # genuinely new data this pass needs to bind itself.
         bind_ssr_textures(self.pbr_program, self._ssr_color_texture, self._ssr_depth_texture)
-        active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
-        view_proj = bind_frame_uniforms(
-            self.pbr_program, camera, self.light_dir, active_shadow_manager,
-            light_color=self.light_color, light_intensity=self.light_intensity,
-            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
-            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
-            static_shadow_light_vp=self._static_shadow_light_vp,
-        )
         for obj in ssr_objects:
             if obj.get("double_sided"):
                 self.ctx.disable(moderngl.CULL_FACE)
@@ -3118,57 +3323,85 @@ class Scene:
                 self.ctx.enable(moderngl.CULL_FACE)
                 self.ctx.cull_face = "back"
             model_matrix = self._get_model_matrix(obj)
-            bind_material(self.pbr_program, obj, model_matrix, view_proj)
+            bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
             obj["vao"].render()
 
         self.ctx.depth_func = "<"
 
-    def _render_scene(self, camera):
-        self.ctx.screen.use()
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.depth_func = "<"
-        self.ctx.enable(moderngl.CULL_FACE)
-        self.ctx.cull_face = "back"
+    def _bind_pbr_frame_uniforms(self, camera):
+        """Everything on self.pbr_program that's identical for every
+        object AND every pass this whole frame (point lights, ambient
+        environment, equirect reflection environment, camera/light/
+        shadow uniforms) - bound exactly ONCE here, reused by
+        _render_scene, _render_ssr_pass, and _render_transparent_objects
+        alike, instead of each of those three separately re-calling
+        bind_point_lights/bind_environment/bind_reflection_environment/
+        bind_frame_uniforms with the literal same arguments.
 
-        # Point-light data and shadow textures are identical for every
-        # object this frame, so bind them once here rather than inside
-        # the per-object loop below. Done separately for pbr_program and
-        # skeletal_program - they're two distinct compiled GL programs,
-        # each with its own uniform locations, so binding one doesn't
-        # affect the other even though the uniform names match.
+        This used to be 3 separate call sites (once per pass) doing the
+        exact same work three times a frame - confirmed via CPU
+        profiling as a real, disproportionately large cost: bind_frame_
+        uniforms alone rebuilds several mat4 arrays via Python-side
+        glm.to_bytes()/b"".join() calls (see its own docstring), and
+        paying that 3x for a "transparent" pass that then goes on to
+        draw as few as ONE blend object, or an "ssr" pass with a
+        handful of objects, made those passes cost nearly as much as
+        the main opaque pass despite drawing a fraction of the content -
+        exactly backwards from where the cost should concentrate.
+        Nothing these functions bind can actually have changed between
+        those three passes within the same frame (same camera, same
+        sun, same shadow cascades, same ambient/reflection environment),
+        so doing it a second or third time was pure waste, not fresher
+        data.
+
+        Returns pbr_view_proj (see bind_frame_uniforms' own docstring)
+        so every pass can still cheaply build its own per-object u_mvp
+        without re-deriving the camera's view/projection matrices."""
         bind_point_lights(self.pbr_program, self.point_lights)
-        bind_point_lights(self.skeletal_program, self.point_lights)
         bind_environment(self.pbr_program, self.environment_sky_color, self.environment_ground_color)
-        bind_environment(self.skeletal_program, self.environment_sky_color, self.environment_ground_color)
         bind_reflection_environment(
             self.pbr_program, self.equirect_skybox_texture,
-            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
-        )
-        bind_reflection_environment(
-            self.skeletal_program, self.equirect_skybox_texture,
             exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
         )
         # No scene grab exists yet this early in the frame (this IS the
         # pass that produces one - see _grab_scene_textures/_render_ssr_
         # pass, called AFTER this) - an "ssr" material just falls back
-        # to the plain skybox reflection on THIS draw; _render_ssr_pass
-        # redraws it a second time, afterward, with the real thing.
+        # to the plain skybox reflection on THIS draw; _render_ssr_pass/
+        # _render_transparent_objects each rebind this a second time,
+        # later, with the real thing (genuinely fresh data every frame,
+        # unlike everything else this method binds - not folded in here).
         bind_ssr_textures(self.pbr_program, None, None)
-        bind_ssr_textures(self.skeletal_program, None, None)
-        # view/light/shadow uniforms are identical for every object this
-        # frame too (same camera, same sun, same shadow cascades) - bound
-        # once per program here rather than inside the loops below (see
-        # bind_frame_uniforms' own docstring). Each returns view_proj so
-        # bind_material can cheaply build u_mvp per object without
-        # re-deriving the camera's view/projection matrices every draw.
         active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
-        pbr_view_proj = bind_frame_uniforms(
+        return bind_frame_uniforms(
             self.pbr_program, camera, self.light_dir, active_shadow_manager,
             light_color=self.light_color, light_intensity=self.light_intensity,
             time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
             static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
             static_shadow_light_vp=self._static_shadow_light_vp,
         )
+
+    def _render_scene(self, camera, pbr_view_proj):
+        self.ctx.screen.use()
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.depth_func = "<"
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.cull_face = "back"
+
+        # pbr_view_proj (and everything else self.pbr_program needs this
+        # frame) was already bound once by _bind_pbr_frame_uniforms - see
+        # its own docstring for why this no longer redoes that here.
+        # skeletal_program is a SEPARATE compiled GL program (its own
+        # uniform locations, same names) that only ever needs this once,
+        # right here - not duplicated across passes the way pbr_program's
+        # binding used to be, so it stays exactly as before.
+        bind_point_lights(self.skeletal_program, self.point_lights)
+        bind_environment(self.skeletal_program, self.environment_sky_color, self.environment_ground_color)
+        bind_reflection_environment(
+            self.skeletal_program, self.equirect_skybox_texture,
+            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
+        )
+        bind_ssr_textures(self.skeletal_program, None, None)
+        active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
         skeletal_view_proj = bind_frame_uniforms(
             self.skeletal_program, camera, self.light_dir, active_shadow_manager,
             light_color=self.light_color, light_intensity=self.light_intensity,
@@ -3200,6 +3433,20 @@ class Scene:
         frustum_planes = extract_frustum_planes(pbr_view_proj)
 
         blended_objects = []
+        # Tracked here (where every object's visibility is already being
+        # tested for culling anyway) so render() can skip _grab_scene_
+        # textures/_render_ssr_pass entirely on a frame where nothing
+        # visible actually needs them - see render()'s own use of the
+        # returned value and _render_ssr_depth_prepass's own docstring
+        # for why that pair is expensive enough (a full second depth-only
+        # redraw of every opaque/MASK object) to be worth skipping
+        # whenever there's genuinely nothing for it to feed - e.g. the
+        # camera facing away from the scene's only "ssr" material (an
+        # enable_screen_space_reflections water plane, typically), not
+        # just "SSR was ever enabled for this scene at all" (which stays
+        # true for the scene's whole lifetime and so never actually
+        # skips anything on its own).
+        any_ssr_visible = False
         # (obj, label_prefix) rather than the plain concatenated
         # tuple render used before PROFILE_RENDER existed - only matters
         # for building each object's own profiling label below (see
@@ -3212,6 +3459,8 @@ class Scene:
         for obj, prefix, movable in tagged_objects:
             if not self._is_visible(obj, frustum_planes, movable=movable):
                 continue
+            if obj.get("reflection_mode") == "ssr":
+                any_ssr_visible = True
             if obj.get("alpha_mode") == "BLEND":
                 # movable carried along too - _render_transparent_
                 # objects needs it to depth-sort correctly (see its own
@@ -3242,6 +3491,7 @@ class Scene:
             # whatever the frame-level call left bound).
             if movable or not obj.get("lightmap_texture"):
                 bind_point_lights(self.pbr_program, self._nearest_point_lights(obj["position"]))
+                bind_probe_irradiance(self.pbr_program, self._sample_probe_irradiance(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
             bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
             with self._profiled(f"{prefix}:{obj.get('name', '?')}"):
@@ -3268,6 +3518,7 @@ class Scene:
             # lights rebind, not whatever the frame-level call (or the
             # previous skeletal object's own rebind) left bound.
             bind_point_lights(self.skeletal_program, self._nearest_point_lights(obj["position"]))
+            bind_probe_irradiance(self.skeletal_program, self._sample_probe_irradiance(obj["position"]))
 
             # bind_material is fully generic on prog - reused as-is here
             # rather than duplicating a "bind_skeletal_material":
@@ -3279,9 +3530,9 @@ class Scene:
             with self._profiled(f"skeletal:{obj.get('name', '?')}"):
                 obj["vao"].render()
 
-        return blended_objects
+        return blended_objects, any_ssr_visible
 
-    def _render_transparent_objects(self, camera, blended_objects):
+    def _render_transparent_objects(self, camera, blended_objects, pbr_view_proj):
         """Draws BLEND-alpha_mode objects (see _render_scene's own
         comment on why they're excluded from its own pass) - called from
         render() AFTER the skybox specifically, not just after _render_
@@ -3370,39 +3621,19 @@ class Scene:
         self.ctx.disable(moderngl.CULL_FACE)
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-        # Explicitly (re-)bound here, not left to whatever _render_scene/
-        # _render_ssr_pass happened to leave on self.pbr_program earlier
-        # this same frame - a BLEND material (e.g. transparent water)
-        # with reflection_mode="ssr" needs the real grabbed color/depth
-        # bound for its own env_reflection block to do anything but fall
-        # back to the cheap skybox path (see ssr_reflect's own u_has_
-        # scene_grab check) - relying on _render_ssr_pass's own call to
-        # have already set this correctly would silently break the
-        # moment its own ssr_objects list happened to be empty (e.g. a
-        # scene whose ONLY "ssr" material is this BLEND one), since that
-        # method returns early without touching these uniforms at all in
-        # that case.
-        bind_reflection_environment(
-            self.pbr_program, self.equirect_skybox_texture,
-            exposure=self.equirect_exposure, is_hdr=self.equirect_is_hdr,
-        )
+        # Point lights/environment/reflection/camera/light/shadow
+        # uniforms (and pbr_view_proj, passed in) were already bound once
+        # this frame by _bind_pbr_frame_uniforms (see its own docstring)
+        # - reflection_environment in particular used to be re-bound here
+        # defensively in case _render_ssr_pass's own ssr_objects list was
+        # empty and skipped binding it, but _bind_pbr_frame_uniforms now
+        # guarantees it's fresh every frame regardless, so that's no
+        # longer a concern. Only the just-grabbed SSR color/depth are
+        # genuinely new data this pass needs to bind itself - a BLEND
+        # material (e.g. transparent water) with reflection_mode="ssr"
+        # needs the real grabbed color/depth for its own env_reflection
+        # block to do anything but fall back to the cheap skybox path.
         bind_ssr_textures(self.pbr_program, self._ssr_color_texture, self._ssr_depth_texture)
-        # Called once for this whole pass, not per object - see
-        # bind_frame_uniforms' own docstring (same reasoning _render_
-        # scene already applies to its own static/dynamic/skeletal
-        # loops). time/near/far/frame added for the same reason as the
-        # reflection/SSR binding above - a BLEND water material's own
-        # animated normal pan (u_time) and SSR ray march (u_near/u_far)
-        # need these to be genuinely fresh for THIS pass, not whatever
-        # an earlier pass happened to leave behind.
-        blend_active_shadow_manager = self.shadow_manager if ENABLE_SHADOWS else None
-        blend_view_proj = bind_frame_uniforms(
-            self.pbr_program, camera, self.light_dir, blend_active_shadow_manager,
-            light_color=self.light_color, light_intensity=self.light_intensity,
-            time=self._elapsed_time, near=camera.near, far=camera.far, frame=self._frame_count,
-            static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
-            static_shadow_light_vp=self._static_shadow_light_vp,
-        )
         for obj, _movable in blended_objects:
             # BLEND objects are never lightmapped (see add_static's own
             # alpha_mode_overrides docstring - baking assumes opaque,
@@ -3411,8 +3642,9 @@ class Scene:
             # every one of these always needs its own nearest-lights
             # rebind, same as the skeletal loop above.
             bind_point_lights(self.pbr_program, self._nearest_point_lights(obj["position"]))
+            bind_probe_irradiance(self.pbr_program, self._sample_probe_irradiance(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
-            bind_material(self.pbr_program, obj, model_matrix, blend_view_proj)
+            bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
             with self._profiled(f"blend:{obj.get('name', '?')}"):
                 obj["vao"].render()
         self.ctx.disable(moderngl.BLEND)
@@ -3432,8 +3664,16 @@ class Scene:
         if ENABLE_SHADOWS:
             with self._profiled("shadows"), self._profiled_cpu("shadows"):
                 self._render_shadows(camera)
+
+        # ONE frame-level bind for everything self.pbr_program needs
+        # that doesn't change between now and the end of this frame -
+        # see _bind_pbr_frame_uniforms' own docstring for why this used
+        # to be 3 separate, identical rebinds (main scene/ssr/transparent
+        # passes) and what that actually cost.
+        pbr_view_proj = self._bind_pbr_frame_uniforms(camera)
+
         with self._profiled_cpu("main_scene"):
-            blended_objects = self._render_scene(camera)
+            blended_objects, any_ssr_visible = self._render_scene(camera, pbr_view_proj)
 
         if self.skybox_textures is not None:
             with self._profiled("skybox"), self._profiled_cpu("skybox"):
@@ -3459,9 +3699,23 @@ class Scene:
         # called this scene, or no static object actually uses
         # "reflection_mode": "ssr" - free for every scene/material that
         # doesn't touch this feature at all.
-        with self._profiled("ssr"), self._profiled_cpu("ssr"):
-            self._grab_scene_textures(camera)
-            self._render_ssr_pass(camera)
+        #
+        # Also skipped outright (any_ssr_visible, from _render_scene's
+        # own per-object visibility test above) when NOTHING currently
+        # on screen actually has reflection_mode="ssr" this frame - e.g.
+        # the camera facing away from the scene's only ssr water plane.
+        # _grab_scene_textures/_render_ssr_depth_prepass redraw every
+        # opaque/MASK object a SECOND time (a real full extra pass, not
+        # just uniform rebinding - see _render_ssr_depth_prepass's own
+        # docstring), confirmed via CPU profiling as a genuinely large
+        # per-frame cost that was previously paid unconditionally for
+        # the scene's entire lifetime once enable_screen_space_
+        # reflections had ever been called, regardless of whether the
+        # one thing it exists to feed was even in view.
+        if any_ssr_visible:
+            with self._profiled("ssr"), self._profiled_cpu("ssr"):
+                self._grab_scene_textures(camera)
+                self._render_ssr_pass(camera, pbr_view_proj)
 
         # AFTER the skybox (and the SSR redraw above, which needs to be
         # the LAST thing to touch water's own opaque pixels before
@@ -3469,10 +3723,10 @@ class Scene:
         # transparent_objects' own docstring for exactly why the skybox
         # part of this order matters.
         with self._profiled_cpu("transparent"):
-            self._render_transparent_objects(camera, blended_objects)
+            self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
 
-        # self._report_profile_window()
-        # self._report_render_cpu_profile_window()
+        self._report_profile_window()
+        self._report_render_cpu_profile_window()
 
     # =============================================================
     # DESTROY
@@ -3534,7 +3788,7 @@ class Scene:
 
     def _release_object(self, obj):
         for key in (
-            "vao", "shadow_vao", "lightmap_vao", "lightmap_texture",
+            "vao", "shadow_vao", "lightmap_vao", "lightmap_texture", "sun_lightmap_texture",
             "texture", "metallic_roughness_texture", "normal_texture", "_material_ubo",
         ):
             _release(obj.get(key))

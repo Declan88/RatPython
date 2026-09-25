@@ -50,6 +50,8 @@ already used for real-time shadows, just fed different light_mvps.
 import moderngl
 import numpy as np
 
+from Modules.Graphics.pbr_shader import _has_uniform
+
 BAKE_VERTEX_SHADER = """
 #version 330
 uniform mat4 u_model;
@@ -330,9 +332,29 @@ def dilate_lightmap(ctx, dilate_program, quad_vao, texture, iterations=6):
     """Grows each chart's own baked lighting outward by `iterations`
     texels into the empty padding gap generate_lightmap_uvs left around
     it (see that function's own padding_texels docstring - it explicitly
-    expects a dilation step like this one to exist, sized to match; 6
-    here comfortably covers padding_texels' own default of 4.0 with a
-    little slack).
+    expects a dilation step like this one to exist, sized to match).
+
+    iterations MUST be sized against the REAL resolution `texture` was
+    actually baked at, not generate_lightmap_uvs' own internal
+    DEFAULT_RESOLUTION assumption (256) - that function reserves a
+    margin that's a FIXED FRACTION of UV space, computed without ever
+    knowing what resolution this texture would really end up being
+    baked at (that's decided later, independently - see Scene.
+    bake_static_lighting), so the real, actual TEXEL width of that
+    margin scales up proportionally with however much higher the real
+    resolution is than DEFAULT_RESOLUTION. The default of 6 here only
+    ever matches DEFAULT_RESOLUTION itself (256) - Scene.bake_static_
+    lighting's own call site computes a real value scaled to whatever
+    lightmap_resolution it's actually baking at instead of relying on
+    this default, which is kept only for any other/future caller that
+    doesn't. Getting this wrong doesn't error or crash - it silently
+    leaves most of the padding gap as raw, never-written clear color
+    instead of a safe color extension, which is exactly what was
+    confirmed to cause visible bleeding/seams between unrelated charts
+    packed into the same lightmap (this project bakes at 2048-4096,
+    8-16x DEFAULT_RESOLUTION, while this default of 6 alone would only
+    ever ACTUALLY cover a 256-resolution bake, leaving most of the real
+    gap at those higher resolutions completely unfilled).
 
     Without this, the padding gap is still just whatever create_lightmap
     cleared it to (transparent black) - bilinear sampling at a chart's
@@ -409,9 +431,9 @@ def bake_point_light(ctx, bake_program, obj, model_matrix, light, shadow_map=Non
             shadow_map.live_textures[face].use(location=face)
         # Whole-array assignment, not per-index bracket names - see
         # pbr_shader.py's docstring for why that distinction matters.
-        if "u_point_shadow_faces" in bake_program:
+        if _has_uniform(bake_program, "u_point_shadow_faces"):
             bake_program["u_point_shadow_faces"].value = tuple(range(6))
-        if "u_point_light_mvps" in bake_program:
+        if _has_uniform(bake_program, "u_point_light_mvps"):
             bake_program["u_point_light_mvps"].write(b"".join(m.to_bytes() for m in shadow_map.light_mvps))
     else:
         bake_program["u_has_shadow"].value = 0
@@ -448,9 +470,9 @@ def bake_directional_light(ctx, bake_program, obj, model_matrix, light_dir, ligh
     bake_program["u_light_dir"].value = tuple(light_dir)
 
     shadow_texture.use(location=0)
-    if "u_directional_shadow_map" in bake_program:
+    if _has_uniform(bake_program, "u_directional_shadow_map"):
         bake_program["u_directional_shadow_map"].value = 0
-    if "u_directional_light_mvp" in bake_program:
+    if _has_uniform(bake_program, "u_directional_light_mvp"):
         bake_program["u_directional_light_mvp"].write(shadow_light_mvp.to_bytes())
     bake_program["u_directional_shadow_texel"].value = 1.0 / shadow_resolution
 

@@ -298,6 +298,7 @@ class WindowManager:
             pygame.display.set_caption(
                 f"{self.title} - {self.clock.get_fps():.0f} FPS - {vsync_label}"
             )
+            print(f"[FPS] {self.clock.get_fps():.1f}")
 
         return True, dt
 

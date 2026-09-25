@@ -212,7 +212,30 @@ def _pack_charts(chart_uvs, margin):
     return offsets, (max(packed_width, 1e-9), max(packed_height, 1e-9))
 
 
-def generate_lightmap_uvs(vertices, faces, resolution=256, padding_texels=4.0,
+# Both defaults are also referenced from lightmap_baker.py's
+# dilate_lightmap (via scene_base.py's bake_static_lighting) to scale
+# its own dilation reach to whatever resolution a scene ACTUALLY bakes
+# at - see that call site's own comment for why: this function has no
+# way to know the real bake resolution at UV-generation time (see
+# generate_lightmap_uvs' own resolution docstring - it's decided later,
+# independently, at bake time), so the margin it reserves is a FIXED
+# FRACTION of UV space computed against this assumed resolution, not
+# the real one. Keeping both as named, importable constants (rather
+# than bare literals repeated in two files) is what keeps them from
+# silently drifting apart the way they already once did: this project's
+# scenes bake at 2048/4096, 8-16x this DEFAULT_RESOLUTION, so the real
+# per-chart margin at bake time was 8-16x more texels wide than
+# dilate_lightmap's own OLD fixed iteration count ever reached -
+# confirmed as the actual cause of a reported lightmap seam/bleed bug.
+DEFAULT_RESOLUTION = 256
+# 12, not the old 4 - directly "more breathing room" between charts, on
+# top of fixing the dilation-reach mismatch above (see this module's
+# own docstring for both).
+DEFAULT_PADDING_TEXELS = 12.0
+
+
+def generate_lightmap_uvs(vertices, faces, resolution=DEFAULT_RESOLUTION,
+                           padding_texels=DEFAULT_PADDING_TEXELS,
                            angle_threshold_deg=5.0):
     """Generates a lightmap UV set for a mesh that doesn't have one -
     see this module's own docstring for the overall approach (planar-
@@ -222,23 +245,31 @@ def generate_lightmap_uvs(vertices, faces, resolution=256, padding_texels=4.0,
     fine, only relative positions WITHIN a chart matter (see
     _flatten_chart).
     faces: (M, 3) int array of triangle vertex indices into vertices.
-    resolution: the lightmap texture resolution this UV set is
-    expected to eventually be baked at (e.g. Scene.bake_static_
-    lighting's own lightmap_resolution) - used only to convert
-    padding_texels into a UV-space margin, never to allocate a texture
-    here. The actual bake resolution is decided later, independently,
-    at bake time (see Scene.add_static/bake_static_lighting) - if the
-    real resolution ends up HIGHER than this, the margin is simply
-    more generous than the minimum needed (safe); a resolution LOWER
-    than this would under-pad and risk bleed, which is why the default
-    here matches bake_static_lighting's own conservative default (256)
-    rather than this project's typically-much-higher per-scene
-    settings (e.g. MainMapScene's 4096) - pass the real target
-    resolution through if it's known to be lower than 256.
-    padding_texels: gap enforced between charts, in texels of the
-    eventual bake target - needs to be at least as big as whatever
-    blur/dilation radius lightmap_baker.py applies, or adjacent charts'
-    baked lighting will visibly bleed into each other.
+    resolution: the lightmap texture resolution this UV set is assumed
+    to be baked at when converting padding_texels into a UV-space
+    margin - never used to allocate a texture here. The actual bake
+    resolution is decided later, independently, at bake time (see
+    Scene.add_static/bake_static_lighting), so this is necessarily a
+    guess: DEFAULT_RESOLUTION matches this function's own default
+    (deliberately conservative/low, not this project's typically-much-
+    higher per-scene settings - e.g. MainMapScene's 2048), so the
+    margin this reserves, AS A FRACTION OF UV SPACE, ends up more
+    generous than the minimum needed once actually baked at a real,
+    higher resolution - safe on its own, but see dilate_lightmap's own
+    docstring (lightmap_baker.py) for the other half of this: whatever
+    that UV-space margin turns out to be in REAL texels at the ACTUAL
+    bake resolution, dilation has to reach at least that far to
+    actually fill it, or the padding this reserves stays raw, unfilled
+    clear color instead of a safe color extension - confirmed as a real
+    bug (this docstring described the invariant; dilate_lightmap wasn't
+    actually honoring it) rather than a hypothetical one.
+    padding_texels: gap enforced between charts, in texels of THIS
+    function's own `resolution` assumption above (not necessarily the
+    real eventual bake resolution) - needs to be at least as big as
+    whatever blur/dilation radius lightmap_baker.py applies AT THE REAL
+    BAKE RESOLUTION, or adjacent charts' baked lighting will visibly
+    bleed into each other - see dilate_lightmap's own docstring for how
+    that reach is actually kept in sync with this value.
     angle_threshold_deg: see _build_charts - how much two adjacent
     triangles' normals may differ and still be merged into the same
     chart. Smaller = more, smaller, flatter charts (less distortion,
