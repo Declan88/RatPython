@@ -68,6 +68,7 @@ class NetworkManager:
         self._members = set()
         self._last_hello_time = 0.0
         self._net_seen = set()
+        self._member_order = []
         self._retry_at = {}
         self._failed_logged = set()
         self._heard_from = set()  # peers that have sent us anything (incl. hellos)
@@ -374,14 +375,20 @@ class NetworkManager:
     HELLO_FLAGS = 8 | 32  # Reliable | AutoRestartBrokenSession
 
     def _initiates_to(self, member_id):
-        """Exactly ONE side of each pair may open the Steam session. If both
-        send to each other before a session exists, Steam gets two crossed
-        connection attempts ("Duplicate P2P connection" assertions) and takes
-        ~10-20s to untangle them. The lower Steam id opens it; the other side
-        stays silent toward that peer until it has heard from them (their
-        traffic arrives over the session they opened, which we then reuse)."""
-        return (self.local_steam_id < member_id or member_id in self.remote_players
-                or member_id in self._heard_from)
+        """Exactly ONE side of each pair may open the Steam session (both
+        sending first = crossed connection attempts Steam can't resolve), and
+        it must be the side that is ready to answer, not the one still
+        loading: a joiner opens the session to the host (first lobby member);
+        the host stays silent toward a peer until it has heard from them.
+        Two non-hosts: the lower Steam id opens it."""
+        if member_id in self.remote_players or member_id in self._heard_from:
+            return True
+        host_id = self._member_order[0] if self._member_order else None
+        if member_id == host_id:
+            return True
+        if self.local_steam_id == host_id:
+            return False
+        return self.local_steam_id < member_id
 
     def _send_hellos(self, now):
         """Opens (and keeps retrying) a Steam session with every lobby member
@@ -393,8 +400,8 @@ class NetworkManager:
         so it both forces the handshake immediately (even while the map is
         still loading) and can't be lost. Stops per-peer as soon as they show
         up in remote_players."""
-        if now - self._last_hello_time < self.HELLO_INTERVAL:
-            return
+        if not self.in_game or now - self._last_hello_time < self.HELLO_INTERVAL:
+            return  # not in_game = still loading, can't answer a session request yet
         self._last_hello_time = now
         members = self._refresh_members()
         if not members:
@@ -461,7 +468,9 @@ class NetworkManager:
         """Re-reads the current lobby's member ids. Returns the set, or None
         if it couldn't be read (left as-is in that case)."""
         try:
-            self._members = set(self.client.get_lobby_members(self.current_lobby_id))
+            order = list(self.client.get_lobby_members(self.current_lobby_id))
+            self._member_order = order
+            self._members = set(order)
         except Exception:
             return None
         self._members_checked = time.perf_counter()
