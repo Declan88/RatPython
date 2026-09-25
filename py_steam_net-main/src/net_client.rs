@@ -8,8 +8,8 @@ use pyo3::{
 use steamworks::{
     networking_messages::NetworkingMessages,
     networking_types::{NetworkingIdentity, SendFlags},
-    Client, ClientManager, LobbyChatUpdate, LobbyId, LobbyKey, LobbyType, SingleClient, SteamId,
-    StringFilter, StringFilterKind,
+    Client, ClientManager, DistanceFilter, LobbyChatUpdate, LobbyId, LobbyKey, LobbyType,
+    SingleClient, SteamId, StringFilter, StringFilterKind,
 };
 
 // Every lobby this binding creates gets tagged with this key/value, and
@@ -243,6 +243,18 @@ impl PySteamClient {
                 GAME_IDENTITY_VALUE,
                 StringFilterKind::Include,
             ));
+            // Without this, RequestLobbyList silently uses
+            // ELobbyDistanceFilterDefault - Valve's own docs describe
+            // this as restricted to "the same immediate region" as the
+            // searching client, NOT worldwide. Confirmed as the actual
+            // cause of one real machine hosting a correctly-tagged
+            // lobby that a second, geographically different machine's
+            // search still couldn't find at all - nothing wrong with
+            // the tag or the filter above, Steam was just never
+            // returning lobbies outside the searcher's own region in
+            // the first place. This game has no reason to restrict
+            // matchmaking by geography at all, so search worldwide.
+            matchmaking.set_request_lobby_list_distance_filter(DistanceFilter::Worldwide);
             matchmaking.request_lobby_list(move |result| {
                 Python::with_gil(|py| {
                     // Every call1 in this file used to be `let _ =
