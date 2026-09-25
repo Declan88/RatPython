@@ -67,6 +67,8 @@ class NetworkManager:
         self._last_prune_time = 0.0
         self._members = set()
         self._last_hello_time = 0.0
+        self._net_seen = set()
+        self._net_log_t0 = {}   # peer -> first hello time (diagnostics)
         self._members_checked = 0.0
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
         self._pending_host = None
@@ -348,6 +350,15 @@ class NetworkManager:
     HELLO_INTERVAL = 0.5
     HELLO_FLAGS = 8 | 32  # Reliable | AutoRestartBrokenSession
 
+    def _initiates_to(self, member_id):
+        """Exactly ONE side of each pair may open the Steam session. If both
+        send to each other before a session exists, Steam gets two crossed
+        connection attempts ("Duplicate P2P connection" assertions) and takes
+        ~10-20s to untangle them. The lower Steam id opens it; the other side
+        stays silent toward that peer until it has heard from them (their
+        traffic arrives over the session they opened, which we then reuse)."""
+        return self.local_steam_id < member_id or member_id in self.remote_players
+
     def _send_hellos(self, now):
         """Opens (and keeps retrying) a Steam session with every lobby member
         we haven't heard a movement packet from yet. The movement stream is
@@ -369,6 +380,11 @@ class NetworkManager:
         for member_id in members:
             if member_id == self.local_steam_id or member_id in self.remote_players:
                 continue
+            if not self._initiates_to(member_id):
+                continue
+            if member_id not in self._net_log_t0:
+                self._net_log_t0[member_id] = now
+                print(f"[Net] hello -> {member_id} (in_game={self.in_game})")
             try:
                 self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
             except Exception:
@@ -391,7 +407,7 @@ class NetworkManager:
         payload = json.dumps(self._local_state, separators=(",", ":")).encode("utf-8")
         try:
             for member_id in self.client.get_lobby_members(self.current_lobby_id):
-                if member_id != self.local_steam_id:
+                if member_id != self.local_steam_id and self._initiates_to(member_id):
                     # 1 = Steam's UnreliableNoNagle: movement is a stream
                     # where only the newest packet matters, so it must not
                     # queue/retransmit. (This used to send flag 2, which
@@ -437,6 +453,11 @@ class NetworkManager:
         return steam_id in self._members
 
     def handle_data(self, sender_id, ch, msg_bytes):
+        if sender_id not in self._net_seen:
+            self._net_seen.add(sender_id)
+            t0 = self._net_log_t0.get(sender_id)
+            since = f"{time.perf_counter() - t0:.1f}s after our first hello" if t0 else "before we sent any hello"
+            print(f"[Net] first packet from {sender_id}: {since} (scene_ready={self.scene is not None}, member={sender_id in self._members})")
         if self.scene is None:
             return  # a peer's packet arrived before our map finished loading
         if not self._is_lobby_member(sender_id):
