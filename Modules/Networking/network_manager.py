@@ -1,4 +1,6 @@
+import hashlib
 import json
+import secrets
 import time
 
 # steam_api64.dll is already pre-loaded globally (ctypes.RTLD_GLOBAL) by
@@ -43,14 +45,28 @@ class NetworkManager:
     global scene graph it could reach that through on its own.
     """
 
-    def __init__(self, camera, scene):
+    # Movement packets: at most this often, plus a heartbeat when idle.
+    SEND_INTERVAL = 1.0 / 30.0
+    HEARTBEAT_INTERVAL = 0.25
+
+    def __init__(self, camera, scene=None):
         self.camera = camera
+        # None while in menus; app.py sets it (and in_game) once a map is
+        # loaded - RemotePlayer needs the scene, and there's nothing to
+        # broadcast before then.
         self.scene = scene
+        self.in_game = False
         self.remote_players = {}
         self.current_lobby_id = None
-        self.last_pos = None
-        self.last_hpr = None
+        self._local_state = None
+        self._jump_count = 0
+        self._last_sent_state = None
+        self._last_send_time = 0.0
+        self._last_update_time = 0.0
+        self._last_prune_time = 0.0
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
+        self._pending_host = None
+        self._pending_join = None
 
         try:
             self.client = py_steam_net.PySteamClient()
@@ -62,12 +78,13 @@ class NetworkManager:
 
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
-
-            self.setup_networking_mode()
-
         except Exception as e:
             print(f"Steam initialization failed: {e}. Make sure Steam client is running.")
             self.client = None
+
+    @property
+    def available(self):
+        return self.client is not None
 
     # =============================================================
     # PER-FRAME UPDATE - call this once per frame from your main loop
@@ -78,17 +95,26 @@ class NetworkManager:
             return
         self.client.run_callbacks()
         self._run_deferred()
-        self._broadcast_transform()
+        if self.in_game:
+            now = time.perf_counter()
+            dt = now - self._last_update_time if self._last_update_time else 0.0
+            self._last_update_time = now
+            self._broadcast_transform(now)
+            for remote in self.remote_players.values():
+                remote.update(dt)
+            if now - self._last_prune_time >= 1.0:
+                self._last_prune_time = now
+                self._prune_remote_players()
 
     def _schedule(self, delay_seconds, func):
         """Replaces taskMgr.doMethodLater - runs func() once, after at
         least delay_seconds have passed, the next time update() runs."""
-        self._deferred.append((time.monotonic() + delay_seconds, func))
+        self._deferred.append((time.perf_counter() + delay_seconds, func))
 
     def _run_deferred(self):
         if not self._deferred:
             return
-        now = time.monotonic()
+        now = time.perf_counter()
         remaining = []
         for fire_time, func in self._deferred:
             if now >= fire_time:
@@ -126,39 +152,144 @@ class NetworkManager:
         except Exception as e:
             print(f"Error printing session roster: {e}")
 
+    # =============================================================
+    # HOST / LIST / JOIN
+    #
+    # Every call into py_steam_net that takes &mut self (create_lobby,
+    # join_lobby, get_lobby_list) goes through _schedule(0, ...) rather
+    # than being called directly: these methods are reached from UI
+    # events or from Steam callbacks that fire INSIDE run_callbacks(),
+    # and a &mut self call while that borrow is outstanding raises PyO3's
+    # "Already borrowed". The on_result callbacks below can themselves
+    # run inside run_callbacks(), so they must only record state, never
+    # call back into self.client.
+    # =============================================================
+
+    @staticmethod
+    def hash_password(salt, password):
+        return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def check_password(cls, lobby_info, password):
+        """Client-side check of a listed lobby's password. Steam has no
+        lobby-password concept, so the host publishes a salted hash in
+        lobby data and joiners compare against it before joining - this
+        keeps casual joiners out, but anyone modifying their own client
+        can skip it (the join itself can't be refused host-side)."""
+        if not lobby_info["has_password"]:
+            return True
+        return cls.hash_password(lobby_info["pw_salt"], password) == lobby_info["pw_hash"]
+
+    def host_lobby(self, name, map_key, max_players, password, on_result):
+        """Creates a public lobby tagged with its settings. on_result(ok,
+        info) is called once - info is the lobby id, or an error string."""
+        if not self.client:
+            on_result(False, "Steam isn't running")
+            return
+        self._pending_host = {
+            "name": name, "map": map_key, "max_players": max_players,
+            "password": password, "on_result": on_result,
+        }
+        self._schedule(0, lambda: self.client.create_lobby(2, max_players, self.on_lobby_created))
+
     def on_lobby_created(self, lobby_id, error=None):
-        if error:
+        pending, self._pending_host = self._pending_host, None
+        on_result = pending["on_result"] if pending else None
+        if error or lobby_id is None:
             print(f"\n--> Failed to create lobby: {error}")
-        else:
-            self.current_lobby_id = lobby_id
-            print(f"\n--> SUCCESS! Lobby Created ID: {self.current_lobby_id}")
+            if on_result:
+                on_result(False, str(error))
+            return
+        self.current_lobby_id = lobby_id
+        print(f"\n--> SUCCESS! Lobby Created ID: {self.current_lobby_id}")
 
-            # Tag the lobby specifically for this game, matching the
-            # exact key/value py_steam_net's own get_lobby_list now
-            # filters by server-side (see net_client.rs's own
-            # GAME_IDENTITY_KEY/GAME_IDENTITY_VALUE comment) - a lobby
-            # created here that DIDN'T get this tag would be invisible
-            # to every future search, including this same client's own,
-            # so this isn't just cosmetic. Previously "gname"=
-            # "RatWarGame" was set here but never actually filtered on
-            # anywhere (handle_lobby_list below just took whatever
-            # get_lobby_list returned, unfiltered) - the tag existed but
-            # did nothing; this key/value pairing is what makes it real.
-            try:
-                self.client.set_lobby_data(lobby_id, "GameIdentity", "Rat King")
-            except Exception as e:
-                print(f"Failed to set custom lobby tag: {e}")
+        if pending:
+            # GameIdentity is what py_steam_net's own get_lobby_list
+            # filters by server-side - without it this lobby would be
+            # invisible to every search, including our own.
+            data = {
+                "GameIdentity": "Rat King",
+                "lobby_name": pending["name"],
+                "map": pending["map"],
+                "max_players": str(pending["max_players"]),
+                "has_password": "1" if pending["password"] else "0",
+            }
+            if pending["password"]:
+                salt = secrets.token_hex(8)
+                data["pw_salt"] = salt
+                data["pw_hash"] = self.hash_password(salt, pending["password"])
+            for key, value in data.items():
+                try:
+                    self.client.set_lobby_data(lobby_id, key, value)
+                except Exception as e:
+                    print(f"Failed to set lobby data {key!r}: {e}")
 
-            print("Hosting game session...")
-            self._schedule(0.5, self.print_session_roster)
+        print("Hosting game session...")
+        self._schedule(0.5, self.print_session_roster)
+        if on_result:
+            on_result(True, lobby_id)
+
+    def request_lobbies(self, on_result):
+        """Searches for open lobbies. on_result(lobbies, error): lobbies
+        is a list of dicts (id, name, map, players, max_players,
+        has_password, pw_salt, pw_hash), error is None or a string."""
+        if not self.client:
+            on_result([], "Steam isn't running")
+            return
+
+        def handle(lobby_ids, error):
+            if error:
+                on_result([], str(error))
+            else:
+                on_result([self._lobby_info(lobby_id) for lobby_id in lobby_ids], None)
+
+        self._schedule(0, lambda: self.client.get_lobby_list(handle))
+
+    def _lobby_info(self, lobby_id):
+        def get(key):
+            return self.client.get_lobby_data(lobby_id, key) or ""
+
+        try:
+            players = len(self.client.get_lobby_members(lobby_id))
+        except Exception:
+            players = 0
+        try:
+            max_players = int(get("max_players"))
+        except ValueError:
+            max_players = 0
+        return {
+            "id": lobby_id,
+            "name": get("lobby_name") or "Unnamed lobby",
+            "map": get("map"),
+            "players": players,
+            "max_players": max_players,
+            "has_password": get("has_password") == "1",
+            "pw_salt": get("pw_salt"),
+            "pw_hash": get("pw_hash"),
+        }
+
+    def join_lobby(self, lobby_id, on_result):
+        """on_result(ok, info) is called once - info is the lobby id, or
+        an error string."""
+        if not self.client:
+            on_result(False, "Steam isn't running")
+            return
+        self._pending_join = on_result
+        self._schedule(0, lambda: self.client.join_lobby(lobby_id, self.on_lobby_joined))
 
     def on_lobby_joined(self, lobby_id, error=None):
-        if error:
+        on_result, self._pending_join = self._pending_join, None
+        if error or lobby_id is None:
             print(f"\n--> Failed to join lobby: {error}")
-        else:
-            self.current_lobby_id = lobby_id
-            print(f"\n--> SUCCESS! Joined Lobby ID: {self.current_lobby_id}")
-            self._schedule(0.5, self.print_session_roster)
+            if on_result:
+                on_result(False, str(error))
+            return
+        self.current_lobby_id = lobby_id
+        print(f"\n--> SUCCESS! Joined Lobby ID: {self.current_lobby_id}")
+        self._schedule(0.5, self.print_session_roster)
+        if on_result:
+            on_result(True, lobby_id)
+
 
     def on_lobby_changed(self, lobby_id, user_changed, making_change, member_state_change):
         print(f"\n[Lobby Update] Lobby ID: {lobby_id}, User: {user_changed}, State Change: {member_state_change}")
@@ -175,129 +306,85 @@ class NetworkManager:
     _LOBBY_SEARCH_MAX_ATTEMPTS = 5
     _LOBBY_SEARCH_RETRY_DELAY_SECONDS = 2.0
 
-    def setup_networking_mode(self):
-        print("\n--- Scanning for Open RatWar Lobbies ---")
-        search_attempt = [0]  # list, not a plain int, so the nested closure below can mutate it
-
-        def handle_lobby_list(lobbies, error):
-            # create_lobby/join_lobby are deliberately NOT called
-            # directly from here, even though that reads more naturally -
-            # this function runs as py_steam_net's own async callback for
-            # get_lobby_list, invoked synchronously from INSIDE
-            # PySteamClient.run_callbacks() (itself holding a PyO3
-            # borrow of the client object for run_callbacks' own entire
-            # duration). create_lobby/join_lobby are &mut self on the
-            # Rust side, so calling either one here - while that borrow
-            # is still outstanding - makes PyO3's runtime borrow checker
-            # raise "RuntimeError: Already borrowed" on EVERY attempt.
-            # That exception used to vanish silently (py_steam_net's own
-            # Rust callback discarded it via `let _ = ...call1(...)`, now
-            # fixed to at least print it) - meaning lobby hosting/joining
-            # was completely broken here with zero visible error.
-            # self._schedule(0, ...) defers the call to run from
-            # NetworkManager.update()'s own _run_deferred() instead,
-            # which happens right after run_callbacks() has already
-            # RETURNED that same frame - same effective latency (still
-            # well within this frame), but outside the borrow entirely.
-            if error:
-                print(f"Failed to request lobby list: {error}")
-                print("Hosting a new lobby instead...")
-                self._schedule(0, lambda: self.client.create_lobby(2, 4, self.on_lobby_created))
-                return
-
-            open_lobby_id = None
-            if lobbies:
-                for l_id in lobbies:
-                    try:
-                        members = self.client.get_lobby_members(l_id)
-                        if members and 0 < len(members) < 4:
-                            open_lobby_id = l_id
-                            break
-                    except Exception:
-                        continue
-
-            if open_lobby_id:
-                print(f"Found valid open lobby {open_lobby_id}. Joining automatically...")
-                self._schedule(0, lambda: self.client.join_lobby(open_lobby_id, self.on_lobby_joined))
-                return
-
-            # No match THIS attempt - retry a few times, spaced out,
-            # before giving up and hosting. A lobby another client just
-            # created (or just tagged, via the separate set_lobby_data
-            # call in on_lobby_created - see its own comment) isn't
-            # guaranteed to be immediately visible to a DIFFERENT
-            # client's RequestLobbyList: Steam's matchmaking list is
-            # backed by its own server-side cache, and a fresh write
-            # from one client reaching another client's next query is
-            # a real (if usually brief) propagation delay, not
-            # instantaneous - confirmed as a real-world issue via two
-            # actual separate PCs, one hosting and staying up the whole
-            # time, the other's very first (and previously ONLY) search
-            # still coming back with zero results. A single one-shot
-            # search has no way to recover from that even when everyone
-            # involved is doing everything right; retrying does.
-            search_attempt[0] += 1
-            if search_attempt[0] < self._LOBBY_SEARCH_MAX_ATTEMPTS:
-                print(
-                    f"No open RatWar lobbies found yet (attempt "
-                    f"{search_attempt[0]}/{self._LOBBY_SEARCH_MAX_ATTEMPTS}) - "
-                    f"retrying in {self._LOBBY_SEARCH_RETRY_DELAY_SECONDS:.0f}s..."
-                )
-                self._schedule(
-                    self._LOBBY_SEARCH_RETRY_DELAY_SECONDS,
-                    lambda: self.client.get_lobby_list(handle_lobby_list),
-                )
-            else:
-                print(
-                    f"No open RatWar lobbies found after "
-                    f"{self._LOBBY_SEARCH_MAX_ATTEMPTS} attempts. Hosting a new lobby..."
-                )
-                self._schedule(0, lambda: self.client.create_lobby(2, 4, self.on_lobby_created))
-
-        try:
-            self.client.get_lobby_list(handle_lobby_list)
-        except Exception as e:
-            print(f"Error initiating lobby list request: {e}")
-            self.client.create_lobby(2, 4, self.on_lobby_created)
-
     # =============================================================
     # TRANSFORM SYNC
     # =============================================================
 
-    def _broadcast_transform(self):
-        if not self.current_lobby_id:
+    def set_local_state(self, feet_pos, yaw, pitch, speed, crouched, grounded,
+                        sprinting, move_direction, jumped):
+        """Call once per frame with the LOCAL player's real state (not the
+        camera - in third person the camera sits on a boom arm behind the
+        player, so broadcasting it would put everyone else's view of you
+        in the wrong place). This is exactly what drives the local
+        PlayerModel, so remote players' copies of you animate the same
+        way. jumped: True on the frame a jump actually executed - it's
+        sent as a counter (see RemotePlayer.receive_state) so a lost
+        packet can't drop the event."""
+        if jumped:
+            self._jump_count += 1
+        self._local_state = {
+            "p": [round(feet_pos.x, 3), round(feet_pos.y, 3), round(feet_pos.z, 3)],
+            "y": round(yaw, 2),
+            "pt": round(pitch, 2),
+            "v": round(speed, 2),
+            "c": int(crouched),
+            "g": int(grounded),
+            "s": int(sprinting),
+            "d": [round(move_direction.x, 2), round(move_direction.z, 2)],
+            "j": self._jump_count,
+        }
+
+    def _broadcast_transform(self, now):
+        if not self.current_lobby_id or self._local_state is None:
+            return
+        # Rate-limited: the game loop runs at hundreds of fps but ~30
+        # updates/s is plenty (receivers interpolate) - unthrottled, this
+        # queued a packet per member per FRAME. Sent when the state changed
+        # or as a heartbeat, so a standing-still player still reads as
+        # connected and its last state is refreshed if a packet is lost.
+        interval = now - self._last_send_time
+        if interval < self.SEND_INTERVAL:
+            return
+        if self._local_state == self._last_sent_state and interval < self.HEARTBEAT_INTERVAL:
             return
 
-        current_pos = (self.camera.position.x, self.camera.position.y, self.camera.position.z)
-        current_hpr = (self.camera.yaw, self.camera.pitch, 0.0)
+        payload = json.dumps(self._local_state, separators=(",", ":")).encode("utf-8")
+        try:
+            for member_id in self.client.get_lobby_members(self.current_lobby_id):
+                if member_id != self.local_steam_id:
+                    # 1 = Steam's UnreliableNoNagle: movement is a stream
+                    # where only the newest packet matters, so it must not
+                    # queue/retransmit. (This used to send flag 2, which
+                    # isn't a valid Steam flag - the binding fell back to
+                    # RELIABLE, so every position update waited behind the
+                    # last one.)
+                    self.client.send_message_to(member_id, 1, 0, payload)
+        except Exception:
+            pass
+        self._last_sent_state = self._local_state
+        self._last_send_time = now
 
-        if current_pos != self.last_pos or current_hpr != self.last_hpr:
-            payload = json.dumps({
-                "pos": list(current_pos),
-                "hpr": list(current_hpr)
-            }).encode("utf-8")
-
-            try:
-                members = self.client.get_lobby_members(self.current_lobby_id)
-                for member_id in members:
-                    if member_id != self.local_steam_id:
-                        self.client.send_message_to(member_id, 2, 0, payload)
-            except Exception:
-                pass
-
-            self.last_pos = current_pos
-            self.last_hpr = current_hpr
+    def _prune_remote_players(self):
+        """Removes the model/hitbox of any peer no longer in the lobby."""
+        try:
+            members = set(self.client.get_lobby_members(self.current_lobby_id))
+        except Exception:
+            return
+        for steam_id in list(self.remote_players):
+            if steam_id not in members:
+                print(f"\n--> Peer left the lobby: {steam_id}")
+                self.remote_players.pop(steam_id).destroy()
 
     def handle_data(self, sender_id, ch, msg_bytes):
-        if sender_id not in self.remote_players:
-            print(f"\n--> Discovered peer in lobby: {sender_id}")
-            self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
-
+        if self.scene is None:
+            return  # a peer's packet arrived before our map finished loading
         try:
-            parsed = json.loads(msg_bytes.decode("utf-8"))
-            if "pos" in parsed and "hpr" in parsed:
-                self.remote_players[sender_id].update_transform(
-                    parsed["pos"], parsed["hpr"]
-                )
+            state = json.loads(msg_bytes.decode("utf-8"))
+            if "p" not in state or "y" not in state:
+                return  # not this version's movement packet
+            if sender_id not in self.remote_players:
+                print(f"\n--> Discovered peer in lobby: {sender_id}")
+                self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
+            self.remote_players[sender_id].receive_state(state)
         except Exception as e:
             print(f"Error parsing incoming packet from {sender_id}: {e}")

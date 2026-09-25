@@ -226,6 +226,20 @@ impl PySteamClient {
         }
     }
 
+    /// Reads one lobby data key (see set_lobby_data). Returns None if the
+    /// key isn't set. Works on any lobby whose data this client has cached -
+    /// i.e. every lobby a get_lobby_list result just returned, or one it's in.
+    pub fn get_lobby_data(&self, lobby_id: u64, key: &str) -> PyResult<Option<String>> {
+        if let Some((client, _)) = &self.client {
+            let matchmaking = client.matchmaking();
+            Ok(matchmaking
+                .lobby_data(LobbyId::from_raw(lobby_id), key)
+                .map(|s| s.to_string()))
+        } else {
+            Err(PyRuntimeError::new_err("Client not initialized"))
+        }
+    }
+
     pub fn get_lobby_list(&mut self, cb_on_list: Py<PyAny>) {
         if let Some((client, _)) = &self.client {
             let matchmaking = client.matchmaking();

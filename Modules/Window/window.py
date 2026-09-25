@@ -252,7 +252,7 @@ class WindowManager:
             (self.width, self.height), self.flags, vsync=self.vsync
         )
 
-    def handle_events(self, camera, on_key_down=None):
+    def handle_events(self, camera, on_key_down=None, event_filter=None):
         """on_key_down: optional callback(pygame_key_constant), invoked
         for every KEYDOWN event this method sees (after its own internal
         handling below, which happens regardless - it always still
@@ -263,7 +263,12 @@ class WindowManager:
         game-specific concepts like "third person mode" - it only ever
         hands back which key went down, callers decide what that means.
         Not called for QUIT/ESCAPE, since those already end the loop
-        before reaching it."""
+        before reaching it.
+
+        event_filter: optional callback(event) -> bool, offered every
+        event except QUIT first; returning True marks it consumed and
+        skips this method's own handling of it (the UI uses this to keep
+        mouse motion from turning the camera while a menu has the cursor)."""
         now = time.perf_counter()
         dt = now - self._last_time
         self._last_time = now
@@ -272,6 +277,8 @@ class WindowManager:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False, dt
+            if event_filter is not None and event_filter(event):
+                continue
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return False, dt
@@ -298,8 +305,6 @@ class WindowManager:
             pygame.display.set_caption(
                 f"{self.title} - {self.clock.get_fps():.0f} FPS - {vsync_label}"
             )
-            print(f"[FPS] {self.clock.get_fps():.1f}")
-
         return True, dt
 
     def flip(self):

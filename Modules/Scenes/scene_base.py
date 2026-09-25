@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import math
-import time
 from pathlib import Path
 
 import moderngl
@@ -72,31 +70,6 @@ from Modules.Graphics.skybox import (
 # between two different clips would otherwise show.
 _DEFAULT_ANIM_BLEND_DURATION = 0.25
 
-# Temporary profiling aid - set True (or flip via a debugger/console) to
-# time every render pass/object via real GPU timer queries (moderngl's
-# ctx.query(time=True), i.e. actual GPU execution time - NOT CPU wall-
-# clock time around a draw call, which would mostly measure how long it
-# took to SUBMIT the call, not how long the GPU actually spent on it,
-# since GL draw calls queue asynchronously) and print a sorted
-# most-expensive-first breakdown every _PROFILE_RENDER_WINDOW_FRAMES
-# frames - see Scene._profiled/Scene.render's own use of it. Safe to
-# leave False permanently (a single boolean check per pass/object,
-# nothing else runs); remove entirely once no longer needed.
-PROFILE_RENDER = False
-_PROFILE_RENDER_WINDOW_FRAMES = 60
-
-# CPU wall-clock companion to PROFILE_RENDER above - that one times GPU
-# EXECUTION via timer queries (see Scene._profiled's own docstring), and
-# says nothing about the Python-side cost of just ISSUING each pass's
-# calls, which is what app.py's own PROFILE_CPU "scene.render (cpu
-# submit)" bucket actually measures as one lump sum for this whole
-# method. This breaks THAT lump sum down by render()'s own sub-passes
-# (shadows/main scene/skybox/ssr/transparent) using plain time.
-# perf_counter, same shape as app.py's _profiled_cpu - off by default,
-# a single boolean check per pass when off.
-PROFILE_RENDER_CPU = False
-_render_cpu_samples = {}
-_render_cpu_frame_count = 0
 
 # Temporary perf-comparison switch - set False to skip the real-time
 # shadow pass entirely (_render_shadows never runs, and every
@@ -249,12 +222,6 @@ class Scene:
         self.sound_manager = SoundManager()
         self.physics = PhysicsWorld()
 
-        # See PROFILE_RENDER/Scene._profiled - accumulated GPU
-        # nanoseconds per label across the current profiling window,
-        # and how many frames have gone by since the last window was
-        # printed/reset.
-        self._profile_samples = {}
-        self._profile_frame_count = 0
 
         self.light_dir = glm.vec3(0.5, 1.0, 0.8)
 
@@ -2726,108 +2693,6 @@ class Scene:
         return not aabb_outside_frustum(aabb[0], aabb[1], frustum_planes)
 
     # =============================================================
-    # PROFILING (see PROFILE_RENDER)
-    # =============================================================
-
-    @contextlib.contextmanager
-    def _profiled(self, label):
-        """Wraps a render pass or single draw call in a GPU timer query
-        (see PROFILE_RENDER's own docstring for why this measures actual
-        GPU execution time rather than CPU submission time) when
-        PROFILE_RENDER is on - a complete no-op (the `with` block just
-        runs, nothing allocated or queried) when it's off, so leaving
-        every call site in place permanently costs nothing. Accumulates
-        into self._profile_samples[label] (summed across every call with
-        that same label this window, e.g. one call per object per frame
-        adds up into that object's own running total) rather than
-        overwriting, so Scene.render()'s own end-of-window report can
-        show a true per-window total/average rather than just whatever
-        the LAST frame happened to measure.
-
-        label should identify WHAT this is timing specifically (e.g.
-        "static:mainmap" or "skeletal:rat") - Scene.render()'s own
-        per-object call sites build these from each obj's own "name"
-        field (see _load_object/add_skeletal) prefixed by which pass/
-        list it came from, so the eventual report can actually point at
-        a specific mesh instead of just "static objects in general"."""
-        if not PROFILE_RENDER:
-            yield
-            return
-        query = self.ctx.query(time=True)
-        with query:
-            yield
-        self._profile_samples[label] = self._profile_samples.get(label, 0) + query.elapsed
-
-    def _report_profile_window(self):
-        """Called once per frame from render() - counts frames and, every
-        _PROFILE_RENDER_WINDOW_FRAMES of them, prints every label from
-        self._profile_samples sorted most-expensive-first (total
-        milliseconds across the whole window, and the per-frame average -
-        the average is usually the more directly useful number, e.g. "is
-        THIS mesh alone costing 2ms of the 16.6ms budget for 60fps"),
-        then resets for the next window. A no-op entirely while
-        PROFILE_RENDER is off."""
-        if not PROFILE_RENDER:
-            return
-        self._profile_frame_count += 1
-        if self._profile_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
-            return
-
-        frames = self._profile_frame_count
-        ranked = sorted(self._profile_samples.items(), key=lambda kv: kv[1], reverse=True)
-        print(f"[render profile] over the last {frames} frame(s):")
-        for label, total_ns in ranked:
-            total_ms = total_ns / 1_000_000.0
-            print(f"  {label:40s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
-
-        self._profile_samples = {}
-        self._profile_frame_count = 0
-
-    #     self._profile_samples = {}
-    #     self._profile_frame_count = 0
-
-    @contextlib.contextmanager
-    def _profiled_cpu(self, label):
-        """CPU wall-clock companion to _profiled above - see PROFILE_
-        RENDER_CPU's own module-level comment for why this exists as a
-        separate thing (GPU timer queries measure execution time, not
-        the Python-side cost of issuing the calls in the first place).
-        Same accumulate-then-report shape, module-level dict/counter
-        instead of per-Scene-instance ones since app.py's own
-        _profiled_cpu already established that pattern and there's no
-        strong reason for this one to differ. No-op when PROFILE_RENDER_
-        CPU is off."""
-        if not PROFILE_RENDER_CPU:
-            yield
-            return
-        start = time.perf_counter()
-        yield
-        elapsed = time.perf_counter() - start
-        global _render_cpu_samples
-        _render_cpu_samples[label] = _render_cpu_samples.get(label, 0.0) + elapsed
-
-    def _report_render_cpu_profile_window(self):
-        """Mirrors _report_profile_window exactly, for the CPU-side
-        accumulator above instead of the GPU one - see PROFILE_RENDER_
-        CPU's own comment."""
-        global _render_cpu_frame_count, _render_cpu_samples
-        if not PROFILE_RENDER_CPU:
-            return
-        _render_cpu_frame_count += 1
-        if _render_cpu_frame_count < _PROFILE_RENDER_WINDOW_FRAMES:
-            return
-
-        frames = _render_cpu_frame_count
-        ranked = sorted(_render_cpu_samples.items(), key=lambda kv: kv[1], reverse=True)
-        print(f"[render cpu profile] over the last {frames} frame(s):")
-        for label, total_s in ranked:
-            total_ms = total_s * 1000.0
-            print(f"  {label:20s} total={total_ms:8.3f}ms  avg/frame={total_ms / frames:7.4f}ms")
-
-        _render_cpu_samples = {}
-        _render_cpu_frame_count = 0
-
-    # =============================================================
     # UPDATE
     # =============================================================
 
@@ -3447,16 +3312,11 @@ class Scene:
         # true for the scene's whole lifetime and so never actually
         # skips anything on its own).
         any_ssr_visible = False
-        # (obj, label_prefix) rather than the plain concatenated
-        # tuple render used before PROFILE_RENDER existed - only matters
-        # for building each object's own profiling label below (see
-        # Scene._profiled), the actual draw logic is unaffected either
-        # way.
         tagged_objects = (
-            *((o, "static", False) for o in self.static_objects),
-            *((o, "dynamic", True) for o in self.dynamic_objects),
+            *((o, False) for o in self.static_objects),
+            *((o, True) for o in self.dynamic_objects),
         )
-        for obj, prefix, movable in tagged_objects:
+        for obj, movable in tagged_objects:
             if not self._is_visible(obj, frustum_planes, movable=movable):
                 continue
             if obj.get("reflection_mode") == "ssr":
@@ -3494,8 +3354,7 @@ class Scene:
                 bind_probe_irradiance(self.pbr_program, self._sample_probe_irradiance(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
             bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
-            with self._profiled(f"{prefix}:{obj.get('name', '?')}"):
-                obj["vao"].render()
+            obj["vao"].render()
 
         # Restored before the skeletal loop below - every skeletal object
         # currently renders fully opaque/back-face-culled regardless of
@@ -3527,8 +3386,7 @@ class Scene:
             # skeletal_shader.py's docstring), so this works unmodified.
             bind_material(self.skeletal_program, obj, model_matrix, skeletal_view_proj)
             bind_bone_matrices(obj)
-            with self._profiled(f"skeletal:{obj.get('name', '?')}"):
-                obj["vao"].render()
+            obj["vao"].render()
 
         return blended_objects, any_ssr_visible
 
@@ -3645,8 +3503,7 @@ class Scene:
             bind_probe_irradiance(self.pbr_program, self._sample_probe_irradiance(obj["position"]))
             model_matrix = self._get_model_matrix(obj)
             bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
-            with self._profiled(f"blend:{obj.get('name', '?')}"):
-                obj["vao"].render()
+            obj["vao"].render()
         self.ctx.disable(moderngl.BLEND)
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "back"
@@ -3662,8 +3519,7 @@ class Scene:
 
     def render(self, camera, prog=None):
         if ENABLE_SHADOWS:
-            with self._profiled("shadows"), self._profiled_cpu("shadows"):
-                self._render_shadows(camera)
+            self._render_shadows(camera)
 
         # ONE frame-level bind for everything self.pbr_program needs
         # that doesn't change between now and the end of this frame -
@@ -3672,23 +3528,20 @@ class Scene:
         # passes) and what that actually cost.
         pbr_view_proj = self._bind_pbr_frame_uniforms(camera)
 
-        with self._profiled_cpu("main_scene"):
-            blended_objects, any_ssr_visible = self._render_scene(camera, pbr_view_proj)
+        blended_objects, any_ssr_visible = self._render_scene(camera, pbr_view_proj)
 
         if self.skybox_textures is not None:
-            with self._profiled("skybox"), self._profiled_cpu("skybox"):
-                render_skybox(
-                    self.ctx, self.skybox_program, self.skybox_vao, self.skybox_textures,
-                    self.skybox_average_colors, camera, edge_fade=self.skybox_edge_fade
-                )
+            render_skybox(
+                self.ctx, self.skybox_program, self.skybox_vao, self.skybox_textures,
+                self.skybox_average_colors, camera, edge_fade=self.skybox_edge_fade
+            )
 
         if self.equirect_skybox_texture is not None:
-            with self._profiled("equirect_skybox"), self._profiled_cpu("equirect_skybox"):
-                render_equirect_skybox(
-                    self.ctx, self.equirect_skybox_program, self.equirect_skybox_vao,
-                    self.equirect_skybox_texture, camera, exposure=self.equirect_exposure,
-                    apply_tonemap=self.equirect_is_hdr
-                )
+            render_equirect_skybox(
+                self.ctx, self.equirect_skybox_program, self.equirect_skybox_vao,
+                self.equirect_skybox_texture, camera, exposure=self.equirect_exposure,
+                apply_tonemap=self.equirect_is_hdr
+            )
 
         # AFTER the skybox specifically, same reasoning SSR itself is
         # placed here for: the just-grabbed color/depth (see _grab_
@@ -3713,20 +3566,16 @@ class Scene:
         # reflections had ever been called, regardless of whether the
         # one thing it exists to feed was even in view.
         if any_ssr_visible:
-            with self._profiled("ssr"), self._profiled_cpu("ssr"):
-                self._grab_scene_textures(camera)
-                self._render_ssr_pass(camera, pbr_view_proj)
+            self._grab_scene_textures(camera)
+            self._render_ssr_pass(camera, pbr_view_proj)
 
         # AFTER the skybox (and the SSR redraw above, which needs to be
         # the LAST thing to touch water's own opaque pixels before
         # anything transparent composites on top of them) - see _render_
         # transparent_objects' own docstring for exactly why the skybox
         # part of this order matters.
-        with self._profiled_cpu("transparent"):
-            self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
+        self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
 
-        self._report_profile_window()
-        self._report_render_cpu_profile_window()
 
     # =============================================================
     # DESTROY
