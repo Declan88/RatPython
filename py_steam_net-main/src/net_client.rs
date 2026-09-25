@@ -79,6 +79,7 @@ impl PySteamClient {
                 let networking = client.networking_messages();
                 let cb_connection_failed_shared = self.cb_conn_failed.clone();
                 networking.session_failed_callback(move |info| {
+                    eprintln!("[py_steam_net] session failed: state={:?} end_reason_code={}", info.state(), info.end_reason_raw());
                     Python::with_gil(|py| {
                         if let Some(cb) = &*cb_connection_failed_shared.lock().unwrap() {
                             if let Err(e) = cb.call1(

@@ -1029,6 +1029,11 @@ impl NetConnectionInfo {
         self.inner.m_eState.try_into()
     }
 
+    /// Raw end-reason code - end_reason() panics on codes it doesn't know.
+    pub fn end_reason_raw(&self) -> i32 {
+        self.inner.m_eEndReason as i32
+    }
+
     pub fn end_reason(&self) -> Option<NetConnectionEnd> {
         if self.inner.m_eEndReason
             == sys::ESteamNetConnectionEnd::k_ESteamNetConnectionEnd_Invalid as _

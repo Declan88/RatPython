@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "py_steam_net"
-version = "0.1.6"
+version = "0.1.9"
 dependencies = [
  "pyo3",
  "steamworks",

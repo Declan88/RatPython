@@ -293,10 +293,15 @@ impl<Manager> SessionRequest<Manager> {
 
     /// Accept the connection.
     pub fn accept(self) {
+        // PATCHED: upstream let `self` drop here, and Drop calls
+        // CloseSessionWithUser - i.e. every accepted session was immediately
+        // closed again (the peer saw ClosedByPeer, end code 1001). ManuallyDrop
+        // skips that; the tiny leak (one Arc + identity per accept) is harmless.
+        let this = std::mem::ManuallyDrop::new(self);
         unsafe {
             sys::SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(
-                self.messages,
-                self.remote.as_ptr(),
+                this.messages,
+                this.remote.as_ptr(),
             );
         }
     }
