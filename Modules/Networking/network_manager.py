@@ -68,6 +68,7 @@ class NetworkManager:
         self._members = set()
         self._last_hello_time = 0.0
         self._net_seen = set()
+        self._relay_ok = False
         self._member_order = []
         self._retry_at = {}
         self._failed_logged = set()
@@ -390,6 +391,21 @@ class NetworkManager:
             return False
         return self.local_steam_id < member_id
 
+    def _relay_ready(self):
+        """Steam's relay network takes several seconds after launch to become
+        usable ("Current"); connecting before that fails with ConnectFailed.
+        py_steam_net starts it at init, so by the time a lobby is joined this
+        is normally already true. Older wheels without relay_status: assume yes."""
+        if self._relay_ok:
+            return True
+        try:
+            status = self.client.relay_status()
+        except Exception:
+            self._relay_ok = True
+            return True
+        self._relay_ok = "Current" in status
+        return self._relay_ok
+
     def _send_hellos(self, now):
         """Opens (and keeps retrying) a Steam session with every lobby member
         we haven't heard a movement packet from yet. The movement stream is
@@ -402,6 +418,8 @@ class NetworkManager:
         up in remote_players."""
         if not self.in_game or now - self._last_hello_time < self.HELLO_INTERVAL:
             return  # not in_game = still loading, can't answer a session request yet
+        if not self._relay_ready():
+            return  # Steam's relay network isn't up yet - a send now just fails
         self._last_hello_time = now
         members = self._refresh_members()
         if not members:
@@ -417,7 +435,8 @@ class NetworkManager:
                 continue
             if member_id not in self._net_log_t0:
                 self._net_log_t0[member_id] = now
-                print(f"[Net] hello -> {member_id} (in_game={self.in_game})")
+                status = self.client.relay_status() if hasattr(self.client, "relay_status") else "unknown"
+                print(f"[Net] hello -> {member_id} (relay network: {status})")
             try:
                 self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
             except Exception:

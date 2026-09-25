@@ -71,6 +71,11 @@ impl PySteamClient {
                     });
                 });
 
+                // Start Steam's relay-network setup NOW (at launch) instead of
+                // lazily on the first send: connections attempted before it's
+                // ready fail with ConnectFailed / take ~10s.
+                client.networking_utils().init_relay_network_access();
+
                 let networking = client.networking_messages();
                 let cb_connection_failed_shared = self.cb_conn_failed.clone();
                 networking.session_failed_callback(move |info| {
@@ -357,6 +362,13 @@ impl PySteamClient {
                     eprintln!("[py_steam_net] send to {} failed: {:?} (flags {})", steam_id, e, message_type);
                 }
             }
+        }
+    }
+
+    pub fn relay_status(&self) -> String {
+        match &self.client {
+            Some((client, _)) => format!("{:?}", client.networking_utils().relay_network_status()),
+            None => "no client".to_string(),
         }
     }
 
