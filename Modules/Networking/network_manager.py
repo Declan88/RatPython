@@ -68,6 +68,8 @@ class NetworkManager:
         self._members = set()
         self._last_hello_time = 0.0
         self._net_seen = set()
+        self._retry_at = {}
+        self._failed_logged = set()
         self._heard_from = set()  # peers that have sent us anything (incl. hellos)
         self._net_log_t0 = {}   # peer -> first hello time (diagnostics)
         self._members_checked = 0.0
@@ -85,8 +87,7 @@ class NetworkManager:
 
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
-            self.client.set_connection_failed_callback(
-                lambda steam_id: print(f"[Net] Steam P2P session to {steam_id} FAILED"))
+            self.client.set_connection_failed_callback(self.on_session_failed)
         except Exception as e:
             print(f"Steam initialization failed: {e}. Make sure Steam client is running.")
             self.client = None
@@ -98,6 +99,19 @@ class NetworkManager:
     # =============================================================
     # PER-FRAME UPDATE - call this once per frame from your main loop
     # =============================================================
+
+    SESSION_RETRY_DELAY = 3.0
+
+    def on_session_failed(self, steam_id):
+        # Steam gave up on opening a session. Re-sending immediately (the
+        # stream ran at 30Hz) opened a NEW connection request every time while
+        # the peer was still settling the previous one, which Steam drops
+        # ("Symmetric role resolution ... already the server") - so every
+        # attempt kept failing. Back off and let the slow hello retry instead.
+        self._retry_at[steam_id] = time.perf_counter() + self.SESSION_RETRY_DELAY
+        if steam_id not in self._failed_logged:
+            self._failed_logged.add(steam_id)
+            print(f"[Net] Steam P2P session to {steam_id} failed - retrying every {self.SESSION_RETRY_DELAY:.0f}s")
 
     def pump_callbacks(self):
         """Runs Steam callbacks only - safe to call from inside a long blocking
@@ -392,6 +406,8 @@ class NetworkManager:
                 continue
             if not self._initiates_to(member_id):
                 continue
+            if now < self._retry_at.get(member_id, 0.0):
+                continue
             if member_id not in self._net_log_t0:
                 self._net_log_t0[member_id] = now
                 print(f"[Net] hello -> {member_id} (in_game={self.in_game})")
@@ -417,7 +433,8 @@ class NetworkManager:
         payload = json.dumps(self._local_state, separators=(",", ":")).encode("utf-8")
         try:
             for member_id in self.client.get_lobby_members(self.current_lobby_id):
-                if member_id != self.local_steam_id and self._initiates_to(member_id):
+                if (member_id != self.local_steam_id and
+                        (member_id in self.remote_players or member_id in self._heard_from)):
                     # 1 = Steam's UnreliableNoNagle: movement is a stream
                     # where only the newest packet matters, so it must not
                     # queue/retransmit. (This used to send flag 2, which
