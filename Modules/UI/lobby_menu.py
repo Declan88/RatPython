@@ -15,11 +15,17 @@ work (app.py just records a pending start for its main loop).
 
 from .controls import ScrollBox, Slider
 from .inputs import Dropdown, TextInput
+from . import theme
 from .widgets import Anchor, Button, Label, Panel
+from Modules.Player.hats import available_hats, display_name
 
-_W = 524  # inner width of the host/join panels (560 - 2 * 18 padding)
-_MUTED = (160, 160, 172, 255)
-_WARN = (255, 210, 120, 255)
+_W = 700  # inner width of the host/join panels (736 - 2 * 18 padding)
+_MUTED = theme.MUTED
+_WARN = theme.WARN
+
+
+def _button(text, on_click, **kw):
+    return Button(text, on_click=on_click, **theme.BUTTON, **kw)
 
 
 class LobbyMenu:
@@ -27,13 +33,15 @@ class LobbyMenu:
     MIN_PLAYERS = 2
     MAX_PLAYERS = 10
 
-    def __init__(self, ui, net, maps, on_start):
-        """maps: [(display name, scene key), ...]; on_start(scene_key)."""
+    def __init__(self, ui, net, maps, on_start, on_hat_change=None):
+        """maps: [(display name, scene key), ...]; on_start(scene_key);
+        on_hat_change(hat name or None) fires when the wardrobe pick changes."""
         self.ui = ui
         self.net = net
         self.maps = maps
         self._map_names = {key: name for name, key in maps}
         self.on_start = on_start
+        self.on_hat_change = on_hat_change
         self.lobbies = []
         self._searching = False
         self._busy = False
@@ -45,65 +53,98 @@ class LobbyMenu:
 
     def _build(self):
         root = Panel(size_frac=(1, 1), name="main_menu")
-        column = root.add(Panel(anchor=Anchor.TOP_CENTER, offset=(0, 90), layout="vertical",
-                                spacing=16, align="center", fit_content=True))
-        column.add(Label("RATWAR", font_size=96))
-        buttons = column.add(Panel(layout="horizontal", spacing=20, fit_content=True))
-        buttons.add(Button("Host", on_click=self.toggle_host, size=(250, 60), font_size=32))
-        buttons.add(Button("Join", on_click=self.toggle_join, size=(250, 60), font_size=32))
-        self.status = column.add(Label("", font_size=22, color=_WARN, align="center"))
+
+        # Left: a full-height sidebar with an accent edge holds the title and
+        # the Host/Join flow; the right side is left open for the 3D rat.
+        sidebar = root.add(Panel(color=theme.SIDEBAR, size=(theme.SIDEBAR_WIDTH, 0), size_frac=(0, 1),
+                                 anchor=Anchor.TOP_LEFT))
+        sidebar.add(Panel(color=theme.ACCENT, size=(4, 0), size_frac=(0, 1), anchor=Anchor.TOP_RIGHT))
+        column = sidebar.add(Panel(anchor=Anchor.TOP_LEFT, offset=(80, 50), layout="vertical",
+                                   spacing=14, fit_content=True))
+        column.add(Label("RATWAR", font_size=132, color=theme.ACCENT, font=theme.title_font_path()))
+        column.add(Panel(size=(1, 18)))  # spacer
+        buttons = column.add(Panel(layout="horizontal", spacing=16, fit_content=True))
+        buttons.add(_button("HOST", self.toggle_host, size=((_W + 36 - 16) // 2, 84), font_size=40))
+        buttons.add(_button("JOIN", self.toggle_join, size=((_W + 36 - 16) // 2, 84), font_size=40))
+        self.status = column.add(Label("", font_size=26, color=_WARN))
         self.host_panel = column.add(self._build_host_panel())
         self.join_panel = column.add(self._build_join_panel())
+
+        self._build_wardrobe(root)
         return root
 
+    def _build_wardrobe(self, root):
+        """A card under the 3D rat with the hat dropdown. The choice lives on
+        NetworkManager (local_hat): it's put on the local rat when a map
+        starts, sent to every other player in each movement packet, and
+        shown on the preview rat right away via on_hat_change."""
+        hats = available_hats()
+        stage = root.add(Panel(anchor=Anchor.TOP_RIGHT, size=(-theme.SIDEBAR_WIDTH, 0), size_frac=(1, 1)))
+        card = stage.add(Panel(color=theme.CARD, anchor=(0.5, 0.84), pivot=(0.5, 0.0),
+                              layout="vertical", spacing=10, padding=22, align="center",
+                              fit_content=True))
+        card.add(Label("WARDROBE", font_size=28, color=theme.ACCENT))
+
+        def choose(index, _option):
+            self.net.local_hat = hats[index - 1] if index > 0 else None
+            if self.on_hat_change is not None:
+                self.on_hat_change(self.net.local_hat)
+
+        current = self.net.local_hat
+        selected = hats.index(current) + 1 if current in hats else 0
+        self.hat_dropdown = card.add(Dropdown(
+            ["No hat"] + [display_name(h) for h in hats], selected=selected,
+            on_change=choose, size=(400, 62), font_size=30, color=theme.BUTTON["color"],
+            hover_color=theme.BUTTON["hover_color"], highlight_color=theme.ACCENT_DIM))
+
     def _panel(self):
-        return Panel(color=(15, 15, 25, 225), layout="vertical", spacing=10, padding=18,
+        return Panel(color=theme.CARD, layout="vertical", spacing=10, padding=18,
                      fit_content=True, size=(_W + 36, 0), visible=False)
 
     def _build_host_panel(self):
         p = self._panel()
-        p.add(Label("Lobby name", font_size=20, color=_MUTED))
-        self.name_input = p.add(TextInput("RatWar Lobby", max_length=24, size=(_W, 40)))
-        p.add(Label("Map", font_size=20, color=_MUTED))
-        self.map_dropdown = p.add(Dropdown([name for name, _ in self.maps], size=(_W, 40)))
-        p.add(Label("Password (optional)", font_size=20, color=_MUTED))
+        p.add(Label("Lobby name", font_size=24, color=_MUTED))
+        self.name_input = p.add(TextInput("RatWar Lobby", max_length=24, size=(_W, 54), font_size=26))
+        p.add(Label("Map", font_size=24, color=_MUTED))
+        self.map_dropdown = p.add(Dropdown([name for name, _ in self.maps], size=(_W, 54), font_size=26))
+        p.add(Label("Password (optional)", font_size=24, color=_MUTED))
         self.pass_input = p.add(TextInput(password=True, placeholder="No password",
-                                          max_length=24, size=(_W, 40)))
-        self.players_label = p.add(Label("", font_size=20, color=_MUTED))
+                                          max_length=24, size=(_W, 54), font_size=26))
+        self.players_label = p.add(Label("", font_size=24, color=_MUTED))
         self.players_slider = p.add(Slider(4, self.MIN_PLAYERS, self.MAX_PLAYERS, step=1,
-                                           size=(_W, 28), on_change=self._on_players))
+                                           size=(_W, 36), on_change=self._on_players))
         self._on_players(4)
-        p.add(Button("Create lobby", on_click=self._create, size=(_W, 52), font_size=28))
+        p.add(_button("Create lobby", self._create, size=(_W, 68), font_size=34))
         return p
 
     def _build_join_panel(self):
         p = self._panel()
         search = p.add(Panel(layout="horizontal", spacing=10, fit_content=True))
         self.search_input = search.add(TextInput(placeholder="Search lobby name...",
-                                                 max_length=24, size=(400, 40),
+                                                 max_length=24, size=(_W - 160, 54), font_size=26,
                                                  on_change=lambda _t: self._rebuild_rows()))
-        search.add(Button("Refresh", on_click=self.refresh, size=(_W - 410, 40), font_size=22))
+        search.add(_button("Refresh", self.refresh, size=(150, 54), font_size=26))
 
         # Header columns line up with _make_row's label anchors: the list's
         # rows sit 6px in (ScrollBox padding) and are 502 wide (524 minus
         # padding and the scrollbar).
-        header = p.add(Panel(size=(502, 22), offset=(6, 0)))
-        header.add(Label("Lobby", font_size=18, color=_MUTED, anchor=(0, 0.5), offset=(12, 0)))
-        header.add(Label("Map", font_size=18, color=_MUTED, anchor=(0.56, 0.5), pivot=(0, 0.5)))
-        header.add(Label("Players", font_size=18, color=_MUTED, anchor=(0.86, 0.5), pivot=(0, 0.5)))
+        header = p.add(Panel(size=(_W - 22, 26), offset=(6, 0)))
+        header.add(Label("Lobby", font_size=22, color=_MUTED, anchor=(0, 0.5), offset=(12, 0)))
+        header.add(Label("Map", font_size=22, color=_MUTED, anchor=(0.56, 0.5), pivot=(0, 0.5)))
+        header.add(Label("Players", font_size=22, color=_MUTED, anchor=(0.86, 0.5), pivot=(0, 0.5)))
 
-        self.list = p.add(ScrollBox(size=(_W, 260), padding=6, spacing=6))
-        self.list_status = p.add(Label("", font_size=20, color=_MUTED))
+        self.list = p.add(ScrollBox(size=(_W, 330), padding=6, spacing=8))
+        self.list_status = p.add(Label("", font_size=24, color=_MUTED))
 
         self.password_panel = p.add(Panel(layout="vertical", spacing=8, fit_content=True,
                                           visible=False))
-        self.password_prompt = self.password_panel.add(Label("", font_size=20, color=_WARN))
+        self.password_prompt = self.password_panel.add(Label("", font_size=24, color=_WARN))
         entry = self.password_panel.add(Panel(layout="horizontal", spacing=10, fit_content=True))
         self.join_pass_input = entry.add(TextInput(password=True, placeholder="Password",
-                                                   max_length=24, size=(320, 40),
+                                                   max_length=24, size=(_W - 240, 54), font_size=26,
                                                    on_submit=lambda _t: self._submit_password()))
-        entry.add(Button("Join", on_click=self._submit_password, size=(96, 40), font_size=22))
-        entry.add(Button("Cancel", on_click=self._cancel_password, size=(88, 40), font_size=22))
+        entry.add(_button("Join", self._submit_password, size=(110, 54), font_size=26))
+        entry.add(_button("Cancel", self._cancel_password, size=(110, 54), font_size=26))
         return p
 
     # ---- panel toggles ------------------------------------------------
@@ -203,14 +244,14 @@ class LobbyMenu:
     def _make_row(self, info):
         full = info["max_players"] > 0 and info["players"] >= info["max_players"]
         color = _MUTED if full else (255, 255, 255, 255)
-        row = Button("", on_click=lambda i=info: self._select(i), size=(0, 40), size_frac=(1, 0))
-        row.add(Label(info["name"], font_size=22, color=color, anchor=(0, 0.5), offset=(12, 0)))
-        row.add(Label(self._map_names[info["map"]], font_size=20, color=color,
+        row = _button("", lambda i=info: self._select(i), size=(0, 52), size_frac=(1, 0))
+        row.add(Label(info["name"], font_size=26, color=color, anchor=(0, 0.5), offset=(12, 0)))
+        row.add(Label(self._map_names[info["map"]], font_size=24, color=color,
                       anchor=(0.56, 0.5), pivot=(0, 0.5)))
-        row.add(Label(f"{info['players']}/{info['max_players'] or '?'}", font_size=20, color=color,
+        row.add(Label(f"{info['players']}/{info['max_players'] or '?'}", font_size=24, color=color,
                       anchor=(0.86, 0.5), pivot=(0, 0.5)))
         if info["has_password"]:
-            row.add(Label("PW", font_size=18, color=_WARN, anchor=(1, 0.5), offset=(-8, 0)))
+            row.add(Label("PW", font_size=22, color=_WARN, anchor=(1, 0.5), offset=(-8, 0)))
         return row
 
     def _select(self, info):

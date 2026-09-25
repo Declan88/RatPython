@@ -70,6 +70,23 @@ from PIL import Image
 # off rather than all render simultaneously stacked on the same head.
 _HIDDEN_NODE_PREFIXES = ("hat_", "physics_")
 _HIDDEN_NODE_SUFFIXES = ("_physics",)
+# Hidden "hat_*" nodes aren't discarded: their geometry is kept as an optional
+# add-on (see load_hat) that a Scene can draw on top of the base mesh. Each has
+# its OWN material/texture, so it can't be merged into the base mesh.
+_HAT_PREFIX = "hat_"
+
+
+def list_hat_names(path):
+    """Short names (prefix stripped, e.g. "cowboy") of the hat nodes in a
+    skinned glb, in file order."""
+    result = _read_glb_json_and_blob(path)
+    if result is None:
+        return []
+    gltf, _ = result
+    return [
+        n["name"][len(_HAT_PREFIX):] for n in gltf.get("nodes", [])
+        if n.get("mesh") is not None and (n.get("name") or "").lower().startswith(_HAT_PREFIX)
+    ]
 
 
 def _is_hidden_by_default(node_name):
@@ -328,6 +345,14 @@ class Skeleton:
     def __init__(self, joints, animations):
         self.joints = joints  # list[Joint], in skin.joints order
         self.animations = animations  # dict[name -> AnimationClip]
+        # Pose snapshotting (see Scene._begin_pose_snapshot): last_pose is the
+        # final local (translation, rotation, scale) per joint the previous
+        # _world_matrices call produced - i.e. exactly what was on screen -
+        # and _pose_snap, when set to (snapshot, weight), makes the next
+        # walk blend from that snapshot toward the freshly computed pose.
+        self.last_pose = None
+        self._pose_snap = None
+        self._bind_trs = {}
 
     def _empty_pose(self):
         joint_count = len(self.joints)
@@ -507,6 +532,8 @@ class Skeleton:
         R * parent_rotation once expressed in local terms) - not
         available before this walk computes it."""
         world_cache = {}
+        snap = self._pose_snap
+        final_pose = [None] * len(self.joints)
 
         def world_matrix(i):
             if i in world_cache:
@@ -541,13 +568,43 @@ class Skeleton:
                 local_offset = glm.inverse(parent_rotation) * rotation_offsets[i] * parent_rotation
                 rotation = local_offset * base_rotation
 
-            local = self._local_matrix(joint, translations[i], rotation, scales[i])
+            t_i, s_i = translations[i], scales[i]
+            if snap is not None:
+                snap_pose, snap_weight = snap
+                st, sr, ss = snap_pose[i]
+                ct, cr, cs = self._concrete_trs(i, t_i, rotation, s_i)
+                t_i = glm.mix(st, ct, snap_weight)
+                rotation = glm.slerp(sr, cr, snap_weight)
+                s_i = glm.mix(ss, cs, snap_weight)
+                final_pose[i] = (t_i, rotation, s_i)
+            else:
+                final_pose[i] = self._concrete_trs(i, t_i, rotation, s_i)
+
+            local = self._local_matrix(joint, t_i, rotation, s_i)
             world = parent_world * local
 
             world_cache[i] = world
             return world
 
-        return [world_matrix(i) * self.joints[i].inverse_bind_matrix for i in range(len(self.joints))]
+        result = [world_matrix(i) * self.joints[i].inverse_bind_matrix for i in range(len(self.joints))]
+        self.last_pose = final_pose
+        return result
+
+    def _concrete_trs(self, joint_index, t, r, s):
+        """A joint's local (translation, rotation, scale) with every component
+        resolved to a real value: any None component is identity, matching
+        _local_matrix - except a joint with NO animated component at all,
+        which is its bind pose (decomposed once and cached)."""
+        if t is None and r is None and s is None:
+            bind = self._bind_trs.get(joint_index)
+            if bind is None:
+                scale, rot, trans = glm.vec3(), glm.quat(), glm.vec3()
+                glm.decompose(self.joints[joint_index].local_bind_matrix, scale, rot, trans, glm.vec3(), glm.vec4())
+                bind = self._bind_trs[joint_index] = (trans, rot, scale)
+            return bind
+        return (t if t is not None else glm.vec3(0.0),
+                r if r is not None else glm.quat(1.0, 0.0, 0.0, 0.0),
+                s if s is not None else glm.vec3(1.0))
 
     def compute_bone_matrices(self, animation_name, time,
                                prev_animation_name=None, prev_time=0.0, blend_weight=1.0):
@@ -1087,6 +1144,41 @@ def load_animation_clips(path, skeleton, rename=None, time_scale=1.0):
     return added
 
 
+def load_hat(hat_source, name, ctx):
+    """One hat's geometry (same skin/joint indexing as the base mesh, so it
+    animates with it) plus its own texture, in the same dict shape
+    create_skeletal_vao takes. None if the hat doesn't exist/can't be read."""
+    prims = hat_source["prims"].get(name)
+    if not prims:
+        return None
+    gltf, blob = hat_source["gltf"], hat_source["blob"]
+    parts = {k: [] for k in ("positions", "normals", "uvs", "joints_0", "weights_0", "faces")}
+    offset = 0
+    for prim in prims:
+        attrs = prim.get("attributes", {})
+        if not all(k in attrs for k in ("POSITION", "NORMAL", "JOINTS_0", "WEIGHTS_0")):
+            return None
+        pos = _read_accessor(gltf, blob, attrs["POSITION"])
+        parts["positions"].append(pos)
+        parts["normals"].append(_read_accessor(gltf, blob, attrs["NORMAL"]))
+        parts["uvs"].append(
+            _read_accessor(gltf, blob, attrs["TEXCOORD_0"]) if "TEXCOORD_0" in attrs
+            else np.zeros((len(pos), 2), dtype=np.float32))
+        parts["joints_0"].append(_read_accessor(gltf, blob, attrs["JOINTS_0"]).astype(np.uint32))
+        parts["weights_0"].append(_read_accessor(gltf, blob, attrs["WEIGHTS_0"]).astype(np.float32))
+        idx = prim.get("indices")
+        faces = (_read_accessor(gltf, blob, idx).astype(np.uint32).reshape(-1, 3) if idx is not None
+                 else np.arange(len(pos), dtype=np.uint32).reshape(-1, 3))
+        parts["faces"].append(faces + offset)
+        offset += len(pos)
+    data = {k: np.concatenate(v, axis=0) for k, v in parts.items()}
+    base_color, _m, _r, _e, texture, _mr = _extract_material(
+        ctx, gltf, blob, prims[0].get("material"), hat_source["dir"])
+    data["base_color"] = base_color
+    data["texture"] = texture
+    return data
+
+
 def load_skinned_glb(path, ctx=None, time_scale=1.0):
     """Returns a dict:
         {
@@ -1139,6 +1231,7 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
     meshes = gltf.get("meshes", [])
     prims = []
     hidden_node_names = []
+    hat_prims = {}
     for node in gltf.get("nodes", []):
         mesh_index = node.get("mesh")
         if mesh_index is None:
@@ -1146,6 +1239,8 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
         node_name = node.get("name", f"mesh_{mesh_index}")
         if _is_hidden_by_default(node_name):
             hidden_node_names.append(node_name)
+            if node_name.lower().startswith(_HAT_PREFIX):
+                hat_prims[node_name[len(_HAT_PREFIX):]] = list(meshes[mesh_index].get("primitives", []))
             continue
         prims.extend(meshes[mesh_index].get("primitives", []))
 
@@ -1286,6 +1381,9 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
         "emissive": emissive,
         "texture": texture,
         "metallic_roughness_texture": mr_texture,
+        # Only what load_hat needs later; nothing is parsed/uploaded until a
+        # hat is actually asked for.
+        "hat_source": {"gltf": gltf, "blob": blob, "dir": Path(path).parent, "prims": hat_prims},
     }
 
 

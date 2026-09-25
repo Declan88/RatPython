@@ -20,8 +20,43 @@ events so the camera doesn't spin under the menu.
 
 import pygame
 
+from . import theme
 from .renderer import UIRenderer
 from .widgets import Widget
+
+
+class SmoothFont:
+    """A pygame Font that rasterizes at SUPERSAMPLE x the requested size and
+    scales the result down. pygame's own glyph rendering hints/rounds every
+    glyph to whole pixels, which at larger sizes shows as uneven letter
+    spacing and jagged curves; averaging a larger render gives even spacing
+    and smooth edges. Same size()/get_linesize()/render() surface as Font, so
+    callers are unchanged."""
+
+    SUPERSAMPLE = 3
+    # An OS typeface runs bigger than pygame's bundled one at the same px, so
+    # it's scaled down to keep the layout's sizes meaning what they always did.
+    OS_FONT_SCALE = 0.8
+
+    def __init__(self, path, px):
+        if path is not None:
+            px = max(1, round(px * self.OS_FONT_SCALE))
+        self._big = pygame.font.Font(path, px * self.SUPERSAMPLE)
+
+    def _down(self, n):
+        return -(-n // self.SUPERSAMPLE)
+
+    def size(self, text):
+        w, h = self._big.size(text)
+        return self._down(w), self._down(h)
+
+    def get_linesize(self):
+        return self._down(self._big.get_linesize())
+
+    def render(self, text, antialias, color):
+        big = self._big.render(text, True, color)
+        w, h = big.get_size()
+        return pygame.transform.smoothscale(big, (max(1, self._down(w)), max(1, self._down(h))))
 
 
 class UIManager:
@@ -50,12 +85,13 @@ class UIManager:
     # ---- resources --------------------------------------------------
 
     def get_font(self, path, px):
+        path = path or theme.font_path()
         key = (path, px)
         font = self._fonts.get(key)
         if font is None:
             if not pygame.font.get_init():
                 pygame.font.init()
-            font = self._fonts[key] = pygame.font.Font(path, px)
+            font = self._fonts[key] = SmoothFont(path, px)
         return font
 
     def _ensure_renderer(self):

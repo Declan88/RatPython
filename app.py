@@ -111,6 +111,9 @@ from Modules.Window.window import WindowManager
 from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
+from Modules.UI import Anchor, ProgressBar
+from Modules.UI.nametags import NameTags
+from Modules.Graphics.paper_doll import PaperDoll
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
 from Modules.Scenes.torus_scene import TorusScene
@@ -216,9 +219,10 @@ def main():
     boom_arm = None
     third_person = False
     toggle_third_person = cycle_upper_override = lambda key: None
+    update_moving_adjust = lambda speed: None
 
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, cycle_upper_override, local_player_model, player, player_height, third_person, toggle_third_person
+        nonlocal boom_arm, current_scene, current_scene_key, cycle_upper_override, update_moving_adjust, local_player_model, player, player_height, third_person, toggle_third_person
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
@@ -527,6 +531,37 @@ def main():
         }
         upper_override_index = 0
 
+        # While MOVING with an upper-body override (shotgun/pistol) the character
+        # reads as looking too far left: the override pose is absolute, so it
+        # doesn't follow the lean/twist the running lower body adds. This is an
+        # extra yaw correction on Spine4 (component space, degrees; negative =
+        # turn right), blended in/out through the same crossfade as any other
+        # offset change.
+        _SPINE4 = "ValveBiped.Bip01_Spine4"
+        _MOVING_SPEED = 1.0   # m/s of horizontal speed that counts as moving
+        moving_yaw = {"degrees": -20.0}
+        moving_state = {"moving": False}
+
+        def override_offsets(clip, moving):
+            base = _UPPER_OVERRIDE_ROTATION_DEGREES.get(clip, {}).get(_SPINE4, (0.0, 0.0, 0.0))
+            extra = moving_yaw["degrees"] if moving else 0.0
+            return {_SPINE4: (base[0], base[1] + extra, base[2])}
+
+        def apply_override_offsets():
+            clip = _UPPER_OVERRIDE_CYCLE[upper_override_index]
+            if clip is not None:
+                local_player_model.set_upper_rotation_offset(
+                    override_offsets(clip, moving_state["moving"])
+                )
+
+        def update_moving_adjust(horiz_speed):
+            if upper_override_index == 0:
+                return
+            moving = horiz_speed > _MOVING_SPEED
+            if moving != moving_state["moving"]:
+                moving_state["moving"] = moving
+                apply_override_offsets()
+
         def cycle_upper_override(key):
             nonlocal upper_override_index
             if key == pygame.K_y:
@@ -538,12 +573,28 @@ def main():
                     local_player_model.clear_upper_override()
                 else:
                     local_player_model.set_upper_override(override_clip)
-                    local_player_model.set_upper_rotation_offset(
-                        _UPPER_OVERRIDE_ROTATION_DEGREES.get(override_clip, (0.0, 0.0, 0.0))
-                    )
+                    apply_override_offsets()
 
     ui = UIManager(window)
     ui_demo = build_demo(ui)
+
+    # TEMPORARY health bar - a placeholder until a real damage system exists.
+    # H takes 10 damage, J heals 10 (see on_key_down); nothing else reads or
+    # writes `health` yet. Hidden on the main menu, shown once a map starts.
+    name_tags = NameTags(ui)
+    health = {"value": 100.0, "max": 100.0}
+    health_bar = ProgressBar(
+        value=health["value"], max_value=health["max"], label_format="{value:.0f} / {max:.0f}",
+        anchor=Anchor.BOTTOM_LEFT, offset=(130, -49), size=(300, 26), visible=False,
+        fill_color=(90, 200, 110, 255),
+    )
+    ui.root.add(health_bar)
+
+    def change_health(delta):
+        health["value"] = max(0.0, min(health["max"], health["value"] + delta))
+        health_bar.value = health["value"]
+        low = health["value"] <= health["max"] * 0.3
+        health_bar.fill_color = (220, 70, 70, 255) if low else (90, 200, 110, 255)
 
     # The game starts on the main menu and loads nothing else. Host/Join
     # (see Modules/UI/lobby_menu.py) talk to NetworkManager - created here,
@@ -565,10 +616,17 @@ def main():
         nonlocal pending_start
         pending_start = map_key
 
+    paper_doll = None  # head of the local rat beside the health bar - built in start_game
+
     def start_game(map_key):
-        nonlocal in_menu
+        nonlocal in_menu, paper_doll
         menu_ui.visible = False
         setup_game(map_key)
+        health_bar.visible = True
+        name_tags.visible = True
+        if local_player_model is not None and local_player_model.obj is not None:
+            local_player_model.set_hat(net_mgr.local_hat)
+            paper_doll = PaperDoll(window.ctx, local_player_model.obj)
         in_menu = False
         ui.set_cursor_free(False)
         camera.yaw, camera.pitch, camera.front = game_look
@@ -590,6 +648,10 @@ def main():
         toggle_third_person(key)
         cycle_upper_override(key)
         toggle_ui_demo(key)
+        if key == pygame.K_h:
+            change_health(-10.0)
+        elif key == pygame.K_j:
+            change_health(10.0)
 
     running = True
     while running:
@@ -691,6 +753,7 @@ def main():
         # PlayerModel.update()'s own just_jumped docstring for why that
         # debounce alone made a real jump feel delayed).
         just_jumped = player.pop_jumped()
+        update_moving_adjust(horiz_speed)
         local_player_model.update(
             dt,
             feet_position,
@@ -734,10 +797,13 @@ def main():
         current_scene.update_audio(camera)
 
         net_mgr.update()
+        name_tags.update(net_mgr.remote_players, camera, window.ctx.screen.size)
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
         current_scene.render(camera, None)
         ui.render()
+        if paper_doll is not None:
+            paper_doll.render(window.ctx.screen.size)
         window.flip()
 
     ui.destroy()

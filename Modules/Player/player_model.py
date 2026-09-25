@@ -1245,6 +1245,14 @@ class PlayerModel:
         kwargs = self._animation_blend_kwargs if blend_duration is None else {"blend_duration": float(blend_duration)}
         self._scene.set_skeletal_upper_rotation_offset(self.obj, degrees, **kwargs)
 
+    def set_hat(self, name):
+        """Wears the named hat ("cowboy", ...; see hats.py) or none for
+        None/"" - a no-op for an unknown name or a model that failed to
+        load. Returns whether the model is now wearing what was asked."""
+        if self.obj is None:
+            return False
+        return self._scene.set_skeletal_hat(self.obj, name)
+
     def set_visible_in_color(self, visible):
         """Switches whether this model actually draws in the normal
         color pass (see add_skeletal's own visible_in_color) - e.g.

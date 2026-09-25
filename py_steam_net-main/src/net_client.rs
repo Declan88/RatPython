@@ -373,6 +373,31 @@ impl PySteamClient {
         }
     }
 
+    /// This user's own Steam persona (display) name.
+    pub fn own_name(&self) -> String {
+        match &self.client {
+            Some((client, _)) => client.friends().name(),
+            None => String::new(),
+        }
+    }
+
+    /// Another user's persona name. Steam only knows names of people it has
+    /// loaded; for anyone else this asks Steam to fetch it (name only) and
+    /// returns "" until it arrives - so callers just ask again later.
+    pub fn friend_name(&self, steam_id: u64) -> String {
+        match &self.client {
+            Some((client, _)) => {
+                let friends = client.friends();
+                let id = SteamId::from_raw(steam_id);
+                if friends.request_user_information(id, true) {
+                    return String::new();
+                }
+                friends.get_friend(id).name()
+            }
+            None => String::new(),
+        }
+    }
+
     pub fn own_steam_id(&self) -> u64 {
         if let Some((client, _)) = &self.client {
             client.user().steam_id().raw()

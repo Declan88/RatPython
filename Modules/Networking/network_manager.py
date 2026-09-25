@@ -60,6 +60,8 @@ class NetworkManager:
         self.remote_players = {}
         self.current_lobby_id = None
         self._local_state = None
+        self.local_hat = None   # short hat name from the main menu, or None
+        self.local_name = ""    # our Steam persona name, sent in every packet
         self._jump_count = 0
         self._last_sent_state = None
         self._last_send_time = 0.0
@@ -86,6 +88,8 @@ class NetworkManager:
 
             self.local_steam_id = self.client.own_steam_id()
             print(f"Your Steam ID: {self.local_steam_id}")
+            self.local_name = self.client.own_name() if hasattr(self.client, "own_name") else ""
+            print(f"Your Steam name: {self.local_name}")
 
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
@@ -370,6 +374,8 @@ class NetworkManager:
             "s": int(sprinting),
             "d": [round(move_direction.x, 2), round(move_direction.z, 2)],
             "j": self._jump_count,
+            "h": self.local_hat or "",
+            "n": self.local_name,
         }
 
     HELLO_INTERVAL = 0.5
@@ -390,6 +396,14 @@ class NetworkManager:
         if self.local_steam_id == host_id:
             return False
         return self.local_steam_id < member_id
+
+    def _friend_name(self, steam_id):
+        """Steam's own record of a player's name ('' if not loaded yet) - only
+        a fallback until their packets, which carry the name, arrive."""
+        try:
+            return self.client.friend_name(steam_id)
+        except Exception:
+            return ""
 
     def _relay_ready(self):
         """Steam's relay network takes several seconds after launch to become
@@ -525,6 +539,7 @@ class NetworkManager:
             if sender_id not in self.remote_players:
                 print(f"\n--> Discovered peer in lobby: {sender_id}")
                 self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
+                self.remote_players[sender_id].name = self._friend_name(sender_id)
             self.remote_players[sender_id].receive_state(state)
         except Exception as e:
             print(f"Error parsing incoming packet from {sender_id}: {e}")

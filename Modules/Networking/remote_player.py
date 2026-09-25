@@ -139,6 +139,9 @@ class RemotePlayer:
         self._last_packet = 0.0
         self._jump_seen = None    # last jump counter value seen
         self._pending_jump = False
+        self.name = ""            # Steam persona name (packets carry it)
+        self._hat_wanted = None   # from the latest packet ('' = bare-headed)
+        self._hat_applied = None
 
     def receive_state(self, state):
         """state: the decoded packet dict from NetworkManager._broadcast_
@@ -158,6 +161,9 @@ class RemotePlayer:
         if self._jump_seen is not None and jumps > self._jump_seen:
             self._pending_jump = True
         self._jump_seen = jumps
+        self._hat_wanted = state.get("h") or None
+        if state.get("n"):
+            self.name = str(state["n"])[:32]
 
     def _sample(self, render_time):
         """(feet_pos, yaw) at render_time, interpolated between the two
@@ -192,6 +198,9 @@ class RemotePlayer:
             just_jumped=self._pending_jump,
         )
         self._pending_jump = False
+        if self._hat_wanted != self._hat_applied:
+            self._hat_applied = self._hat_wanted   # even if unknown - don't retry every frame
+            self.model.set_hat(self._hat_wanted)
 
         # Hitbox centered vertically on the body (feet to eye), not at
         # floor level, and follows facing so a future directional query

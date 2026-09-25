@@ -271,9 +271,18 @@ class Dropdown(Widget):
 
     # ---- popup ---------------------------------------------------------
 
+    def _popup_top(self):
+        """Y of the option list's top edge: just below the box, or - if the
+        list wouldn't fit above the window's bottom edge - just above it."""
+        x, y, w, h = self.rect
+        n = len(self.options)
+        if self.manager is not None and y + h + h * n > self.manager.root.rect[3] and y - h * n >= 0:
+            return y - h * n
+        return y + h
+
     def _popup_rect(self):
         x, y, w, h = self.rect
-        return x, y + h, w, h * len(self.options)
+        return x, self._popup_top(), w, h * len(self.options)
 
     def popup_contains(self, x, y):
         if not self.open:
@@ -290,7 +299,7 @@ class Dropdown(Widget):
     def on_press(self, x, y):
         if self.open:
             if self.popup_contains(x, y):
-                self.set_selected(int((y - self.rect[1] - self.rect[3]) // self.rect[3]))
+                self.set_selected(int((y - self._popup_top()) // self.rect[3]))
             self.close()
         else:
             self.open = True
@@ -300,7 +309,7 @@ class Dropdown(Widget):
         pass
 
     def on_hover(self, x, y):
-        self._hover_index = (int((y - self.rect[1] - self.rect[3]) // self.rect[3])
+        self._hover_index = (int((y - self._popup_top()) // self.rect[3])
                              if self.popup_contains(x, y) else -1)
 
     # ---- draw ----------------------------------------------------------
@@ -314,8 +323,9 @@ class Dropdown(Widget):
     def _draw_popup(self, out):
         x, y, w, h = self.rect
         out.rect(self._popup_rect(), _color(self.popup_color))
+        top = self._popup_top()
         for i, lbl in enumerate(self._option_labels):
-            row_y = y + h * (i + 1)
+            row_y = top + h * i
             if i == self._hover_index:
                 out.rect((x, row_y, w, h), _color(self.highlight_color))
             lw, lh = lbl.measure(0, 0)

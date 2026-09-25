@@ -16,6 +16,7 @@ from Modules.Graphics.pbr_shader import (
     bind_frame_uniforms,
     bind_point_lights,
     bind_probe_irradiance,
+    TEX_UNIT_ALBEDO,
     bind_environment,
     _has_uniform,
     bind_reflection_environment,
@@ -44,7 +45,7 @@ from Modules.Graphics import lightmap_cache_io
 from Modules.Graphics.light_probes import (
     build_light_probe_grid, sample_light_probe_visibility, sample_light_probe_irradiance,
 )
-from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao, load_animation_clips
+from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao, load_animation_clips, load_hat
 from Modules.Graphics.skeletal_shader import (
     create_skeletal_program,
     create_skeletal_shadow_program,
@@ -144,6 +145,24 @@ def _apply_upper_rotation_offsets(obj, new_offsets, blend_duration=_DEFAULT_ANIM
     obj["upper_rotation_offsets"] = new_offsets
     obj["upper_offset_blend_elapsed"] = 0.0
     obj["upper_offset_blend_duration"] = blend_duration
+
+
+def _begin_pose_snapshot(obj, duration):
+    """Starts a transition that fades FROM the pose currently on screen.
+    The older per-track crossfades (prev_animation & co.) fade from a single
+    clip frozen at one time, which is not what the bones were actually doing
+    when leaving a blend space (several clips mixed, a rotation offset, a
+    mask split...) - so the pose jumped to that clip and only then blended,
+    which reads as looking one way and turning back. A snapshot of the real
+    last pose has no such gap. Returns True if a snapshot was taken; the
+    caller then makes its own crossfade instant so the two don't stack."""
+    last = obj["skeleton"].last_pose
+    if last is None or duration <= 0.0:
+        return False
+    obj["pose_snap"] = list(last)
+    obj["pose_snap_elapsed"] = 0.0
+    obj["pose_snap_duration"] = duration
+    return True
 
 
 def _advance_clip_time(skeleton, obj, dt, anim_key="animation", time_key="anim_time", loop_key="anim_loop"):
@@ -1297,6 +1316,11 @@ class Scene:
             "_shadow_vbos": shadow_vao_info["vbos"],
             "_shadow_ibo": shadow_vao_info["ibo"],
             "skeleton": skeleton,
+            # Optional hats (see set_skeletal_hat): source data for lazy
+            # loading, a cache of built hats, and the one currently worn.
+            "_hat_source": data.get("hat_source"),
+            "hats": {},
+            "active_hat": None,
             "animation": animation,
             "anim_time": 0.0,
             "anim_loop": bool(loop),
@@ -1394,6 +1418,50 @@ class Scene:
         self.skeletal_objects.append(obj)
         return obj
 
+    def set_skeletal_hat(self, obj, name):
+        """Puts the named hat (a "hat_<name>" node of the glb, e.g. "cowboy")
+        on a skeletal object, or takes it off with name=None/"". Built on
+        first use only - geometry, own texture and VAOs - and then just
+        toggled; a hat is drawn right after the base mesh with the same bones
+        (see the skeletal draw loops). Returns False for an unknown name."""
+        if not name:
+            obj["active_hat"] = None
+            return True
+        hats = obj["hats"]
+        if name not in hats:
+            source = obj.get("_hat_source")
+            data = load_hat(source, name, self.ctx) if source else None
+            if data is None:
+                return False
+            render = create_skeletal_vao(self.ctx, self.skeletal_program, data)
+            shadow = create_skeletal_vao(self.ctx, self.skeletal_shadow_program, data)
+            hats[name] = {
+                "vao": render["vao"], "vbos": render["vbos"], "ibo": render["ibo"],
+                "shadow_vao": shadow["vao"], "_shadow_vbos": shadow["vbos"], "_shadow_ibo": shadow["ibo"],
+                "texture": data.get("texture"),
+            }
+        obj["active_hat"] = name
+        return True
+
+    @staticmethod
+    def _active_hat(obj):
+        name = obj.get("active_hat")
+        return obj["hats"].get(name) if name else None
+
+    def _draw_hat(self, obj):
+        """Color pass: the worn hat, if any, over the just-drawn base mesh -
+        same program/uniforms/bones, only the albedo texture differs."""
+        hat = self._active_hat(obj)
+        if hat is not None:
+            if hat["texture"] is not None:
+                hat["texture"].use(location=TEX_UNIT_ALBEDO)
+            hat["vao"].render()
+
+    def _draw_hat_shadow(self, obj):
+        hat = self._active_hat(obj)
+        if hat is not None:
+            hat["shadow_vao"].render()
+
     def set_skeletal_animation(self, obj, animation_name, blend_duration=_DEFAULT_ANIM_BLEND_DURATION,
                                 loop=True, start_time=0.0):
         """Switches obj to a different animation clip, restarting from
@@ -1454,6 +1522,8 @@ class Scene:
         finish."""
         if animation_name == obj["animation"] and obj["locomotion_weights"] is None:
             return
+        if _begin_pose_snapshot(obj, blend_duration):
+            blend_duration = 0.0
         obj["prev_animation"] = obj["animation"]
         obj["prev_anim_time"] = obj["anim_time"]
         obj["anim_blend_elapsed"] = 0.0
@@ -1479,6 +1549,8 @@ class Scene:
         mechanism, upper-body side)."""
         if animation_name == obj["upper_animation"] and obj["upper_locomotion_weights"] is None:
             return
+        if _begin_pose_snapshot(obj, blend_duration):
+            blend_duration = 0.0
         obj["upper_prev_animation"] = obj["upper_animation"]
         obj["upper_prev_anim_time"] = obj["upper_anim_time"]
         obj["upper_anim_blend_elapsed"] = 0.0
@@ -1522,6 +1594,8 @@ class Scene:
         every single frame and never finish."""
         if weighted_clips == obj["locomotion_weights"] and upper_weighted_clips == obj["upper_locomotion_weights"]:
             return
+        if _begin_pose_snapshot(obj, blend_duration):
+            blend_duration = 0.0
         obj["prev_animation"] = obj["animation"]
         obj["prev_anim_time"] = obj["anim_time"]
         obj["anim_blend_elapsed"] = 0.0
@@ -1558,6 +1632,8 @@ class Scene:
         upper_body_root_joints set (upper_root_indices is then empty, so
         there's nothing for the offset to apply to)."""
         new_offsets = _resolve_upper_rotation_offsets(obj["skeleton"], obj["upper_root_indices"], degrees)
+        if _begin_pose_snapshot(obj, blend_duration):
+            blend_duration = 0.0
         _apply_upper_rotation_offsets(obj, new_offsets, blend_duration)
 
     def set_skeletal_upper_joint_mask(self, obj, root_joint_names, blend_duration=_DEFAULT_ANIM_BLEND_DURATION):
@@ -1598,6 +1674,8 @@ class Scene:
 
         Takes effect on the very next Scene.update()."""
         skeleton = obj["skeleton"]
+        if _begin_pose_snapshot(obj, blend_duration):
+            blend_duration = 0.0
         obj["upper_joint_mask_prev"] = obj["upper_joint_mask"]
         obj["upper_joint_mask"] = skeleton.compute_joint_mask(root_joint_names)
         obj["upper_root_indices"] = skeleton.resolve_joint_indices(root_joint_names)
@@ -2760,6 +2838,21 @@ class Scene:
             skeleton = obj["skeleton"]
             upper_mask = obj.get("upper_joint_mask")
 
+            # Transition-from-snapshot blend (see _begin_pose_snapshot): while
+            # active, Skeleton._world_matrices fades from the captured pose to
+            # whatever this frame computes, with a smoothstep ease.
+            snap = obj.get("pose_snap")
+            if snap is not None:
+                obj["pose_snap_elapsed"] += dt
+                w = min(1.0, obj["pose_snap_elapsed"] / obj["pose_snap_duration"])
+                if w >= 1.0:
+                    obj["pose_snap"] = None
+                    skeleton._pose_snap = None
+                else:
+                    skeleton._pose_snap = (snap, w * w * (3.0 - 2.0 * w))
+            else:
+                skeleton._pose_snap = None
+
             # Every track (lower, and upper if this obj has a split) is
             # fed into Skeleton's weighted-list sampler either way - a
             # single clip is just a 1-entry list (weight 1.0), which
@@ -3021,6 +3114,7 @@ class Scene:
                 self.skeletal_shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
                 bind_bone_matrices(obj)
                 obj["shadow_vao"].render()
+                self._draw_hat_shadow(obj)
 
         self.ctx.screen.use()
         self.ctx.viewport = old_viewport
@@ -3151,6 +3245,7 @@ class Scene:
             self.skeletal_shadow_program["u_light_mvp"].write(mvp.to_bytes())
             bind_bone_matrices(obj)
             obj["shadow_vao"].render()
+            self._draw_hat_shadow(obj)
 
         self.ctx.screen.use()
         self.ctx.enable(moderngl.CULL_FACE)
@@ -3405,6 +3500,7 @@ class Scene:
             bind_material(self.skeletal_program, obj, model_matrix, skeletal_view_proj)
             bind_bone_matrices(obj)
             obj["vao"].render()
+            self._draw_hat(obj)
 
         return blended_objects, any_ssr_visible
 
@@ -3652,6 +3748,13 @@ class Scene:
         for vbo_dict_key in ("_render_vbos", "_shadow_vbos"):
             for vbo in obj.get(vbo_dict_key, {}).values():
                 _release(vbo)
+
+        for hat in obj.get("hats", {}).values():
+            for key in ("vao", "shadow_vao", "ibo", "_shadow_ibo", "texture"):
+                _release(hat.get(key))
+            for vbo_dict_key in ("vbos", "_shadow_vbos"):
+                for vbo in hat.get(vbo_dict_key, {}).values():
+                    _release(vbo)
 
     def _release_object(self, obj):
         for key in (
