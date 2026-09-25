@@ -31,6 +31,8 @@ class SoundManager:
         max_distance=20.0,
         loop=True,
         universal=False,
+        follow=None,
+        channel=None,
     ):
         """loop=True starts it as a looping ambient sound immediately
         (e.g. a hum, a fire crackling); loop=False plays it once and
@@ -40,14 +42,32 @@ class SoundManager:
         entirely - the sound plays at a flat `volume` in both ears
         regardless of the listener's position/facing (e.g. music, UI
         sounds, a global ambience bed). position is still required but
-        ignored in this mode."""
+        ignored in this mode.
+
+        follow: optional callable returning the emitter's CURRENT world
+        position, polled every update() while it plays - a sound that's
+        attached to something that moves (a gunshot ringing out of a moving
+        player) instead of staying where it started. `position` is where it
+        begins.
+
+        channel: the channel an earlier call returned (its emitter's "channel")
+        to play on again instead of whichever is free: whatever is still
+        playing on it is cut off, its emitter dropped, and this sound takes
+        its place. For a sound that repeats faster than it ends (a gunshot) -
+        the old one is killed and the new one always plays, rather than
+        needing a free channel from the pool each time, which with the mixer
+        busy could be none."""
         if not pygame.mixer.get_init():
             pygame.mixer.init()
             pygame.mixer.set_num_channels(32)
 
         sound = pygame.mixer.Sound(sound_path)
         sound.set_volume(volume)
-        channel = sound.play(loops=-1 if loop else 0)
+        if channel is not None:
+            self.emitters = [e for e in self.emitters if e["channel"] is not channel]
+            channel.play(sound, loops=-1 if loop else 0)
+        else:
+            channel = sound.play(loops=-1 if loop else 0)
 
         if channel is None:
             print(f"[SoundManager] No free mixer channel for sound: {sound_path}")
@@ -61,6 +81,7 @@ class SoundManager:
             "max_distance": float(max_distance),
             "loop": bool(loop),
             "universal": bool(universal),
+            "follow": follow,
         }
         self.emitters.append(emitter)
         return emitter
@@ -86,6 +107,9 @@ class SoundManager:
                 # for an unrelated sound, and calling .set_volume() on
                 # it afterward would affect that different sound).
                 continue
+
+            if emitter["follow"] is not None:
+                emitter["position"] = glm.vec3(emitter["follow"]())
 
             if emitter["universal"]:
                 # No distance attenuation or panning - flat volume in

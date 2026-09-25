@@ -13,12 +13,16 @@ only updates widgets/flags - on_start itself is expected to defer the real
 work (app.py just records a pending start for its main loop).
 """
 
-from .controls import ScrollBox, Slider
+from .controls import ColorWheel, ScrollBox, Slider
 from .inputs import Dropdown, TextInput
 from . import theme
-from .widgets import Anchor, Button, Label, Panel
+from .widgets import Anchor, Button, Image, Label, Panel
 from Modules.Player.hats import available_hats, display_name
+from Modules.Player.rat_colors import hsv_to_rgb, rgb_to_hsv
 
+# Where the fur color's brightness slider starts (and returns to on reset) -
+# well below full so a freshly picked color isn't blown out.
+_DEFAULT_BRIGHTNESS = 0.45
 _W = 700  # inner width of the host/join panels (736 - 2 * 18 padding)
 _MUTED = theme.MUTED
 _WARN = theme.WARN
@@ -33,15 +37,17 @@ class LobbyMenu:
     MIN_PLAYERS = 2
     MAX_PLAYERS = 10
 
-    def __init__(self, ui, net, maps, on_start, on_hat_change=None):
+    def __init__(self, ui, net, maps, on_start, on_hat_change=None, on_color_change=None):
         """maps: [(display name, scene key), ...]; on_start(scene_key);
-        on_hat_change(hat name or None) fires when the wardrobe pick changes."""
+        on_hat_change(hat name or None) fires when the wardrobe pick changes;
+        on_color_change((r, g, b) 0-1 or None) when the fur color does."""
         self.ui = ui
         self.net = net
         self.maps = maps
         self._map_names = {key: name for name, key in maps}
         self.on_start = on_start
         self.on_hat_change = on_hat_change
+        self.on_color_change = on_color_change
         self.lobbies = []
         self._searching = False
         self._busy = False
@@ -96,6 +102,64 @@ class LobbyMenu:
             ["No hat"] + [display_name(h) for h in hats], selected=selected,
             on_change=choose, size=(400, 62), font_size=30, color=theme.BUTTON["color"],
             hover_color=theme.BUTTON["hover_color"], highlight_color=theme.ACCENT_DIM))
+        self._build_color_card(stage)
+
+    def _build_color_card(self, stage):
+        """A card at the right of the 3D rat with the fur color wheel. Like the
+        hat, the choice lives on NetworkManager (local_color): shown on the
+        preview rat right away via on_color_change, put on the local rat when a
+        map starts, and sent to everyone else in each movement packet."""
+        card = stage.add(Panel(color=theme.CARD, anchor=Anchor.MIDDLE_RIGHT, pivot=(1.0, 0.5),
+                              offset=(-40, 0), layout="vertical", spacing=12, padding=22,
+                              align="center", fit_content=True, visible=False))
+        self.color_card = card
+
+        # The card starts closed; this palette button (top right of the stage)
+        # opens/closes it.
+        def toggle_card():
+            card.visible = not card.visible
+            self.palette_button.normal_color = (theme.ACCENT_DIM if card.visible
+                                                else theme.BUTTON["color"])
+
+        self.palette_button = stage.add(Button(
+            "", on_click=toggle_card, size=(80, 80), anchor=Anchor.TOP_RIGHT, offset=(-40, 40),
+            **theme.BUTTON))
+        self.palette_button.add(Image("Assets/Textures/UI/Palette.png", size=(56, 56),
+                                      anchor=Anchor.CENTER))
+        card.add(Label("FUR COLOR", font_size=28, color=theme.ACCENT))
+        self.color_wheel = card.add(ColorWheel(value=_DEFAULT_BRIGHTNESS, size=(260, 260),
+                                                  on_change=self._on_wheel))
+        card.add(Label("Brightness", font_size=22, color=_MUTED))
+        self.color_brightness = card.add(Slider(_DEFAULT_BRIGHTNESS, 0.15, 1.0, size=(260, 34),
+                                                on_change=self._on_brightness))
+        card.add(_button("Default colors", self._reset_color, size=(260, 54), font_size=26))
+        current = self.net.local_color
+        if current is not None:
+            h, s, v = rgb_to_hsv(current)
+            self.color_wheel.set_hs(h, s)
+            self.color_wheel.set_value(v)
+            self.color_brightness.set_value(v, notify=False)
+
+    def _apply_color(self):
+        w = self.color_wheel
+        self.net.local_color = hsv_to_rgb(w.hue, w.saturation, w.value)
+        if self.on_color_change is not None:
+            self.on_color_change(self.net.local_color)
+
+    def _on_wheel(self, hue, saturation):
+        self._apply_color()
+
+    def _on_brightness(self, value):
+        self.color_wheel.set_value(value)
+        self._apply_color()
+
+    def _reset_color(self):
+        self.net.local_color = None
+        self.color_wheel.set_hs(0.0, 0.0)
+        self.color_wheel.set_value(_DEFAULT_BRIGHTNESS)
+        self.color_brightness.set_value(_DEFAULT_BRIGHTNESS, notify=False)
+        if self.on_color_change is not None:
+            self.on_color_change(None)
 
     def _panel(self):
         return Panel(color=theme.CARD, layout="vertical", spacing=10, padding=18,

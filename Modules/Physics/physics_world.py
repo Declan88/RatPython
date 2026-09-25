@@ -107,6 +107,23 @@ def _euler_to_quat(rotation):
     )
 
 
+class RayHit:
+    """What a PhysicsWorld.raycast found. Everything is in render space.
+    position/normal: where the ray struck and the surface's normal there;
+    distance: metres from the ray's start; owner: whatever add_hitbox tagged
+    the struck node with (a remote player's steam_id) or None for ordinary
+    level geometry/props; node: the Bullet node itself."""
+    __slots__ = ("position", "normal", "distance", "fraction", "owner", "node")
+
+    def __init__(self, position, normal, distance, fraction, owner, node):
+        self.position = position
+        self.normal = normal
+        self.distance = distance
+        self.fraction = fraction
+        self.owner = owner
+        self.node = node
+
+
 class CollisionGroup:
     """Combinable collision-mask bits (up to 32 available). Two bodies
     only collide if (a.collision_mask & b.collision_mask) != 0 - see
@@ -257,6 +274,37 @@ class PhysicsWorld:
             to_physics_pos(from_pos), to_physics_pos(to_pos), collision_mask,
         )
         return not hit.hasHit()
+
+    def raycast(self, from_pos, to_pos, collision_mask=None):
+        """Line trace: the closest thing between from_pos and to_pos (both
+        render space), or None if the segment is clear - a RayHit with the
+        hit point, surface normal, distance and owner (see RayHit).
+
+        collision_mask defaults to "everything a bullet should stop at":
+        level geometry (STATIC), props (DYNAMIC) and player HITBOXES - but not
+        PLAYER, the local player's own movement hull, which sits at the
+        camera and would otherwise block every shot before it left. Pass a
+        narrower mask to trace against just some of those (e.g. HITBOX alone
+        to ignore walls). One Bullet rayTestClosest - cheap, no allocation
+        beyond the result.
+
+        line_of_sight is the no-detail version for "is anything in the way"."""
+        if collision_mask is None:
+            collision_mask = CollisionGroup.STATIC | CollisionGroup.DYNAMIC | CollisionGroup.HITBOX
+        start, end = glm.vec3(from_pos), glm.vec3(to_pos)
+        result = self.world.rayTestClosest(to_physics_pos(start), to_physics_pos(end), collision_mask)
+        if not result.hasHit():
+            return None
+        node = result.getNode()
+        fraction = result.getHitFraction()
+        return RayHit(
+            position=to_render_pos(result.getHitPos()),
+            normal=to_render_vec(result.getHitNormal()),
+            distance=glm.length(end - start) * fraction,
+            fraction=fraction,
+            owner=node.getPythonTag("owner") if node.hasPythonTag("owner") else None,
+            node=node,
+        )
 
     # ---------------------------------------------------------------
     # STATIC COLLIDERS (mass = 0, never move - level geometry)

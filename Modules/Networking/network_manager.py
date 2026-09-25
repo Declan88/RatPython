@@ -16,6 +16,7 @@ import time
 
 import py_steam_net
 from .remote_player import RemotePlayer
+from Modules.Player.rat_colors import encode_color
 
 
 class NetworkManager:
@@ -61,6 +62,9 @@ class NetworkManager:
         self.current_lobby_id = None
         self._local_state = None
         self.local_hat = None   # short hat name from the main menu, or None
+        self.local_color = None  # (r, g, b) 0-1 fur color from the main menu, or None
+        self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
+        self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
         self.local_name = ""    # our Steam persona name, sent in every packet
         self._jump_count = 0
         self._last_sent_state = None
@@ -352,6 +356,38 @@ class NetworkManager:
     # TRANSFORM SYNC
     # =============================================================
 
+    def notify_shot(self):
+        """Call when the local player fires. Sent as a running counter in the
+        movement packets (so a lost packet can't drop a shot) - other players
+        play the gunshot at our position when it goes up."""
+        self._shot_count += 1
+
+    def send_damage(self, victim_id, amount, weapon_name=""):
+        """Tells `victim_id` they were shot for `amount`: the shooter decides
+        a hit (against the victim's hitbox as the shooter sees it) and the
+        victim applies it to their own health - see on_damage. RELIABLE, unlike
+        the movement stream: a hit must not be lost or reordered. Returns
+        whether it was sent."""
+        if victim_id == self.local_steam_id or not self.current_lobby_id:
+            return False
+        payload = json.dumps(
+            {"dmg": round(float(amount), 2), "w": str(weapon_name)}, separators=(",", ":")
+        ).encode("utf-8")
+        try:
+            self.client.send_message_to(victim_id, self.HELLO_FLAGS, 0, payload)
+            return True
+        except Exception:
+            return False
+
+    def _receive_damage(self, sender_id, message):
+        try:
+            amount = float(message["dmg"])
+        except (KeyError, TypeError, ValueError):
+            return
+        amount = max(0.0, min(amount, 1000.0))   # it comes off the wire: keep it sane
+        if amount > 0.0 and self.on_damage is not None:
+            self.on_damage(amount, sender_id, str(message.get("w", "")))
+
     def set_local_state(self, feet_pos, yaw, pitch, speed, crouched, grounded,
                         sprinting, move_direction, jumped):
         """Call once per frame with the LOCAL player's real state (not the
@@ -375,6 +411,8 @@ class NetworkManager:
             "d": [round(move_direction.x, 2), round(move_direction.z, 2)],
             "j": self._jump_count,
             "h": self.local_hat or "",
+            "k": encode_color(self.local_color),
+            "f": self._shot_count,
             "n": self.local_name,
         }
 
@@ -534,6 +572,9 @@ class NetworkManager:
         self._heard_from.add(sender_id)
         try:
             state = json.loads(msg_bytes.decode("utf-8"))
+            if "dmg" in state:
+                self._receive_damage(sender_id, state)
+                return
             if "p" not in state or "y" not in state:
                 return  # not this version's movement packet
             if sender_id not in self.remote_players:

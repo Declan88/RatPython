@@ -5,6 +5,12 @@ ScrollBox) use the mouse-capture protocol UIManager.handle_event drives:
 on_press, then on_drag for every motion event while held, then on_release.
 """
 
+import colorsys
+import math
+
+import numpy as np
+import pygame
+
 from .widgets import Anchor, Label, Panel, Widget, _color
 
 
@@ -254,3 +260,105 @@ class ScrollBox(Panel):
             active = self._grab is not None or self.hovered
             out.rect((tx + 2, ty, self.scrollbar_width - 4, th),
                      _color((215, 215, 225, 200 if active else 130)))
+
+
+class ColorWheel(Widget):
+    """Hue/saturation disc: the angle around the centre picks the hue (red at
+    the right, going counter-clockwise), the distance from it the saturation.
+    Brightness is separate - set_value() dims the disc, and a Slider next to it
+    drives that. on_change(hue, saturation) fires while the disc is dragged;
+    all three are in 0-1."""
+
+    interactive = True
+    TEXTURE_SIZE = 256
+
+    def __init__(self, hue=0.0, saturation=0.0, value=1.0, on_change=None, **kw):
+        kw.setdefault("size", (240, 240))
+        super().__init__(**kw)
+        self.hue = hue
+        self.saturation = saturation
+        self.value = value
+        self.on_change = on_change
+        self._tex = None
+
+    def set_hs(self, hue, saturation):
+        self.hue = hue % 1.0
+        self.saturation = min(1.0, max(0.0, saturation))
+
+    def set_value(self, value):
+        self.value = min(1.0, max(0.0, value))
+
+    def _build_texture(self):
+        n = self.TEXTURE_SIZE
+        ys, xs = np.mgrid[0:n, 0:n]
+        c = (n - 1) / 2.0
+        dx, dy = xs - c, ys - c
+        radius = np.hypot(dx, dy) / c
+        hue = (np.arctan2(-dy, dx) / (2.0 * math.pi)) % 1.0   # y is down on screen
+        # Vectorised HSV->RGB at full value, saturation = radius.
+        h6 = hue * 6.0
+        i = np.floor(h6).astype(int) % 6
+        f = h6 - np.floor(h6)
+        sat = np.clip(radius, 0.0, 1.0)
+        p, q, t = 1.0 - sat, 1.0 - sat * f, 1.0 - sat * (1.0 - f)
+        one = np.ones_like(sat)
+        rgb = np.select(
+            [i[..., None] == k for k in range(6)],
+            [np.stack(v, -1) for v in ((one, t, p), (q, one, p), (p, one, t), (p, q, one), (t, p, one), (one, p, q))],
+        )
+        alpha = np.clip((1.0 - radius) * c, 0.0, 1.0)         # 1px soft edge
+        rgba = np.dstack([rgb, alpha])
+        data = (rgba * 255.0 + 0.5).astype(np.uint8)
+        surf = pygame.image.frombuffer(data.tobytes(), (n, n), "RGBA")
+        self._tex = self.manager.renderer.texture_from_surface(surf)
+
+    def _release_resources(self):
+        super()._release_resources()
+        if self._tex is not None:
+            self._tex.release()
+            self._tex = None
+
+    def _set_from_point(self, x, y):
+        rx, ry, w, h = self.rect
+        cx, cy = rx + w / 2.0, ry + h / 2.0
+        radius = min(w, h) / 2.0
+        dx, dy = x - cx, y - cy
+        if dx == 0.0 and dy == 0.0:
+            hue = self.hue
+        else:
+            hue = (math.atan2(-dy, dx) / (2.0 * math.pi)) % 1.0
+        self.hue = hue
+        self.saturation = min(1.0, math.hypot(dx, dy) / radius) if radius > 0 else 0.0
+        if self.on_change is not None:
+            self.on_change(self.hue, self.saturation)
+
+    def _contains(self, x, y):
+        rx, ry, w, h = self.rect
+        radius = min(w, h) / 2.0
+        return math.hypot(x - (rx + w / 2.0), y - (ry + h / 2.0)) <= radius
+
+    def on_press(self, x, y):
+        self._set_from_point(x, y)
+
+    def on_drag(self, x, y):
+        self._set_from_point(x, y)
+
+    def on_release(self, x, y, inside):
+        pass
+
+    def draw(self, out):
+        if self._tex is None and self.manager is not None:
+            self._build_texture()
+        x, y, w, h = self.rect
+        if self._tex is not None:
+            v = self.value
+            out.texture_logical(self._tex, self.rect, (v, v, v, 1.0))
+        # Marker at the picked point: dark and light frames around a swatch
+        # of the color it picks.
+        radius = min(w, h) / 2.0
+        mx = x + w / 2.0 + math.cos(self.hue * 2.0 * math.pi) * self.saturation * radius
+        my = y + h / 2.0 - math.sin(self.hue * 2.0 * math.pi) * self.saturation * radius
+        picked = (*colorsys.hsv_to_rgb(self.hue, self.saturation, self.value), 1.0)
+        for size, color in ((16, (0.0, 0.0, 0.0, 1.0)), (12, (1.0, 1.0, 1.0, 1.0)), (8, picked)):
+            out.rect((mx - size / 2.0, my - size / 2.0, size, size), color)
+        super().draw(out)

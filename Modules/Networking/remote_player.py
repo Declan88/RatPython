@@ -20,6 +20,8 @@ import time
 import glm
 
 from Modules.Player.player_model import PlayerModel
+from Modules.Player.rat_colors import RAT_TINT_MASK_PATH, decode_color
+from Modules.Weapons import USP
 
 # How far behind real time remote players are drawn - see module docstring.
 # Comfortably more than one packet interval (1/30s) so there are almost
@@ -109,7 +111,7 @@ class RemotePlayer:
             scene, model_path,
             visible_in_color=True, cast_shadow=True,
             states=animation_states, forward_offset_degrees=forward_offset_degrees,
-            scale=scale, time_scale=_RAT_ANIM_TIME_SCALE,
+            scale=scale, time_scale=_RAT_ANIM_TIME_SCALE, tint_mask_path=RAT_TINT_MASK_PATH,
             directional_clips=_DIRECTIONAL_CLIPS,
             jump_animation="rifle_jump", crouch_animation="rifle_crouch",
         )
@@ -132,6 +134,13 @@ class RemotePlayer:
                     self.model.obj, path, rename=rename, time_scale=time_scale,
                 )
 
+        # Every player carries the USP for now (the packets don't say which
+        # weapon yet). The world model goes in the hand; the arm pose only
+        # applies to a model with an upper-body split, which this one doesn't
+        # have - see WeaponsBase.equip_player.
+        self.weapon = USP()
+        self.weapon.equip_player(scene, self.model)
+
         self._hitbox = scene.physics.add_hitbox(hitbox_half_extents, owner=steam_id)
 
         self._snapshots = []      # [(arrival_time, feet_pos, yaw_degrees)], oldest first
@@ -142,6 +151,11 @@ class RemotePlayer:
         self.name = ""            # Steam persona name (packets carry it)
         self._hat_wanted = None   # from the latest packet ('' = bare-headed)
         self._hat_applied = None
+        self._shot_seen = None     # last shot counter value seen
+        self._pending_shots = 0
+        self._voice_position = glm.vec3(0.0)  # where this player's shots sound from
+        self._color_wanted = None  # fur color from the latest packet (None = the rat's own)
+        self._color_applied = None
 
     def receive_state(self, state):
         """state: the decoded packet dict from NetworkManager._broadcast_
@@ -162,6 +176,13 @@ class RemotePlayer:
             self._pending_jump = True
         self._jump_seen = jumps
         self._hat_wanted = state.get("h") or None
+        self._color_wanted = decode_color(state.get("k"))
+        # Shots travel as a counter like jumps: any increase is that many shots
+        # (capped so a long stall can't replay a burst of gunfire at once).
+        shots = int(state.get("f", 0))
+        if self._shot_seen is not None and shots > self._shot_seen:
+            self._pending_shots = min(self._pending_shots + shots - self._shot_seen, 3)
+        self._shot_seen = shots
         if state.get("n"):
             self.name = str(state["n"])[:32]
 
@@ -186,6 +207,7 @@ class RemotePlayer:
             return
         now = time.perf_counter()
         feet_pos, yaw = self._sample(now - INTERP_DELAY)
+        self._voice_position = feet_pos + glm.vec3(0.0, _BODY_HEIGHT * 0.8, 0.0)
         s = self._state
         stale = now - self._last_packet > _STALE_SECONDS
         move = s.get("d", (0.0, 0.0))
@@ -198,9 +220,17 @@ class RemotePlayer:
             just_jumped=self._pending_jump,
         )
         self._pending_jump = False
+        while self._pending_shots > 0:
+            self._pending_shots -= 1
+            # From about chest height at where they're standing now.
+            # From about chest height, following this player while it plays.
+            self.weapon.play_fire_sound(self.scene, self._voice_position, follow=lambda: self._voice_position)
         if self._hat_wanted != self._hat_applied:
             self._hat_applied = self._hat_wanted   # even if unknown - don't retry every frame
             self.model.set_hat(self._hat_wanted)
+        if self._color_wanted != self._color_applied:
+            self._color_applied = self._color_wanted
+            self.model.set_tint(self._color_wanted)
 
         # Hitbox centered vertically on the body (feet to eye), not at
         # floor level, and follows facing so a future directional query
@@ -217,6 +247,7 @@ class RemotePlayer:
         feature doesn't add to), so a disconnected peer's model/hitbox
         currently just stays put. Exposed now so wiring that up later is
         a one-line call, not another rewrite."""
+        self.weapon.unequip()
         self.model.destroy()
         if self._hitbox is not None:
             self.scene.physics.remove_hitbox(self._hitbox)

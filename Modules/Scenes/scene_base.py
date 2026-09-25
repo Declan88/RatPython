@@ -21,6 +21,8 @@ from Modules.Graphics.pbr_shader import (
     _has_uniform,
     bind_reflection_environment,
     bind_ssr_textures,
+    invalidate_material_ubo,
+    bind_untinted_material,
     MAX_POINT_LIGHTS,
 )
 from Modules.Graphics.frustum import extract_frustum_planes, aabb_outside_frustum
@@ -45,7 +47,9 @@ from Modules.Graphics import lightmap_cache_io
 from Modules.Graphics.light_probes import (
     build_light_probe_grid, sample_light_probe_visibility, sample_light_probe_irradiance,
 )
-from Modules.Graphics.skeletal_loader import load_skinned_glb, create_skeletal_vao, load_animation_clips, load_hat
+from Modules.Graphics.skeletal_loader import (
+    load_skinned_glb, create_skeletal_vao, load_animation_clips, load_hat, _extract_rotation,
+)
 from Modules.Graphics.skeletal_shader import (
     create_skeletal_program,
     create_skeletal_shadow_program,
@@ -82,6 +86,10 @@ _DEFAULT_ANIM_BLEND_DURATION = 0.25
 # way - only the real-time cascades/sampling are skipped. Revert to
 # True when done comparing.
 ENABLE_SHADOWS = True
+
+# See Scene._render_viewmodels: fraction of the depth range a viewmodel is
+# squeezed into (from the near end).
+_VIEWMODEL_DEPTH_SCALE = 0.05
 
 # Mirrors pbr_shader.py's own (private) _ALPHA_MODE_TO_INT - kept as a
 # separate constant here rather than importing that one, since it's a
@@ -246,6 +254,9 @@ class Scene:
         self.static_objects = []
         self.dynamic_objects = []
         self.skeletal_objects = []
+        self.viewmodel_objects = []   # see add_viewmodel
+        self._attachments = []        # see attach_skeletal
+        self._skeletal_view_proj = None
         self.point_lights = []
         # Built by _build_light_probe_grid (called from bake_static_
         # lighting) - see light_probes.py's own docstring for what this
@@ -1161,14 +1172,110 @@ class Scene:
     # SKELETAL (ANIMATED) OBJECTS
     # =============================================================
 
+    def _load_tint_mask(self, path):
+        """Uploads a player-color mask image (see add_skeletal's
+        tint_mask_path); None for no path."""
+        if path is None:
+            return None
+        from PIL import Image
+        img = Image.open(path).convert("RGBA")
+        texture = self.ctx.texture(img.size, 4, img.tobytes())
+        texture.build_mipmaps()
+        texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        texture.repeat_x = texture.repeat_y = True
+        return texture
+
+    def add_viewmodel(self, model_path, tint_mask_path=None, animation=None, skin_index=0):
+        """Loads a first-person "viewmodel" part (arms, a gun...) glued to
+        the camera: an ordinary skinned model - so Scene.update animates it
+        (`animation` is the clip to start on) - that only _render_viewmodels
+        ever draws (visible_in_color/cast_shadow are off, so shadows, SSR and
+        the main skeletal pass all skip it). A glb holding several rigs (arms
+        AND gun) loads as one part per skin_index. The caller positions it
+        each frame by setting obj["transform"] (a world matrix) and obj
+        ["position"] (used to pick nearby lights), and shows/hides it with
+        obj["viewmodel_visible"] - a hidden part isn't even animated.
+        tint_mask_path: see set_skeletal_tint. None on load failure."""
+        model = self.add_skeletal(
+            model_path, animation=animation, visible_in_color=False, cast_shadow=False,
+            tint_mask_path=tint_mask_path, skin_index=skin_index,
+        )
+        if model is None:
+            return None
+        model["viewmodel"] = True
+        model["viewmodel_visible"] = False
+        model["specular_strength"] = 0
+        model["transform"] = glm.mat4(1.0)
+        model["position"] = glm.vec3(0.0)
+        self.viewmodel_objects.append(model)
+        return model
+
+    def remove_viewmodel(self, obj):
+        """Takes a viewmodel part (from add_viewmodel) out of the scene and
+        frees its GPU resources."""
+        if obj in self.viewmodel_objects:
+            self.viewmodel_objects.remove(obj)
+        self.remove_skeletal(obj)
+
+    def remove_skeletal(self, obj):
+        """Removes a skeletal object (and anything attached to it or that it's
+        attached to - see attach_skeletal) and frees its GPU resources."""
+        self._attachments = [a for a in self._attachments if a["child"] is not obj and a["parent"] is not obj]
+        if obj in self.skeletal_objects:
+            self.skeletal_objects.remove(obj)
+            self._release_skeletal_object(obj)
+
+    def attach_skeletal(self, child, parent, joint_name, local_transform=None):
+        """Glues skeletal object `child` to the named joint of skeletal
+        object `parent` (a weapon in a character's hand): every frame
+        (see _update_attachments) child's world matrix follows that joint's
+        animated pose, plus `local_transform` (a glm.mat4 in the joint's own
+        frame, for offsetting/rotating/scaling the child into place). The
+        joint's own scale is discarded - a rig's joints carry a unit-
+        conversion scale (rat.glb's is 0.024) that would otherwise shrink the
+        child. child also inherits parent's visible_in_color. Returns the
+        attachment, or None for an unknown joint; undo with detach_skeletal.
+        """
+        joints = parent["skeleton"].joints
+        index = next((i for i, j in enumerate(joints) if j.name == joint_name), None)
+        if index is None:
+            print(f"[Scene] attach_skeletal: no joint '{joint_name}' on '{parent.get('name', '?')}'")
+            return None
+        attachment = {
+            "child": child, "parent": parent, "joint": index,
+            "bind_world": glm.inverse(joints[index].inverse_bind_matrix),
+            "local": glm.mat4(local_transform) if local_transform is not None else glm.mat4(1.0),
+        }
+        self._attachments.append(attachment)
+        return attachment
+
+    def detach_skeletal(self, child):
+        self._attachments = [a for a in self._attachments if a["child"] is not child]
+
+    def _update_attachments(self):
+        """Refreshes every attached object's world matrix from its parent's
+        CURRENT pose. Runs at the top of render(), not in update(): the
+        caller moves a character (sets obj["position"]/["rotation"]) after
+        Scene.update, so anything computed there would trail it by a frame."""
+        for att in self._attachments:
+            parent, child = att["parent"], att["child"]
+            bones = parent.get("bone_matrices")
+            if not bones:
+                continue
+            world = bones[att["joint"]] * att["bind_world"]
+            frame = glm.translate(glm.mat4(1.0), glm.vec3(world[3])) * glm.mat4(_extract_rotation(world))
+            child["transform"] = self._get_model_matrix(parent) * frame * att["local"]
+            child["position"] = parent["position"]
+            child["visible_in_color"] = parent.get("visible_in_color", True)
+
     def add_skeletal(self, model_path, position=None, rotation=None, scale=None,
                       transform=None, animation=None, metallic=None, roughness=None,
-                      emissive=None, texture_path=None,
+                      emissive=None, texture_path=None, tint_mask_path=None,
                       visible_in_color=True, cast_shadow=True,
                       upper_body_root_joints=None, upper_animation=None,
                       loop=True, upper_loop=True,
                       upper_rotation_offset_degrees=(0.0, 0.0, 0.0),
-                      time_scale=1.0):
+                      time_scale=1.0, skin_index=0):
         """Loads a skinned/animated glb - see skeletal_loader.py for
         format constraints (one skin, one mesh primitive, LINEAR/STEP
         interpolation only).
@@ -1256,8 +1363,16 @@ class Scene:
         time_scale: see skeletal_loader.load_skinned_glb's own
         docstring - an opt-in per-keyframe-time correction multiplier
         for a model file known to have been baked at the wrong frame
-        rate. 1.0 (no change) by default."""
-        data = load_skinned_glb(model_path, ctx=self.ctx, time_scale=time_scale)
+        rate. 1.0 (no change) by default.
+
+        tint_mask_path: an RGBA image (same UV layout as the model's base
+        texture) that makes the object recolorable via set_skeletal_tint:
+        its alpha marks the tintable region, its RGB is the base color
+        with that region desaturated. Nothing changes until a tint is set.
+
+        skin_index: which skin to load from a glb that has several - see
+        skeletal_loader.load_skinned_glb."""
+        data = load_skinned_glb(model_path, ctx=self.ctx, time_scale=time_scale, skin_index=skin_index)
         if data is None:
             return None
 
@@ -1278,6 +1393,8 @@ class Scene:
             # bind_material() call instead.
             texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
             texture.repeat_x = texture.repeat_y = True
+
+        tint_mask_texture = self._load_tint_mask(tint_mask_path)
 
         mr_texture = data.get("metallic_roughness_texture")
         final_metallic = metallic if metallic is not None else data.get("metallic", 0.1)
@@ -1396,6 +1513,8 @@ class Scene:
             "bone_ubo": None,
             "texture": texture,
             "metallic_roughness_texture": mr_texture,
+            "tint_mask_texture": tint_mask_texture,
+            "tint_color": None,
             "metallic": float(final_metallic),
             "roughness": float(final_roughness),
             "emissive": list(final_emissive),
@@ -1443,6 +1562,19 @@ class Scene:
         obj["active_hat"] = name
         return True
 
+    def set_skeletal_tint(self, obj, rgb):
+        """Recolors the tintable region of a skeletal object built with
+        tint_mask_path (see add_skeletal) to rgb - an (r, g, b) tuple of
+        0-1 floats, or None to go back to the model's own colors. A no-op
+        on an object with no mask."""
+        if obj.get("tint_mask_texture") is None:
+            return
+        new = None if rgb is None else tuple(float(c) for c in rgb)
+        if obj.get("tint_color") == new:
+            return
+        obj["tint_color"] = new
+        invalidate_material_ubo(obj)
+
     @staticmethod
     def _active_hat(obj):
         name = obj.get("active_hat")
@@ -1455,6 +1587,9 @@ class Scene:
         if hat is not None:
             if hat["texture"] is not None:
                 hat["texture"].use(location=TEX_UNIT_ALBEDO)
+            # The hat has its own UVs, which the player-color tint mask
+            # doesn't line up with.
+            bind_untinted_material(self.ctx, obj)
             hat["vao"].render()
 
     def _draw_hat_shadow(self, obj):
@@ -1681,7 +1816,7 @@ class Scene:
         obj["upper_root_indices"] = skeleton.resolve_joint_indices(root_joint_names)
         _apply_upper_rotation_offsets(obj, {}, blend_duration)
 
-    def load_additional_animations(self, obj, path, rename=None, time_scale=1.0):
+    def load_additional_animations(self, obj, path, rename=None, time_scale=1.0, skin_index=0):
         """Loads animation clip(s) from a SEPARATE .glb file sharing
         obj's own armature (matched by joint NAME, not file/node order -
         see skeletal_loader.load_animation_clips) and merges them into
@@ -1697,8 +1832,11 @@ class Scene:
         time_scale: see skeletal_loader.load_animation_clips' own
         docstring - an opt-in per-keyframe-time correction multiplier
         for a pose file known to have been baked at the wrong frame
-        rate. 1.0 (no change) by default."""
-        return load_animation_clips(path, obj["skeleton"], rename=rename, time_scale=time_scale)
+        rate. 1.0 (no change) by default.
+
+        skin_index: which rig of `path` to read (see load_animation_clips)."""
+        return load_animation_clips(
+            path, obj["skeleton"], rename=rename, time_scale=time_scale, skin_index=skin_index)
 
     # =============================================================
     # SKYBOX
@@ -2835,6 +2973,8 @@ class Scene:
                 obj["rotation"].y += rot_speed * dt
 
         for obj in self.skeletal_objects:
+            if obj.get("viewmodel") and not obj.get("viewmodel_visible"):
+                continue   # hidden first-person arms: no need to animate
             skeleton = obj["skeleton"]
             upper_mask = obj.get("upper_joint_mask")
 
@@ -3014,6 +3154,8 @@ class Scene:
         # can't live at its end) - every shadow cascade and the color pass
         # then just re-bind it. See skeletal_shader.py's module docstring.
         for obj in self.skeletal_objects:
+            if obj.get("viewmodel") and not obj.get("viewmodel_visible"):
+                continue
             upload_bone_matrices(self.ctx, obj)
 
     # =============================================================
@@ -3387,6 +3529,7 @@ class Scene:
             static_shadow_texture=self._static_shadow_texture if ENABLE_SHADOWS else None,
             static_shadow_light_vp=self._static_shadow_light_vp,
         )
+        self._skeletal_view_proj = skeletal_view_proj
 
         # Split by alpha_mode (see model_loader.py's _extract_material/
         # Scene._load_object - "OPAQUE" is the default for anything that
@@ -3627,11 +3770,52 @@ class Scene:
         # updating the depth buffer too.
         self.ctx.screen.depth_mask = True
 
+    def _render_viewmodels(self):
+        """Draws the first-person viewmodels (see add_viewmodel) last, over
+        everything else. They must never poke into a wall they're standing
+        right against, and the usual fix (clear the depth buffer first)
+        isn't available here: moderngl's Framebuffer.clear always clears
+        colour too, and re-filling depth with a fullscreen pass would cost
+        a whole extra draw. Instead the projection's depth output is
+        squashed into the nearest 5% of the depth range - so a viewmodel
+        always passes the depth test against the scene - at zero cost: it's
+        just a different matrix. Everything else (lights, shadows, sky
+        colours) is already bound frame-wide by _bind_pbr_frame_uniforms/
+        _render_scene, so a visible part adds a couple of uniform writes and
+        one draw call, and with nothing visible (the third-person/no-arms
+        case) this returns before touching any GL state."""
+        visible = [o for o in self.viewmodel_objects if o.get("viewmodel_visible")]
+        if not visible:
+            return
+
+        # z_ndc -> z_ndc * s + (s - 1): [-1, 1] maps onto [-1, -1 + 2s].
+        squash = glm.mat4(1.0)
+        squash[2][2] = _VIEWMODEL_DEPTH_SCALE
+        squash[3][2] = _VIEWMODEL_DEPTH_SCALE - 1.0
+        if self._skeletal_view_proj is None:
+            return
+        view_proj = squash * self._skeletal_view_proj
+
+        prog = self.skeletal_program
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.depth_func = "<"
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.cull_face = "back"
+        for obj in visible:
+            bind_point_lights(prog, self._nearest_point_lights(obj["position"]))
+            bind_probe_irradiance(prog, self._sample_probe_irradiance(obj["position"]))
+            bind_material(prog, obj, self._get_model_matrix(obj), view_proj)
+            bind_bone_matrices(obj)
+            obj["vao"].render()
+        self.ctx.enable(moderngl.CULL_FACE)
+        self.ctx.cull_face = "back"
+
     # =============================================================
     # RENDER
     # =============================================================
 
     def render(self, camera, prog=None):
+        self._update_attachments()
         if ENABLE_SHADOWS:
             self._render_shadows(camera)
 
@@ -3689,6 +3873,7 @@ class Scene:
         # transparent_objects' own docstring for exactly why the skybox
         # part of this order matters.
         self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
+        self._render_viewmodels()
 
 
     # =============================================================
@@ -3740,9 +3925,11 @@ class Scene:
         self.static_objects.clear()
         self.dynamic_objects.clear()
         self.skeletal_objects.clear()
+        self.viewmodel_objects.clear()
 
     def _release_skeletal_object(self, obj):
-        for key in ("vao", "shadow_vao", "_render_ibo", "_shadow_ibo", "texture", "bone_ubo", "_material_ubo"):
+        for key in ("vao", "shadow_vao", "_render_ibo", "_shadow_ibo", "texture", "bone_ubo", "_material_ubo",
+                    "_material_ubo_untinted", "tint_mask_texture"):
             _release(obj.get(key))
 
         for vbo_dict_key in ("_render_vbos", "_shadow_vbos"):
@@ -3760,5 +3947,6 @@ class Scene:
         for key in (
             "vao", "shadow_vao", "lightmap_vao", "lightmap_texture", "sun_lightmap_texture",
             "texture", "metallic_roughness_texture", "normal_texture", "_material_ubo",
+            "_material_ubo_untinted", "tint_mask_texture",
         ):
             _release(obj.get(key))

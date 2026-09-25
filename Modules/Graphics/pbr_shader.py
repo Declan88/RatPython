@@ -134,6 +134,7 @@ TEX_UNIT_SSR_DEPTH = TEX_UNIT_REFLECTION_ENV + 2  # = 12
 # calculate_static_shadow) replaces what used to be a full re-render of
 # every static object into every cascade, every single frame.
 TEX_UNIT_STATIC_SHADOW = TEX_UNIT_SSR_DEPTH + 1  # = 13
+TEX_UNIT_TINT_MASK = TEX_UNIT_STATIC_SHADOW + 1  # = 14 - player-color mask, see u_tint_mask_texture
 
 # A static object's SUN-ONLY baked lightmap (see Scene.bake_static_
 # lighting's own sun_lightmap_texture comment and calculate_shadow's
@@ -312,11 +313,18 @@ layout(std140) uniform MaterialBlock {
     float _pad_material2a;
     float _pad_material2b;
     float _pad_material2c;
+    // Player-color tint (see Scene.set_skeletal_tint): u_tint_color is the
+    // chosen sRGB color, u_has_tint gates the whole effect. The mask
+    // texture (u_tint_mask_texture) carries the tintable region in its
+    // ALPHA and a desaturated version of the base color in its RGB.
+    vec3 u_tint_color;
+    int u_has_tint;
 };
 
 uniform sampler2D u_texture;
 uniform sampler2D u_metallic_roughness_texture;
 uniform sampler2D u_normal_texture;
+uniform sampler2D u_tint_mask_texture;
 
 // Dynamic/skeletal casters ONLY, tightly re-fit to the camera's own
 // view frustum every frame - see Scene._render_shadows' own comment on
@@ -970,6 +978,17 @@ void main() {
 
     vec4 tex_sample = u_has_texture == 1 ? texture(u_texture, v_uv) : vec4(v_color, 1.0);
     vec3 raw_albedo = tex_sample.rgb;
+    if (u_has_tint == 1) {
+        // Recolor only where the mask's alpha says so (fur - skin, eyes and
+        // other detail keep their own color). The mask's RGB is the fur
+        // already desaturated, so multiplying by the chosen color keeps the
+        // fur's light/dark shading; TINT_BOOST lifts it back up to roughly
+        // the original fur brightness since that shading is mid-grey.
+        const float TINT_BOOST = 2.2;
+        vec4 tint_mask = texture(u_tint_mask_texture, v_uv);
+        vec3 tinted = clamp(tint_mask.rgb * u_tint_color * TINT_BOOST, 0.0, 1.0);
+        raw_albedo = mix(raw_albedo, tinted, tint_mask.a);
+    }
     vec3 albedo = pow(max(raw_albedo, vec3(0.0)), vec3(2.2));
 
     float alpha = clamp(tex_sample.a * u_base_alpha, 0.0, 1.0);
@@ -1288,6 +1307,7 @@ def _bind_material_textures(prog, item_data):
         ("texture", TEX_UNIT_ALBEDO),
         ("metallic_roughness_texture", TEX_UNIT_METALLIC_ROUGHNESS),
         ("normal_texture", TEX_UNIT_NORMAL),
+        ("tint_mask_texture", TEX_UNIT_TINT_MASK),
     ):
         tex = item_data.get(key)
         uniform_name = f"u_{key}"
@@ -1469,10 +1489,14 @@ def bind_frame_uniforms(
 
 _REFLECTION_MODE_TO_INT = {"cheap": 0, "ssr": 1}
 
-_MATERIAL_UBO_STRUCT = struct.Struct("<4f4f2i1i1f1i1f2f2f1f1i1f3f")  # must match MaterialBlock's std140 layout exactly
+_MATERIAL_UBO_STRUCT = struct.Struct("<4f4f2i1i1f1i1f2f2f1f1i1f3f3f1i")  # must match MaterialBlock's std140 layout exactly
 
 
-def _pack_material_ubo(item_data):
+def _pack_material_ubo(item_data, tinted=True):
+    # Tint only applies when a color was chosen AND there's a mask to
+    # apply it through; tinted=False forces it off (see _get_material_ubo).
+    tint = item_data.get("tint_color") if tinted and item_data.get("tint_mask_texture") is not None else None
+    tint_rgb = tuple(tint) if tint is not None else (1.0, 1.0, 1.0)
     emissive = tuple(item_data.get("emissive", (0.0, 0.0, 0.0)))
     pan1 = tuple(item_data.get("normal_pan1_speed", (0.0, 0.0)))
     pan2 = tuple(item_data.get("normal_pan2_speed", (0.0, 0.0)))
@@ -1494,11 +1518,18 @@ def _pack_material_ubo(item_data):
         _REFLECTION_MODE_TO_INT.get(item_data.get("reflection_mode", "cheap"), 0),
         float(item_data.get("normal_uv_scale", 1.0)),
         0.0, 0.0, 0.0,  # _pad_material2a/b/c - unused, see MaterialBlock's own comment
+        float(tint_rgb[0]), float(tint_rgb[1]), float(tint_rgb[2]),
+        1 if tint is not None else 0,
     )
 
 
-def _get_material_ubo(ctx, item_data):
-    """Returns item_data's own MaterialBlock uniform buffer, building
+def _get_material_ubo(ctx, item_data, tinted=True):
+    """tinted=False returns a separate cached buffer with the player-color
+    tint forced off (a worn hat shares its owner's material but has its own
+    UVs, which the tint mask doesn't line up with). Everything below is
+    about the normal, tinted=True buffer.
+
+    Returns item_data's own MaterialBlock uniform buffer, building
     and caching it (on item_data itself, keyed "_material_ubo") the
     first time this object is ever drawn - every field packed into it
     (see _pack_material_ubo) is fixed at load time (metallic/roughness/
@@ -1511,11 +1542,28 @@ def _get_material_ubo(ctx, item_data):
     writing it as 9 separate uniforms, every object, every frame, was a
     real, avoidable cost once per-frame draw counts grew into the
     hundreds (a multi-material level, not a handful of props)."""
-    ubo = item_data.get("_material_ubo")
+    key = "_material_ubo" if tinted else "_material_ubo_untinted"
+    ubo = item_data.get(key)
     if ubo is None:
-        ubo = ctx.buffer(_pack_material_ubo(item_data))
-        item_data["_material_ubo"] = ubo
+        ubo = ctx.buffer(_pack_material_ubo(item_data, tinted))
+        item_data[key] = ubo
     return ubo
+
+
+def invalidate_material_ubo(item_data):
+    """Drops item_data's cached material buffers so the next draw repacks
+    them - call after changing a field that's normally fixed at load time
+    (e.g. tint_color, see Scene.set_skeletal_tint)."""
+    for key in ("_material_ubo", "_material_ubo_untinted"):
+        ubo = item_data.pop(key, None)
+        if ubo is not None:
+            ubo.release()
+
+
+def bind_untinted_material(ctx, item_data):
+    """Rebinds item_data's material block with the color tint off - for the
+    hat drawn right after a tinted base mesh (see Scene._draw_hat)."""
+    _get_material_ubo(ctx, item_data, tinted=False).bind_to_uniform_block(MATERIAL_UBO_BINDING)
 
 
 def bind_material(prog, item_data, model_matrix, view_proj):

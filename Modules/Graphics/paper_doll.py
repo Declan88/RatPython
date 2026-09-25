@@ -46,6 +46,9 @@ _FRAGMENT = """
 #version 330
 uniform sampler2D u_texture;
 uniform int u_has_texture;
+uniform sampler2D u_tint_mask;   // player-color mask (see Scene.set_skeletal_tint)
+uniform vec3 u_tint;
+uniform int u_has_tint;
 uniform vec4 u_box;         // box origin xy + size zw, window pixels
 uniform vec3 u_circle;      // box uv centre xy, radius (fraction of box height)
 in vec3 v_normal;
@@ -54,6 +57,11 @@ out vec4 f_color;
 void main() {
     vec4 base = u_has_texture == 1 ? texture(u_texture, v_uv) : vec4(0.7, 0.7, 0.7, 1.0);
     if (base.a < 0.5) discard;
+    if (u_has_tint == 1) {
+        // Same recolor as pbr_shader.py's TINT_BOOST block.
+        vec4 m = texture(u_tint_mask, v_uv);
+        base.rgb = mix(base.rgb, clamp(m.rgb * u_tint * 2.2, 0.0, 1.0), m.a);
+    }
     // Below the badge's centre line only the part inside the circle shows, so
     // the body is cropped by the circle while the head above it pokes out.
     vec2 uv = (gl_FragCoord.xy - u_box.xy) / u_box.zw;
@@ -219,6 +227,15 @@ class PaperDoll:
             tex.use(location=0)
             self.program["u_texture"].value = 0
         self.program["u_has_texture"].value = has_tex
+        tint = self.obj.get("tint_color")
+        mask = self.obj.get("tint_mask_texture")
+        if tint is not None and mask is not None:
+            mask.use(location=1)
+            self.program["u_tint_mask"].value = 1
+            self.program["u_tint"].value = tuple(tint)
+            self.program["u_has_tint"].value = 1
+        else:
+            self.program["u_has_tint"].value = 0
         bind_bone_matrices(self.obj)
         self.vao.render()
         hat = self.obj["hats"].get(self.obj.get("active_hat"))
@@ -234,6 +251,7 @@ class PaperDoll:
                 ], hat["ibo"])
             if hat["texture"] is not None:
                 hat["texture"].use(location=0)
+            self.program["u_has_tint"].value = 0   # the hat has its own UVs
             vao.render()
 
         ctx.scissor = None

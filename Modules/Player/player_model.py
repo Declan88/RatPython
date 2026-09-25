@@ -397,7 +397,7 @@ class PlayerModel:
                  jump_animation=None, crouch_animation=None, crouch_blend_duration=0.1,
                  directional_clips=None,
                  scale=None, metallic=None, roughness=None, emissive=None, texture_path=None,
-                 time_scale=1.0):
+                 time_scale=1.0, tint_mask_path=None):
         """scene: the Scene this model is added to (needs scene.add_skeletal
         and scene.set_skeletal_locomotion/set_skeletal_animation).
 
@@ -706,7 +706,7 @@ class PlayerModel:
             model_path, position=initial_pos, rotation=glm.vec3(0.0),
             scale=scale, animation=initial_lower_clip,
             metallic=metallic, roughness=roughness, emissive=emissive,
-            texture_path=texture_path,
+            texture_path=texture_path, tint_mask_path=tint_mask_path,
             visible_in_color=visible_in_color, cast_shadow=cast_shadow,
             upper_body_root_joints=upper_body_root_joints, upper_animation=initial_upper_animation,
             upper_rotation_offset_degrees=upper_rotation_offset_degrees,
@@ -1252,6 +1252,13 @@ class PlayerModel:
         if self.obj is None:
             return False
         return self._scene.set_skeletal_hat(self.obj, name)
+
+    def set_tint(self, rgb):
+        """Recolors the tintable part of the model (needs tint_mask_path)
+        to rgb - 0-1 floats - or restores its own colors for None. A no-op
+        on a model that failed to load or has no mask."""
+        if self.obj is not None:
+            self._scene.set_skeletal_tint(self.obj, rgb)
 
     def set_visible_in_color(self, visible):
         """Switches whether this model actually draws in the normal

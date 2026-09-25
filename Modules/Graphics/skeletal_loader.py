@@ -1050,7 +1050,7 @@ def _parse_animations(gltf, blob, node_to_joint_index, name_prefix="", time_scal
     return animations
 
 
-def load_animation_clips(path, skeleton, rename=None, time_scale=1.0):
+def load_animation_clips(path, skeleton, rename=None, time_scale=1.0, skin_index=0):
     """Loads animation clips from a SEPARATE .glb file and merges them
     directly into an already-loaded skeleton's own .animations dict (in
     place - nothing is returned besides the list of clip names actually
@@ -1087,7 +1087,11 @@ def load_animation_clips(path, skeleton, rename=None, time_scale=1.0):
     default 24fps scene setting left unchanged when 30fps was actually
     intended - see the call sites currently using this for exactly that
     case). 1.0 (no change) unless a caller has a specific reason to
-    believe THIS file's baked rate doesn't match what was intended."""
+    believe THIS file's baked rate doesn't match what was intended.
+
+    skin_index: which of the SOURCE file's skins to read animations for, when
+    it has several rigs (see load_skinned_glb's skin_index) - only channels
+    targeting that skin's joints are used, so each rig gets its own clip."""
     result = _read_glb_json_and_blob(path)
     if result is None:
         print(f"[skeletal_loader] {path} has no JSON chunk - not a valid .glb, no animations loaded.")
@@ -1098,8 +1102,11 @@ def load_animation_clips(path, skeleton, rename=None, time_scale=1.0):
     if not skins:
         print(f"[skeletal_loader] {path} has no skin - can't match its animation channels to any joint.")
         return []
+    if not 0 <= skin_index < len(skins):
+        print(f"[skeletal_loader] {path} has no skin {skin_index} (it has {len(skins)}).")
+        return []
 
-    source_joint_node_indices = skins[0]["joints"]
+    source_joint_node_indices = skins[skin_index]["joints"]
     target_joint_index_by_name = {joint.name: i for i, joint in enumerate(skeleton.joints)}
 
     # Map each SOURCE node index straight to the TARGET skeleton's joint
@@ -1179,7 +1186,7 @@ def load_hat(hat_source, name, ctx):
     return data
 
 
-def load_skinned_glb(path, ctx=None, time_scale=1.0):
+def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
     """Returns a dict:
         {
             "positions": (N, 3) float32,
@@ -1206,7 +1213,13 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
     time_scale: see _parse_animations/load_animation_clips' own
     docstring - an opt-in per-keyframe-time correction multiplier for a
     file known to have been baked at the wrong frame rate. 1.0 (no
-    change) by default."""
+    change) by default.
+
+    skin_index: which skin to load from a file that has several (a first-person
+    viewmodel export holding an arms rig AND a gun rig, say). Only the mesh
+    nodes bound to THAT skin are loaded, so another rig's meshes never get
+    merged in against the wrong joints. Ignored for the usual single-skin
+    file."""
     result = _read_glb_json_and_blob(path)
     if result is None:
         return None
@@ -1216,9 +1229,10 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
     if not skins:
         print(f"[skeletal_loader] {path} has no skin - not a skeletal mesh.")
         return None
-    skin = skins[0]
-    if len(skins) > 1:
-        print(f"[skeletal_loader] {path} has {len(skins)} skins - only using the first.")
+    if not 0 <= skin_index < len(skins):
+        print(f"[skeletal_loader] {path} has no skin {skin_index} (it has {len(skins)}).")
+        return None
+    skin = skins[skin_index]
 
     # Gather primitives via the NODES that reference each mesh, not by
     # flattening every mesh in the file unconditionally - a node's own
@@ -1235,6 +1249,8 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0):
     for node in gltf.get("nodes", []):
         mesh_index = node.get("mesh")
         if mesh_index is None:
+            continue
+        if len(skins) > 1 and node.get("skin") != skin_index:
             continue
         node_name = node.get("name", f"mesh_{mesh_index}")
         if _is_hidden_by_default(node_name):

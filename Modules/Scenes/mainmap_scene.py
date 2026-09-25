@@ -4,7 +4,7 @@ from Modules.Scenes.scene_base import Scene
 
 class MainMapScene(Scene):
     def __init__(self, ctx):
-        super().__init__(ctx, recalculate_shadows=True)
+        super().__init__(ctx, recalculate_shadows=False)
 
         # Same sun/skybox lighting setup as TorusScene (torus_scene.py) -
         # kept identical rather than re-tuned, since this scene's only

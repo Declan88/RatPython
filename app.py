@@ -121,6 +121,9 @@ from Modules.Scenes.mainmap_scene import MainMapScene
 from Modules.Scenes.main_menu_scene import MainMenuScene
 from Modules.Physics.character_controller import CharacterController
 from Modules.Player.player_model import PlayerModel
+from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
+from Modules.Player.viewmodel import ViewModel
+from Modules.Weapons import USP
 
 
 def load_steam_api_dll():
@@ -216,13 +219,14 @@ def main():
     player = None
     player_height = None
     local_player_model = None
+    viewmodel = None  # first-person arms glued to the camera
+    weapon = None     # the local player's current weapon (Modules/Weapons)
     boom_arm = None
     third_person = False
-    toggle_third_person = cycle_upper_override = lambda key: None
-    update_moving_adjust = lambda speed: None
+    toggle_third_person = lambda key: None
 
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, cycle_upper_override, update_moving_adjust, local_player_model, player, player_height, third_person, toggle_third_person
+        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, toggle_third_person
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
@@ -314,6 +318,7 @@ def main():
             visible_in_color=False,
             cast_shadow=True,
             time_scale=RAT_ANIM_TIME_SCALE,
+            tint_mask_path=RAT_TINT_MASK_PATH,
             states=player_animation_states,
             directional_clips=player_directional_clips,
             # Splits the model into a lower body (locomotion - legs, spine,
@@ -334,8 +339,8 @@ def main():
                 "ValveBiped.Bip01_R_Clavicle",
                 "ValveBiped.Bip01_L_Clavicle",
             ],
-            # A manually-forced upper-body override (set_upper_override -
-            # see the Y-key cycle below) uses a WIDER split instead, rooted
+            # A weapon's held pose (set_upper_override - see WeaponsBase.
+            # equip_player) uses a WIDER split instead, rooted
             # at Spine4 - which also parents Neck1 (-> Head1) alongside both
             # clavicle chains in this rig, so this pulls in arms, neck, AND
             # head as one unit. Locomotion-driven upper-body poses above
@@ -377,6 +382,9 @@ def main():
         # one does.
         if local_player_model.obj is not None:
             local_player_model.obj["specular_strength"] = 0
+        # First-person arms (see Modules/Player/viewmodel.py) - drawn only
+        # while the camera is in first person, tinted with the same fur color.
+        viewmodel = ViewModel(current_scene)
         # rifleidle.glb/RifleWalkN.glb are separate pose-only exports sharing
         # rat.glb's own armature (see load_additional_animations) - both
         # files happen to name their one clip "New" (same name rat.glb's own
@@ -469,24 +477,6 @@ def main():
             "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
             rename={"New": "rifle_crouch"},
         )
-        # ShotgunIdle.glb/pistolidle.glb - both static held poses (each
-        # file's own first/last keyframe are identical, confirmed via raw
-        # glb inspection, same as RifleCrouch.glb above), so their authored
-        # frame rate/duration don't matter - no time_scale correction
-        # needed. Cycled via the Y key below through PlayerModel.
-        # set_upper_override/clear_upper_override, purely as an experiment -
-        # not tied to any actual weapon-switching system yet.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Shotgun/ShotgunIdle.glb",
-            rename={"New": "shotgun_idle"},
-        )
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Pistol/pistolidle.glb",
-            rename={"New": "pistol_idle"},
-        )
-
         # Third-person mode - see Modules/Camera/camera_boom_arm.py. Off by
         # default (first person): the local player's own model stays
         # shadow-only (visible_in_color=False above) until this is toggled.
@@ -503,77 +493,13 @@ def main():
                 # third person needs it actually drawn instead.
                 local_player_model.set_visible_in_color(third_person)
 
-        # Experimental - Y cycles the upper body through 3 states: normal
-        # (locomotion-driven, e.g. the rifle idle/walk/run poses), a locked
-        # ShotgunIdle.glb override, and a locked pistolidle.glb override
-        # (see PlayerModel.set_upper_override/clear_upper_override) - not
-        # wired to any real weapon-switching system yet, just trying out the
-        # poses. None in this tuple means "normal" - clear_upper_override()
-        # rather than a real clip name.
-        _UPPER_OVERRIDE_CYCLE = (None, "shotgun_idle", "pistol_idle")
-        # Per-clip rotation correction on top of the override's own joint
-        # mask (see PlayerModel's override_upper_body_root_joints and
-        # set_upper_rotation_offset) - keyed by clip, applied AFTER set_
-        # upper_override so it isn't wiped by that call's own mask swap
-        # (Scene.set_skeletal_upper_joint_mask clears any existing offsets
-        # as part of switching masks - see its docstring). Only pistol_idle
-        # needs one right now, on Spine4 itself (NOT a per-clavicle
-        # correction like before - now that the override's own mask is
-        # rooted at Spine4, see [[upper-body-joint-split]], Spine4 is one of
-        # the joints IT drives, so nudging it directly is the natural knob
-        # instead of fighting it through both arms). This is COMPONENT-space
-        # (fixed relative to the character's own body, same sense Unreal's
-        # AnimGraph uses the term - see set_upper_rotation_offset's own
-        # docstring), NOT true world/level space - it rotates rigidly WITH
-        # the player as they turn instead of fighting that turn.
-        _UPPER_OVERRIDE_ROTATION_DEGREES = {
-            "pistol_idle": {"ValveBiped.Bip01_Spine4": (-10, 60, 10)},
-        }
-        upper_override_index = 0
-
-        # While MOVING with an upper-body override (shotgun/pistol) the character
-        # reads as looking too far left: the override pose is absolute, so it
-        # doesn't follow the lean/twist the running lower body adds. This is an
-        # extra yaw correction on Spine4 (component space, degrees; negative =
-        # turn right), blended in/out through the same crossfade as any other
-        # offset change.
-        _SPINE4 = "ValveBiped.Bip01_Spine4"
-        _MOVING_SPEED = 1.0   # m/s of horizontal speed that counts as moving
-        moving_yaw = {"degrees": -20.0}
-        moving_state = {"moving": False}
-
-        def override_offsets(clip, moving):
-            base = _UPPER_OVERRIDE_ROTATION_DEGREES.get(clip, {}).get(_SPINE4, (0.0, 0.0, 0.0))
-            extra = moving_yaw["degrees"] if moving else 0.0
-            return {_SPINE4: (base[0], base[1] + extra, base[2])}
-
-        def apply_override_offsets():
-            clip = _UPPER_OVERRIDE_CYCLE[upper_override_index]
-            if clip is not None:
-                local_player_model.set_upper_rotation_offset(
-                    override_offsets(clip, moving_state["moving"])
-                )
-
-        def update_moving_adjust(horiz_speed):
-            if upper_override_index == 0:
-                return
-            moving = horiz_speed > _MOVING_SPEED
-            if moving != moving_state["moving"]:
-                moving_state["moving"] = moving
-                apply_override_offsets()
-
-        def cycle_upper_override(key):
-            nonlocal upper_override_index
-            if key == pygame.K_y:
-                upper_override_index = (upper_override_index + 1) % len(
-                    _UPPER_OVERRIDE_CYCLE
-                )
-                override_clip = _UPPER_OVERRIDE_CYCLE[upper_override_index]
-                if override_clip is None:
-                    local_player_model.clear_upper_override()
-                else:
-                    local_player_model.set_upper_override(override_clip)
-                    apply_override_offsets()
+        # The current weapon decides everything about how the player holds it:
+        # its gun and arm animations on the first-person viewmodel, its world
+        # model in the character's hand, and the pose of the player rig's upper
+        # body (plus that pose's rotation corrections - see WeaponsBase).
+        weapon = USP()
+        weapon.equip_viewmodel(viewmodel)
+        weapon.equip_player(current_scene, local_player_model)
 
     ui = UIManager(window)
     ui_demo = build_demo(ui)
@@ -607,6 +533,8 @@ def main():
     in_menu = True
     pending_start = None
     net_mgr = NetworkManager(camera, None)
+    # Another player's shot hit us: the shooter decided that, we apply it.
+    net_mgr.on_damage = lambda amount, attacker_id, weapon_name: change_health(-amount)
     from Modules.Scenes import scene_base as _scene_base
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
     menu_scene = get_or_load_scene("mainmenu")
@@ -626,6 +554,8 @@ def main():
         name_tags.visible = True
         if local_player_model is not None and local_player_model.obj is not None:
             local_player_model.set_hat(net_mgr.local_hat)
+            local_player_model.set_tint(net_mgr.local_color)
+            viewmodel.set_tint(net_mgr.local_color)
             paper_doll = PaperDoll(window.ctx, local_player_model.obj)
         in_menu = False
         ui.set_cursor_free(False)
@@ -642,11 +572,21 @@ def main():
             ui_demo.visible = not ui_demo.visible
             ui.set_cursor_free(ui_demo.visible)
 
+    trigger_clicks = [0]   # left clicks since the last frame's firing check
+
+    def count_click(event):
+        """window.handle_events' event filter: counts left clicks (from the
+        event queue, so none is lost between frames) and then lets the UI have
+        the event as before."""
+        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                and not in_menu and not ui.cursor_free):
+            trigger_clicks[0] += 1
+        return ui.handle_event(event)
+
     def on_key_down(key):
         if in_menu:
             return
         toggle_third_person(key)
-        cycle_upper_override(key)
         toggle_ui_demo(key)
         if key == pygame.K_h:
             change_health(-10.0)
@@ -656,7 +596,7 @@ def main():
     running = True
     while running:
         running, dt = window.handle_events(
-            camera, on_key_down=on_key_down, event_filter=ui.handle_event
+            camera, on_key_down=on_key_down, event_filter=count_click
         )
 
         if pending_start is not None:
@@ -734,6 +674,30 @@ def main():
             )
         else:
             camera.position = eye_position
+        # After the camera has its final position/look for this frame.
+        viewmodel.update(camera, not third_person)
+
+        # Left mouse fires: one shot per click (every click counts, even two
+        # inside one frame), or - for an automatic weapon - continuously while
+        # held, limited by the weapon's own fire_interval. Clicks are only
+        # counted with the cursor captured (see count_click), so clicking
+        # menus/UI never shoots.
+        clicks, trigger_clicks[0] = trigger_clicks[0], 0
+        if weapon is not None and not ui.cursor_free:
+            if weapon.automatic:
+                clicks = 1 if pygame.mouse.get_pressed()[0] else 0
+            for _ in range(clicks):
+                # A line trace from the camera along the aim (see PhysicsWorld.
+                # raycast): the first thing it meets - wall, prop or another
+                # player's hitbox - is what the shot hit.
+                shot = weapon.fire(
+                    current_scene, camera.position, direction=camera.front,
+                    follow=lambda: camera.position,
+                )
+                if shot is not None:
+                    net_mgr.notify_shot()
+                    if shot.victim in net_mgr.remote_players:
+                        net_mgr.send_damage(shot.victim, shot.damage, weapon.name)
 
         # get_position() is the hull CENTER, not feet - subtract half
         # the standing height (the same player_height passed to
@@ -753,7 +717,8 @@ def main():
         # PlayerModel.update()'s own just_jumped docstring for why that
         # debounce alone made a real jump feel delayed).
         just_jumped = player.pop_jumped()
-        update_moving_adjust(horiz_speed)
+        if weapon is not None:
+            weapon.set_moving(horiz_speed)
         local_player_model.update(
             dt,
             feet_position,

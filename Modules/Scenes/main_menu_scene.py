@@ -4,6 +4,7 @@ import glm
 
 from Modules.Scenes.scene_base import Scene
 from Modules.Player.player_model import PlayerModel
+from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 from Modules.UI import theme
 from Modules.UI.lobby_menu import LobbyMenu
 
@@ -39,6 +40,7 @@ class MainMenuScene(Scene):
         self.preview = PlayerModel(
             self, "Assets/Models/rat.glb", visible_in_color=True, cast_shadow=False,
             states=(("idle", "rifle_idle", 0.0),), time_scale=_RAT_ANIM_TIME_SCALE,
+            tint_mask_path=RAT_TINT_MASK_PATH,
         )
         if self.preview.obj is not None:
             self.preview.obj["specular_strength"] = 0
@@ -49,6 +51,9 @@ class MainMenuScene(Scene):
 
     def set_preview_hat(self, name):
         self.preview.set_hat(name)
+
+    def set_preview_color(self, rgb):
+        self.preview.set_tint(rgb)
 
     def update(self, dt):
         super().update(dt)
@@ -83,7 +88,9 @@ class MainMenuScene(Scene):
         """Adds the menu to ui.root and returns its full-screen container
         (toggle .visible to show/hide it). maps: [(display name, scene
         key)]; on_start(scene_key) is called once a lobby is hosted/joined."""
-        self.menu = LobbyMenu(ui, net, maps, on_start, on_hat_change=self.set_preview_hat)
+        self.menu = LobbyMenu(ui, net, maps, on_start, on_hat_change=self.set_preview_hat,
+                              on_color_change=self.set_preview_color)
         self.set_preview_hat(net.local_hat)
+        self.set_preview_color(net.local_color)
         ui.root.add(self.menu.root)
         return self.menu.root
