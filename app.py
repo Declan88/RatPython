@@ -556,6 +556,8 @@ def main():
     in_menu = True
     pending_start = None
     net_mgr = NetworkManager(camera, None)
+    from Modules.Scenes import scene_base as _scene_base
+    _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
     menu_scene = get_or_load_scene("mainmenu")
     game_look = (camera.yaw, camera.pitch, glm.vec3(camera.front))
 

@@ -196,6 +196,21 @@ def _advance_upper_offset_blend(obj, dt):
     return blended_offsets, offset_blend_weight
 
 
+# Called at natural points while a scene loads/bakes (which blocks the main
+# loop for 10+ seconds). app.py points it at the network manager so Steam
+# callbacks - notably accepting a peer's P2P session request - keep running;
+# unanswered for the whole load, the peer's connection attempt times out.
+LOAD_PUMP = None
+
+
+def _pump_load():
+    if LOAD_PUMP is not None:
+        try:
+            LOAD_PUMP()
+        except Exception:
+            pass
+
+
 class Scene:
     def __init__(self, ctx, recalculate_shadows=True):
         self.ctx = ctx
@@ -423,6 +438,7 @@ class Scene:
     # =============================================================
 
     def _load_object(self, model_path):
+        _pump_load()
         model = load_glb(model_path, self.ctx, self.pbr_program)
         if model is None:
             return None
@@ -486,6 +502,7 @@ class Scene:
         }
 
     def _load_objects_by_material(self, model_path):
+        _pump_load()
         """Like _load_object, but for a glb that may have more than one
         distinct material - see load_glb_by_material's own docstring for
         why this exists (load_glb/_load_object's _flatten_scene only
@@ -2429,6 +2446,7 @@ class Scene:
                     obj["shadow_vao"].render()
 
             for obj in eligible:
+                _pump_load()
                 bake_point_light(
                     self.ctx, self.bake_program, obj, self._get_model_matrix(obj),
                     light, temp_shadow

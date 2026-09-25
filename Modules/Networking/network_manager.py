@@ -97,6 +97,12 @@ class NetworkManager:
     # PER-FRAME UPDATE - call this once per frame from your main loop
     # =============================================================
 
+    def pump_callbacks(self):
+        """Runs Steam callbacks only - safe to call from inside a long blocking
+        load (see scene_base.LOAD_PUMP)."""
+        if self.client:
+            self.client.run_callbacks()
+
     def update(self):
         if not self.client:
             return
