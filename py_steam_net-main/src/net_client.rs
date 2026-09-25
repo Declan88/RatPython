@@ -54,7 +54,7 @@ impl PySteamClient {
                 client.register_callback::<LobbyChatUpdate, _>(move |update| {
                     Python::with_gil(|py| {
                         if let Some(cb) = &*cb_lobby_changed_shared.lock().unwrap() {
-                            let _ = cb.call1(
+                            if let Err(e) = cb.call1(
                                 py,
                                 (
                                     update.lobby.raw(),
@@ -62,7 +62,9 @@ impl PySteamClient {
                                     update.making_change.raw(),
                                     update.member_state_change as u64,
                                 ),
-                            );
+                            ) {
+                                e.print(py);
+                            }
                         }
                     });
                 });
@@ -72,10 +74,12 @@ impl PySteamClient {
                 networking.session_failed_callback(move |info| {
                     Python::with_gil(|py| {
                         if let Some(cb) = &*cb_connection_failed_shared.lock().unwrap() {
-                            let _ = cb.call1(
+                            if let Err(e) = cb.call1(
                                 py,
                                 (info.identity_remote().unwrap().steam_id().unwrap().raw(),),
-                            );
+                            ) {
+                                e.print(py);
+                            }
                         }
                     });
                 });
@@ -119,7 +123,9 @@ impl PySteamClient {
             Python::with_gil(|py| {
                 if let Some(cb) = &*self.cb_message_recv.lock().unwrap() {
                     for (steam_id, ch, data) in received_messages {
-                        let _ = cb.call1(py, (steam_id, ch, PyBytes::new(py, &data)));
+                        if let Err(e) = cb.call1(py, (steam_id, ch, PyBytes::new(py, &data))) {
+                            e.print(py);
+                        }
                     }
                 }
             });
@@ -149,12 +155,13 @@ impl PySteamClient {
             // immediately after this call1 hands the new lobby id back,
             // is both simpler and just as immediate in practice.
             matchmaking.create_lobby(lobby_kind, max_members, move |result| {
-                Python::with_gil(|py| match result {
-                    Ok(lobby_id) => {
-                        let _ = cb_on_created.call1(py, (lobby_id.raw(),));
-                    }
-                    Err(err) => {
-                        let _ = cb_on_created.call1(py, (py.None(), err.to_string()));
+                Python::with_gil(|py| {
+                    let call = match result {
+                        Ok(lobby_id) => cb_on_created.call1(py, (lobby_id.raw(),)),
+                        Err(err) => cb_on_created.call1(py, (py.None(), err.to_string())),
+                    };
+                    if let Err(e) = call {
+                        e.print(py);
                     }
                 });
             });
@@ -165,18 +172,19 @@ impl PySteamClient {
         if let Some((client, _)) = &self.client {
             let matchmaking = client.matchmaking();
             matchmaking.join_lobby(LobbyId::from_raw(lobby_id), move |result| {
-                Python::with_gil(|py| match result {
-                    Ok(lobby_id) => {
-                        let _ = cb_on_joined.call1(py, (lobby_id.raw(), py.None()));
-                    }
-                    Err(e) => {
-                        let _ = cb_on_joined.call1(
+                Python::with_gil(|py| {
+                    let call = match result {
+                        Ok(lobby_id) => cb_on_joined.call1(py, (lobby_id.raw(), py.None())),
+                        Err(e) => cb_on_joined.call1(
                             py,
                             (
                                 py.None(),
                                 PyRuntimeError::new_err(format!("No Lobby Found: {:?}", e)),
                             ),
-                        );
+                        ),
+                    };
+                    if let Err(e) = call {
+                        e.print(py);
                     }
                 });
             });
@@ -236,13 +244,28 @@ impl PySteamClient {
                 StringFilterKind::Include,
             ));
             matchmaking.request_lobby_list(move |result| {
-                Python::with_gil(|py| match result {
-                    Ok(lobbies) => {
-                        let ids: Vec<u64> = lobbies.iter().map(|id| id.raw()).collect();
-                        let _ = cb_on_list.call1(py, (ids, py.None()));
-                    }
-                    Err(e) => {
-                        let _ = cb_on_list.call1(py, (Vec::<u64>::new(), e.to_string()));
+                Python::with_gil(|py| {
+                    // Every call1 in this file used to be `let _ =
+                    // call1(...)`, silently discarding whatever
+                    // exception the Python callback raised - which is
+                    // exactly what hid a real bug for a while: Python's
+                    // own handle_lobby_list calling back into this same
+                    // PySteamClient instance's create_lobby/join_lobby
+                    // (both &mut self) from INSIDE this callback (itself
+                    // running inside run_callbacks' &self borrow) raised
+                    // PyO3's "RuntimeError: Already borrowed" on every
+                    // single call, with nothing anywhere to show for it.
+                    // e.print(py) at least gets it into stderr/the
+                    // console instead of vanishing.
+                    let call = match result {
+                        Ok(lobbies) => {
+                            let ids: Vec<u64> = lobbies.iter().map(|id| id.raw()).collect();
+                            cb_on_list.call1(py, (ids, py.None()))
+                        }
+                        Err(e) => cb_on_list.call1(py, (Vec::<u64>::new(), e.to_string())),
+                    };
+                    if let Err(e) = call {
+                        e.print(py);
                     }
                 });
             });

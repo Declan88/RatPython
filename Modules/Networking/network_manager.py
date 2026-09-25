@@ -169,10 +169,29 @@ class NetworkManager:
         print("\n--- Scanning for Open RatWar Lobbies ---")
 
         def handle_lobby_list(lobbies, error):
+            # create_lobby/join_lobby are deliberately NOT called
+            # directly from here, even though that reads more naturally -
+            # this function runs as py_steam_net's own async callback for
+            # get_lobby_list, invoked synchronously from INSIDE
+            # PySteamClient.run_callbacks() (itself holding a PyO3
+            # borrow of the client object for run_callbacks' own entire
+            # duration). create_lobby/join_lobby are &mut self on the
+            # Rust side, so calling either one here - while that borrow
+            # is still outstanding - makes PyO3's runtime borrow checker
+            # raise "RuntimeError: Already borrowed" on EVERY attempt.
+            # That exception used to vanish silently (py_steam_net's own
+            # Rust callback discarded it via `let _ = ...call1(...)`, now
+            # fixed to at least print it) - meaning lobby hosting/joining
+            # was completely broken here with zero visible error.
+            # self._schedule(0, ...) defers the call to run from
+            # NetworkManager.update()'s own _run_deferred() instead,
+            # which happens right after run_callbacks() has already
+            # RETURNED that same frame - same effective latency (still
+            # well within this frame), but outside the borrow entirely.
             if error:
                 print(f"Failed to request lobby list: {error}")
                 print("Hosting a new lobby instead...")
-                self.client.create_lobby(2, 4, self.on_lobby_created)
+                self._schedule(0, lambda: self.client.create_lobby(2, 4, self.on_lobby_created))
                 return
 
             open_lobby_id = None
@@ -188,10 +207,10 @@ class NetworkManager:
 
             if open_lobby_id:
                 print(f"Found valid open lobby {open_lobby_id}. Joining automatically...")
-                self.client.join_lobby(open_lobby_id, self.on_lobby_joined)
+                self._schedule(0, lambda: self.client.join_lobby(open_lobby_id, self.on_lobby_joined))
             else:
                 print("No open RatWar lobbies found. Hosting a new lobby...")
-                self.client.create_lobby(2, 4, self.on_lobby_created)
+                self._schedule(0, lambda: self.client.create_lobby(2, 4, self.on_lobby_created))
 
         try:
             self.client.get_lobby_list(handle_lobby_list)
