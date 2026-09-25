@@ -68,6 +68,7 @@ class NetworkManager:
         self._members = set()
         self._last_hello_time = 0.0
         self._net_seen = set()
+        self._heard_from = set()  # peers that have sent us anything (incl. hellos)
         self._net_log_t0 = {}   # peer -> first hello time (diagnostics)
         self._members_checked = 0.0
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
@@ -357,7 +358,8 @@ class NetworkManager:
         ~10-20s to untangle them. The lower Steam id opens it; the other side
         stays silent toward that peer until it has heard from them (their
         traffic arrives over the session they opened, which we then reuse)."""
-        return self.local_steam_id < member_id or member_id in self.remote_players
+        return (self.local_steam_id < member_id or member_id in self.remote_players
+                or member_id in self._heard_from)
 
     def _send_hellos(self, now):
         """Opens (and keeps retrying) a Steam session with every lobby member
@@ -462,6 +464,7 @@ class NetworkManager:
             return  # a peer's packet arrived before our map finished loading
         if not self._is_lobby_member(sender_id):
             return
+        self._heard_from.add(sender_id)
         try:
             state = json.loads(msg_bytes.decode("utf-8"))
             if "p" not in state or "y" not in state:
