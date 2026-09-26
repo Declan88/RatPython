@@ -44,6 +44,8 @@ def _build_texture():
 
 
 class Hitmarker(Widget):
+    HEADSHOT_COLOR = (255, 45, 45, 255)
+
     def __init__(self, duration=0.28, pop=1.25, color=(255, 255, 255, 255), **kw):
         kw.setdefault("anchor", Anchor.CENTER)
         kw.setdefault("size", (46, 46))
@@ -52,6 +54,7 @@ class Hitmarker(Widget):
         self.pop = pop              # how much bigger than normal it starts (shrinks to 1)
         self.color = color
         self._start = None
+        self._headshot = False
         self._tex = None
 
     def prime(self):
@@ -60,9 +63,11 @@ class Hitmarker(Widget):
             self.manager._ensure_renderer()
             self._tex = self.manager.renderer.texture_from_surface(_build_texture())
 
-    def trigger(self):
-        """Shows it (restarting the fade if it's already up)."""
+    def trigger(self, headshot=False):
+        """Shows it (restarting the fade if it's already up): white, or red and a touch bigger
+        and longer for a headshot."""
         self._start = time.perf_counter()
+        self._headshot = headshot
 
     def _release_resources(self):
         super()._release_resources()
@@ -72,7 +77,7 @@ class Hitmarker(Widget):
 
     def draw(self, out):
         if self._start is not None:
-            t = (time.perf_counter() - self._start) / self.duration
+            t = (time.perf_counter() - self._start) / (self.duration * (1.3 if self._headshot else 1.0))
             if t >= 1.0:
                 self._start = None
             elif self.manager is not None:
@@ -80,8 +85,10 @@ class Hitmarker(Widget):
                     self._tex = self.manager.renderer.texture_from_surface(_build_texture())
                 x, y, w, h = self.rect
                 scale = 1.0 + (self.pop - 1.0) * (1.0 - t) ** 2      # settles quickly
+                if self._headshot:
+                    scale *= 1.2
                 sw, sh = w * scale, h * scale
-                r, g, b, a = self.color
+                r, g, b, a = self.HEADSHOT_COLOR if self._headshot else self.color
                 alpha = int(a * min(1.0, (1.0 - t) * 2.0))           # holds, then fades over the second half
                 out.texture_logical(self._tex, (x + (w - sw) / 2, y + (h - sh) / 2, sw, sh), _color((r, g, b, alpha)))
         super().draw(out)

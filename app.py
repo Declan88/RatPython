@@ -125,7 +125,9 @@ from Modules.UI.scoreboard import Scoreboard
 SPAWN_POSITION = (0.0, 2.0, 3.0)   # where the player (re)spawns: hull centre, metres
 RESPAWN_SECONDS = 3.0
 HITMARKER_SOUND = "Assets/Audio/Player/hitmarker.wav"
-HITMARKER_VOLUME = 0.6
+HITMARKER_VOLUME = 1.0   # the sound manager applies a volume twice (on the sound and on its channel), so 1.0 is what plays at full
+HITMARKER_HEADSHOT_PITCH = 1.45   # a headshot's hitmarker sound is this much higher (playback speed)
+HITMARKER_GAIN = 10.0     # ...so anything louder has to amplify the samples themselves (soft-clipped)
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
@@ -672,7 +674,8 @@ def main():
         sounds = current_scene.sound_manager
         if weapon is not None and weapon.fire_sound:
             sounds.preload(weapon.fire_sound, muffle=True)
-        sounds.preload(HITMARKER_SOUND)
+        sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN)
+        sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN, pitch=HITMARKER_HEADSHOT_PITCH)
         if current_scene.gibs is not None:
             if local_player_model is not None and local_player_model.obj is not None:
                 current_scene.gibs.match_material(local_player_model.obj)
@@ -853,11 +856,12 @@ def main():
                                         follow=lambda: weapon.muzzle_position(current_scene))
                     if shot.victim in net_mgr.remote_players:
                         net_mgr.send_damage(shot.victim, shot.damage, weapon.name)
-                        hitmarker.trigger()
+                        hitmarker.trigger(headshot=shot.headshot)
                         # Flat, in both ears, at any distance: it's feedback for us, not a sound in the world.
                         hit_emitter = current_scene.sound_manager.add_sound(
                             HITMARKER_SOUND, camera.position, volume=HITMARKER_VOLUME, loop=False,
-                            universal=True, channel=hit_sound_channel[0])
+                            universal=True, channel=hit_sound_channel[0], gain=HITMARKER_GAIN,
+                            pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
                         hit_sound_channel[0] = hit_emitter["channel"]
 
         # get_position() is the hull CENTER, not feet - subtract half

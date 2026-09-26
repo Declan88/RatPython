@@ -19,6 +19,7 @@ import time
 
 import glm
 
+from Modules.Physics.physics_world import CollisionGroup
 from Modules.Player.player_model import PlayerModel
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH, decode_color
 from Modules.Weapons import USP
@@ -94,6 +95,10 @@ _DIRECTIONAL_CLIPS = {
 _DEFAULT_HITBOX_HALF_EXTENTS = (0.4, 0.9, 0.4)
 # rat.glb's measured eye level above its feet - the hitbox spans feet to eye.
 _BODY_HEIGHT = 1.39225
+# The head's box in the rat's own frame (metres from the feet; +z is the way it faces): where the
+# head mesh sits (measured off Gibs.glb's head), a little generous so a shot that grazes it counts.
+_HEAD_HALF_EXTENTS = (0.20, 0.22, 0.34)
+_HEAD_CENTER = (0.0, 1.42, 0.09)
 
 
 class RemotePlayer:
@@ -142,6 +147,9 @@ class RemotePlayer:
         self.weapon.equip_player(scene, self.model)
 
         self._hitbox = scene.physics.add_hitbox(hitbox_half_extents, owner=steam_id)
+        # Same owner, own group: see CollisionGroup.HEAD and WeaponsBase.fire.
+        self._head_hitbox = scene.physics.add_hitbox(
+            _HEAD_HALF_EXTENTS, owner=steam_id, collision_mask=CollisionGroup.HEAD)
 
         self._snapshots = []      # [(arrival_time, feet_pos, yaw_degrees)], oldest first
         self._state = {}          # latest non-interpolated locomotion state
@@ -289,6 +297,18 @@ class RemotePlayer:
             glm.vec3(0.0, -1000.0, 0.0) if self.dead else feet_pos + glm.vec3(0.0, _BODY_HEIGHT / 2.0, 0.0),
             glm.vec3(0.0, glm.radians(yaw), 0.0),
         )
+        self._update_head_hitbox(feet_pos, yaw)
+
+    def _update_head_hitbox(self, feet_pos, yaw):
+        """Puts the head box on the rat's head, turned the way the model is (the model's local +z
+        is the camera's flat forward - see PlayerModel.update's yaw formula)."""
+        if self.dead:
+            self.scene.physics.update_hitbox(self._head_hitbox, glm.vec3(0.0, -1000.0, 0.0), glm.vec3(0.0))
+            return
+        turn = glm.radians(90.0 - yaw)
+        forward = glm.vec3(glm.sin(turn), 0.0, glm.cos(turn))
+        center = feet_pos + glm.vec3(0.0, _HEAD_CENTER[1], 0.0) + forward * _HEAD_CENTER[2]
+        self.scene.physics.update_hitbox(self._head_hitbox, center, glm.vec3(0.0, turn, 0.0))
 
     def _set_dead(self, dead):
         """Hides (or shows again) their body and the gun in their hand."""
@@ -309,3 +329,6 @@ class RemotePlayer:
         if self._hitbox is not None:
             self.scene.physics.remove_hitbox(self._hitbox)
             self._hitbox = None
+        if self._head_hitbox is not None:
+            self.scene.physics.remove_hitbox(self._head_hitbox)
+            self._head_hitbox = None

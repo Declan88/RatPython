@@ -149,6 +149,10 @@ class CollisionGroup:
     # Gibs (Modules/Gore): collide with level geometry (whose mask is ALL) and each
     # other, but never with the player hull, hitboxes or props.
     GIB = BitMask32.bit(5)
+    # Player head hitboxes: a separate group so a shot can ask "did it also pass through a head?"
+    # (a second, HEAD-only trace) without the head box competing with the body box in the
+    # ordinary bullet trace. Never part of any solid body's mask.
+    HEAD = BitMask32.bit(6)
     ALL = BitMask32.all_on()
 
 

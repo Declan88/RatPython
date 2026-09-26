@@ -29,6 +29,7 @@ import time
 import glm
 
 from Modules.Graphics.skeletal_loader import _read_glb_json_and_blob
+from Modules.Physics.physics_world import CollisionGroup
 from Modules.Weapons.recoil import Recoil
 
 _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
@@ -94,11 +95,12 @@ class Shot:
     nothing within range. victim: the owner tag of the hitbox it struck (a
     remote player's steam_id), or None if it hit level geometry/nothing.
     damage: what this shot does to a victim."""
-    __slots__ = ("hit", "victim", "damage", "direction", "spread")
+    __slots__ = ("hit", "victim", "damage", "direction", "spread", "headshot")
 
-    def __init__(self, hit, damage, direction=None, spread=0.0):
+    def __init__(self, hit, damage, direction=None, spread=0.0, headshot=False):
         self.hit = hit
         self.victim = hit.owner if hit is not None else None
+        self.headshot = headshot     # the trace also passed through the victim's head hitbox
         self.damage = damage
         self.direction = direction   # the (spread-adjusted) direction the trace actually went
         self.spread = spread         # the cone half-angle (degrees) it was drawn from
@@ -151,6 +153,7 @@ class WeaponsBase:
 
     # ---- damage --------------------------------------------------------
     damage = 10.0             # health taken from a player each shot hits
+    headshot_multiplier = 1.5  # ...times this when the shot hits the head
     max_range = 500.0         # metres a shot's line trace reaches
 
     # ---- models --------------------------------------------------------
@@ -266,7 +269,14 @@ class WeaponsBase:
         # After the trace: the shot goes where the camera was pointing when the
         # trigger was pulled; the kick moves it for the NEXT one.
         self.recoil.kick()
-        return Shot(hit, self.damage, aim, spread)
+        # A shot that struck a player is a headshot if the same trace also passes through THAT
+        # player's head box (a second trace, against head boxes only - see CollisionGroup.HEAD).
+        headshot = False
+        if hit is not None and hit.owner is not None:
+            head = scene.physics.raycast(origin, origin + aim * self.max_range, CollisionGroup.HEAD)
+            headshot = head is not None and head.owner == hit.owner
+        damage = self.damage * self.headshot_multiplier if headshot else self.damage
+        return Shot(hit, damage, aim, spread, headshot)
 
     def muzzle_position(self, scene):
         """Where this weapon's bullets come out, in the world: the first-person

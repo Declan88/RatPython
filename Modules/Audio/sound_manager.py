@@ -35,14 +35,38 @@ class SoundManager:
     def _muffle_cutoff(cls, dist):
         return next(cutoff for limit, cutoff in cls.MUFFLE_TIERS if dist <= limit)
 
-    def _load_sound(self, path, cutoff):
+    def _load_sound(self, path, cutoff, gain=1.0, pitch=1.0):
         sound = pygame.mixer.Sound(path)
+        if (gain != 1.0 or pitch != 1.0) and cutoff is None:
+            return self._amplified(sound, path, gain, pitch)
         if cutoff is None:
             return sound
         key = (path, cutoff)
         samples = self._muffled.get(key)
         if samples is None:
             samples = self._muffled[key] = self._lowpass(pygame.sndarray.array(sound), cutoff)
+        return pygame.sndarray.make_sound(samples)
+
+    def _amplified(self, sound, path, gain=1.0, pitch=1.0):
+        """A processed copy of `sound`: pitch-shifted (resampled - higher pitch is also shorter,
+        like a sped-up tape) and/or made louder than the mixer's 1.0 volume ceiling allows
+        (samples scaled by `gain` and soft-clipped with tanh, so peaks round off instead of
+        distorting harshly). Rendered once per file and settings, then cached."""
+        key = (path, "gain", gain, pitch)
+        samples = self._muffled.get(key)
+        if samples is None:
+            raw = pygame.sndarray.array(sound)
+            info = np.iinfo(raw.dtype)
+            data = raw.astype(np.float64)
+            if pitch != 1.0:
+                frames = data.shape[0]
+                positions = np.arange(0.0, frames - 1, pitch)
+                data = np.stack([np.interp(positions, np.arange(frames), data[:, c])
+                                 for c in range(data.shape[1])], axis=1) if data.ndim == 2 else \
+                    np.interp(positions, np.arange(frames), data)
+            if gain != 1.0:
+                data = np.tanh(data / info.max * gain) * info.max
+            samples = self._muffled[key] = np.clip(data, info.min, info.max).astype(raw.dtype)
         return pygame.sndarray.make_sound(samples)
 
     @staticmethod
@@ -57,7 +81,7 @@ class SoundManager:
         info = np.iinfo(samples.dtype)
         return np.clip(out, info.min, info.max).astype(samples.dtype)
 
-    def preload(self, sound_path, muffle=False):
+    def preload(self, sound_path, muffle=False, gain=1.0, pitch=1.0):
         """Warms a sound before its first play: reads and decodes the file once and, for a sound
         that will play with muffle=True, renders every distance-muffled copy now (each is an FFT
         over the whole clip) instead of on the first shot heard from far away."""
@@ -65,6 +89,8 @@ class SoundManager:
             pygame.mixer.init()
             pygame.mixer.set_num_channels(32)
         sound = pygame.mixer.Sound(sound_path)
+        if gain != 1.0 or pitch != 1.0:
+            self._amplified(sound, sound_path, gain, pitch)
         if muffle:
             samples = None
             for _limit, cutoff in self.MUFFLE_TIERS:
@@ -86,6 +112,8 @@ class SoundManager:
         channel=None,
         falloff="legacy",
         muffle=False,
+        gain=1.0,
+        pitch=1.0,
     ):
         """falloff="inverse" swaps the flat point-light-style curve for a
         realistic-for-a-game one: full volume inside min_distance, then
@@ -98,6 +126,10 @@ class SoundManager:
         the highs first, so a distant gunshot loses its crack and is left as a
         dull thump. The mixer can't filter live, so each cutoff is rendered
         once per file and cached.
+
+        gain: louder than volume can go (volume tops out at 1.0): the samples are amplified by this
+        factor with soft clipping - only for a one-shot without muffle. pitch: playback speed
+        factor (1.5 = a fifth up and a third shorter), likewise pre-rendered.
 
         loop=True starts it as a looping ambient sound immediately
         (e.g. a hum, a fire crackling); loop=False plays it once and
@@ -129,7 +161,7 @@ class SoundManager:
         cutoff = None
         if muffle and not universal and self._listener is not None:
             cutoff = self._muffle_cutoff(glm.length(glm.vec3(position) - self._listener[0]))
-        sound = self._load_sound(sound_path, cutoff)
+        sound = self._load_sound(sound_path, cutoff, gain, pitch)
         sound.set_volume(volume)
         if channel is not None:
             self.emitters = [e for e in self.emitters if e["channel"] is not channel]
