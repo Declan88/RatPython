@@ -245,6 +245,8 @@ class WindowManager:
         so left alone this would show up as those systems jumping far
         ahead in one tick instead of a smooth continuation from "now"."""
         self._last_time = time.perf_counter()
+        # Clicks made while loading would otherwise all land on whatever is under the mouse now.
+        pygame.event.clear([pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL])
 
     def toggle_vsync(self):
         self.vsync = 0 if self.vsync else 1

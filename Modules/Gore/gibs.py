@@ -15,6 +15,7 @@ they expire the bodies go and the draw objects return to the pool.
     ...each frame, before particles.update():   scene.gibs.update(dt)
 """
 
+from Modules.settings import settings
 import math
 import os
 import random
@@ -197,6 +198,9 @@ class GibManager:
         if not self.parts:
             return
         feet = glm.vec3(feet_position)
+        if not settings.gibs:
+            self._cheap_death(feet, sound)
+            return
         inherited = glm.vec3(velocity) * 0.6 + (glm.vec3(push) if push is not None else glm.vec3(0.0))
         physics = self.scene.physics
         centre_of_mass = feet + glm.vec3(0.0, 0.8, 0.0)
@@ -256,6 +260,17 @@ class GibManager:
         if sound:
             self.scene.sound_manager.add_sound(
                 GORE_SOUND, centre_of_mass, volume=1.0, min_distance=6.0, max_distance=90.0,
+                loop=False, falloff="inverse", muffle=True)
+
+    def _cheap_death(self, feet, sound):
+        """The death effect with gibs turned off: no bodies, no physics, no extra draws - just
+        the blood burst and cloud and the gore sound."""
+        centre = feet + glm.vec3(0.0, 0.8, 0.0)
+        self.particles.spawn("gore_blood_burst", centre)
+        self.particles.spawn("gore_blood_cloud", centre)
+        if sound:
+            self.scene.sound_manager.add_sound(
+                GORE_SOUND, centre, volume=1.0, min_distance=6.0, max_distance=90.0,
                 loop=False, falloff="inverse", muffle=True)
 
     @staticmethod

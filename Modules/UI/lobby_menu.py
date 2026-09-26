@@ -13,12 +13,13 @@ only updates widgets/flags - on_start itself is expected to defer the real
 work (app.py just records a pending start for its main loop).
 """
 
-from .controls import ColorWheel, ScrollBox, Slider
+from .controls import Checkbox, ColorWheel, ScrollBox, Slider
 from .inputs import Dropdown, TextInput
 from . import theme
 from .widgets import Anchor, Button, Image, Label, Panel
 from Modules.Player.hats import available_hats, display_name
 from Modules.Player.rat_colors import hsv_to_rgb, rgb_to_hsv
+from Modules.settings import settings
 
 # Where the fur color's brightness slider starts (and returns to on reset) -
 # well below full so a freshly picked color isn't blown out.
@@ -118,6 +119,8 @@ class LobbyMenu:
         # opens/closes it.
         def toggle_card():
             card.visible = not card.visible
+            if card.visible:
+                self._set_settings_open(False)
             self.palette_button.normal_color = (theme.ACCENT_DIM if card.visible
                                                 else theme.BUTTON["color"])
 
@@ -126,6 +129,7 @@ class LobbyMenu:
             **theme.BUTTON))
         self.palette_button.add(Image("Assets/Textures/UI/Palette.png", size=(56, 56),
                                       anchor=Anchor.CENTER))
+        self._build_settings(stage)
         card.add(Label("FUR COLOR", font_size=28, color=theme.ACCENT))
         self.color_wheel = card.add(ColorWheel(value=_DEFAULT_BRIGHTNESS, size=(260, 260),
                                                   on_change=self._on_wheel))
@@ -139,6 +143,41 @@ class LobbyMenu:
             self.color_wheel.set_hs(h, s)
             self.color_wheel.set_value(v)
             self.color_brightness.set_value(v, notify=False)
+
+    def _build_settings(self, stage):
+        """A gear button beside the palette button that opens a card of graphics options
+        (Modules/settings.py) - they take effect immediately and are saved."""
+        card = stage.add(Panel(color=theme.CARD, anchor=Anchor.TOP_RIGHT, offset=(-40, 140),
+                              layout="vertical", spacing=14, padding=22, fit_content=True,
+                              visible=False))
+        self.settings_card = card
+        self.settings_button = stage.add(Button(
+            "", on_click=lambda: self._set_settings_open(not card.visible), size=(80, 80),
+            anchor=Anchor.TOP_RIGHT, offset=(-140, 40), **theme.BUTTON))
+        self.settings_button.add(Image("Assets/Textures/UI/Settings.png", size=(56, 56),
+                                       anchor=Anchor.CENTER))
+        card.add(Label("SETTINGS", font_size=28, color=theme.ACCENT))
+
+        def option(text, name):
+            def changed(checked):
+                setattr(settings, name, checked)
+                settings.save()
+            card.add(Checkbox(text, checked=getattr(settings, name), on_toggle=changed,
+                              font_size=26, size=(380, 40)))
+
+        option("Reflections (SSR)", "ssr")
+        option("Gibs on death", "gibs")
+        card.add(Label("Off: water uses a cheap reflection,", font_size=20, color=_MUTED))
+        card.add(Label("deaths are a blood burst, not gibs.", font_size=20, color=_MUTED))
+
+    def _set_settings_open(self, show):
+        if not hasattr(self, "settings_card"):
+            return
+        self.settings_card.visible = show
+        self.settings_button.normal_color = theme.ACCENT_DIM if show else theme.BUTTON["color"]
+        if show and hasattr(self, "color_card") and self.color_card.visible:
+            self.color_card.visible = False
+            self.palette_button.normal_color = theme.BUTTON["color"]
 
     def _apply_color(self):
         w = self.color_wheel

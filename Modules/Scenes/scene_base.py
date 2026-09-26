@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from Modules.settings import settings
 import math
 from pathlib import Path
 
 import moderngl
+import pygame
 import glm
 import numpy as np
 
@@ -239,6 +241,7 @@ _POSE_INTERVALS = (POSE_UPDATE_INTERVAL, 1.0 / 100.0, 1.0 / 60.0, 1.0 / 30.0)   
 
 
 def _pump_load():
+    pygame.event.pump()      # keeps Windows treating the window as responsive
     if LOAD_PUMP is not None:
         try:
             LOAD_PUMP()
@@ -4037,7 +4040,8 @@ class Scene:
         # material (e.g. transparent water) with reflection_mode="ssr"
         # needs the real grabbed color/depth for its own env_reflection
         # block to do anything but fall back to the cheap skybox path.
-        bind_ssr_textures(self.pbr_program, self._ssr_color_texture, self._ssr_depth_texture)
+        bind_ssr_textures(self.pbr_program, self._ssr_color_texture if settings.ssr else None,
+                          self._ssr_depth_texture)
         for obj, _movable in blended_objects:
             # BLEND objects are never lightmapped (see add_static's own
             # alpha_mode_overrides docstring - baking assumes opaque,
@@ -4159,7 +4163,8 @@ class Scene:
         # the scene's entire lifetime once enable_screen_space_
         # reflections had ever been called, regardless of whether the
         # one thing it exists to feed was even in view.
-        if any_ssr_visible:
+        ssr_on = settings.ssr
+        if any_ssr_visible and ssr_on:
             self._grab_scene_textures(camera)
             self._render_ssr_pass(camera, pbr_view_proj)
 

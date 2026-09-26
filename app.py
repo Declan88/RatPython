@@ -83,6 +83,21 @@ def _request_high_performance_gpu():
 
 _request_high_performance_gpu()
 
+
+def _disable_window_ghosting():
+    """Loading blocks the main thread for seconds at a time, and OpenGL only works from that
+    thread, so window messages can't be answered meanwhile. If the player clicks the window
+    in that time Windows swaps it for a white "ghost" and offers to end the process; this
+    tells Windows not to. The clicks simply queue up (and are dropped once loading is done)."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.user32.DisableProcessWindowsGhosting()
+        except Exception:
+            pass
+
+
+_disable_window_ghosting()
+
 # NOTE on Optimus/switchable-graphics GPU selection for OpenGL: the
 # registry hint above isn't reliably honored for a raw OpenGL context
 # (moderngl/pygame-ce, via WGL) the way it is for Direct3D/DXGI apps.
