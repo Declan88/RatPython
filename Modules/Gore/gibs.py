@@ -26,10 +26,16 @@ import glm
 import numpy as np
 import trimesh
 
+from Modules.Graphics.pbr_shader import invalidate_material_ubo
 from Modules.Physics.physics_world import CollisionGroup
+from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 
 GIB_MODEL = "Assets/Models/Gibs/Gibs.glb"
 GORE_SOUND = "Assets/Audio/Player/Gore.wav"
+
+# The fur material of the gib model (the same one the player rat uses): the part of a gib that
+# takes the player's fur colour, matches the player's shading and uses the same tint mask.
+FUR_MATERIAL = "funnyrat.001"
 
 LIFETIME = 6.0            # seconds a gib exists
 SHRINK_TIME = 0.9         # ...of which the last is spent shrinking to nothing
@@ -97,12 +103,44 @@ def _split_model(path):
 
 
 class GibManager:
-    def __init__(self, scene, particles, model_path=GIB_MODEL):
+    def __init__(self, scene, particles, model_path=GIB_MODEL, tint_mask_path=RAT_TINT_MASK_PATH):
         self.scene = scene
         self.particles = particles
         self.parts = []
         self.live = []
+        self._tint_mask = None
+        self._fur_overrides = {"specular_strength": 0}   # what the player rat's shading sets (see app.py)
         self._build(model_path)
+        # The fur takes the player's colour through the same mask texture the rat uses
+        # (the gib meshes share the rat's UV layout), uploaded once for all of them.
+        self._tint_mask = scene._load_tint_mask(tint_mask_path)
+        for part in self.parts:
+            for obj in part.objects:
+                if obj.get("material_name") == FUR_MATERIAL:
+                    obj["tint_mask_texture"] = self._tint_mask
+                    obj.update(self._fur_overrides)
+
+    def match_material(self, source_obj):
+        """Makes the fur match another object's shading - the player's skeletal object:
+        copies its metallic/roughness/specular/emissive/normal settings."""
+        for key in ("metallic", "roughness", "specular_strength", "emissive", "normal_scale"):
+            if key in source_obj:
+                self._fur_overrides[key] = source_obj[key]
+        for part in self.parts:
+            for objects in [part.objects] + part.free:
+                for obj in objects:
+                    if obj.get("material_name") == FUR_MATERIAL:
+                        obj.update(self._fur_overrides)
+                        invalidate_material_ubo(obj)
+
+    def _dress(self, objects, tint):
+        """Puts the current fur colour (rgb 0-1, or None for the model's own) on a set of
+        draw objects, rebuilding a material buffer only when the colour actually changed."""
+        new = None if tint is None else tuple(float(c) for c in tint)
+        for obj in objects:
+            if obj.get("material_name") == FUR_MATERIAL and obj.get("tint_color") != new:
+                obj["tint_color"] = new
+                invalidate_material_ubo(obj)
 
     # ---- one-time setup ----
 
@@ -127,10 +165,11 @@ class GibManager:
 
     # ---- spawning ----
 
-    def spawn(self, feet_position, velocity=(0.0, 0.0, 0.0), push=None, sound=True):
+    def spawn(self, feet_position, velocity=(0.0, 0.0, 0.0), push=None, sound=True, tint=None):
         """Bursts a body standing at `feet_position` into gibs. velocity: the body's own
         velocity (the chunks carry some of it); push: an extra shove for all of them
-        (a shot's direction). Also plays the gore sound and throws blood around."""
+        (a shot's direction). tint: the dead player's fur colour (rgb 0-1, None = the model's own).
+        Also plays the gore sound and throws blood around."""
         if not self.parts:
             return
         feet = glm.vec3(feet_position)
@@ -162,6 +201,7 @@ class GibManager:
             physics.set_body_velocity(body, linear, angular)
 
             objects = part.free.pop() if part.free else [dict(o) for o in part.objects]
+            self._dress(objects, tint)
             live = _Live(part, objects, body)
             live.position = glm.vec3(position)
             for obj in objects:
@@ -228,6 +268,19 @@ class GibManager:
         except ValueError:
             pass
 
+    def prime(self, camera, tint=None):
+        """Does everything a first death would otherwise do lazily - so it can't hitch: builds
+        the draw-object pool and their material buffers, warms the gore sound (and its
+        distance-muffled copies), and draws a set of gibs once. They spawn in front of `camera`
+        into the back buffer (never presented) and are removed again before any physics step.
+        Call once when the game starts, with the camera in the world."""
+        self.scene.sound_manager.preload(GORE_SOUND, muffle=True)
+        front = glm.normalize(glm.vec3(camera.front))
+        self.spawn(glm.vec3(camera.position) + front * 3.0 - glm.vec3(0.0, 0.8, 0.0), sound=False, tint=tint)
+        self.scene.render(camera, None)
+        self.clear()
+        self.particles.clear()
+
     def clear(self):
         """Removes every live gib at once (respawn, leaving the map)."""
         for live in list(self.live):
@@ -242,8 +295,12 @@ class GibManager:
                     self._release_copy(obj)
             part.free.clear()
             for obj in part.objects:
+                obj["tint_mask_texture"] = None      # one texture shared by all: freed once, below
                 self.scene.release_prop_object(obj)
         self.parts.clear()
+        if self._tint_mask is not None:
+            self._tint_mask.release()
+            self._tint_mask = None
 
     @staticmethod
     def _release_copy(obj):

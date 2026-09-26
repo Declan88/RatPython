@@ -1000,6 +1000,24 @@ class ParticleManager:
         self.effects.append(effect)
         return effect
 
+    def prime(self, camera):
+        """Loads every material the registered systems use (images, sprite sheets) and draws one
+        of each system once, so neither happens on the first shot or death. The effects appear
+        in front of `camera` in the back buffer only (nothing is presented) and are cleared
+        again. Call once when the game starts, with the camera in the world."""
+        for definition in self.definitions.values():
+            if definition.material:
+                self._material(definition.material)
+        self._fallback_texture()
+        front = glm.normalize(glm.vec3(camera.front))
+        where = glm.vec3(camera.position) + front * 4.0
+        for i, name in enumerate(self.definitions):
+            self.spawn(name, where, overlay=(i % 2 == 0))
+        self.update(0.02)
+        self.update(0.02)          # children start once their parent has run
+        self.render(camera)
+        self.clear()
+
     def clear(self):
         self.effects.clear()
 

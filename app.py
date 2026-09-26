@@ -589,10 +589,10 @@ def main():
                             offset_scale=WeaponsBase.muzzle_offset_scale, follow=follow)
     net_mgr.on_tracer = remote_shot
 
-    def remote_death(position, velocity):
-        """Another player died: their body bursts into gibs where they stood."""
+    def remote_death(position, velocity, color=None):
+        """Another player died: their body bursts into gibs (in their fur colour) where they stood."""
         if current_scene is not None and current_scene.gibs is not None:
-            current_scene.gibs.spawn(position, velocity)
+            current_scene.gibs.spawn(position, velocity, tint=color)
     net_mgr.on_death = remote_death
     # Another player's shot hit us: the shooter decided that, we apply it.
     net_mgr.on_damage = lambda amount, attacker_id, weapon_name: change_health(-amount)
@@ -619,6 +619,7 @@ def main():
             local_player_model.set_tint(net_mgr.local_color)
             viewmodel.set_tint(net_mgr.local_color)
             paper_doll = PaperDoll(window.ctx, local_player_model.obj)
+        prime_effects()
         in_menu = False
         ui.set_cursor_free(False)
         camera.yaw, camera.pitch, camera.front = game_look
@@ -639,7 +640,7 @@ def main():
         death["eye_drop"] = 0.0
         feet = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
         if current_scene.gibs is not None:
-            current_scene.gibs.spawn(feet, player.velocity)
+            current_scene.gibs.spawn(feet, player.velocity, tint=net_mgr.local_color)
         net_mgr.notify_death()
         set_local_body_visible(False)
         crosshair.visible = False
@@ -657,6 +658,31 @@ def main():
         crosshair.visible = True
         death_screen.hide()
         net_mgr.notify_respawn()
+
+    def prime_effects():
+        """Warms everything a first death, shot or hit would load or compile lazily - gib
+        meshes and materials, blood and impact textures, sounds, the hit marker and death screen
+        - so none of it hitches mid-game. All drawn into the back buffer only."""
+        show_loading_screen(window, "Loading effects...")
+        eye = glm.vec3(*SPAWN_POSITION) + glm.vec3(0.0, 0.5, 0.0)
+        prime_camera = Camera(position=eye, aspect=camera.aspect)
+        prime_camera.fov = camera.fov
+        prime_camera.yaw, prime_camera.pitch = -90.0, 0.0
+        prime_camera.update_vectors()
+        sounds = current_scene.sound_manager
+        if weapon is not None and weapon.fire_sound:
+            sounds.preload(weapon.fire_sound, muffle=True)
+        sounds.preload(HITMARKER_SOUND)
+        if current_scene.gibs is not None:
+            if local_player_model is not None and local_player_model.obj is not None:
+                current_scene.gibs.match_material(local_player_model.obj)
+            current_scene.gibs.prime(prime_camera, tint=net_mgr.local_color)
+        particles.prime(prime_camera)
+        hitmarker.prime()
+        death_screen.show()       # one invisible frame builds its text
+        ui.render()
+        death_screen.hide()
+        window.reset_frame_timer()
 
     menu_ui = menu_scene.build_ui(ui, net_mgr, MAPS, on_start=request_start)
     ui.set_cursor_free(True)

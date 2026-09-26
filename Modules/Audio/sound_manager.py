@@ -57,6 +57,22 @@ class SoundManager:
         info = np.iinfo(samples.dtype)
         return np.clip(out, info.min, info.max).astype(samples.dtype)
 
+    def preload(self, sound_path, muffle=False):
+        """Warms a sound before its first play: reads and decodes the file once and, for a sound
+        that will play with muffle=True, renders every distance-muffled copy now (each is an FFT
+        over the whole clip) instead of on the first shot heard from far away."""
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+            pygame.mixer.set_num_channels(32)
+        sound = pygame.mixer.Sound(sound_path)
+        if muffle:
+            samples = None
+            for _limit, cutoff in self.MUFFLE_TIERS:
+                if cutoff is not None and (sound_path, cutoff) not in self._muffled:
+                    if samples is None:
+                        samples = pygame.sndarray.array(sound)
+                    self._muffled[(sound_path, cutoff)] = self._lowpass(samples, cutoff)
+
     def add_sound(
         self,
         sound_path,

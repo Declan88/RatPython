@@ -54,6 +54,12 @@ class Hitmarker(Widget):
         self._start = None
         self._tex = None
 
+    def prime(self):
+        """Builds its texture now (needs the UI's renderer) instead of at the first hit."""
+        if self._tex is None and self.manager is not None:
+            self.manager._ensure_renderer()
+            self._tex = self.manager.renderer.texture_from_surface(_build_texture())
+
     def trigger(self):
         """Shows it (restarting the fade if it's already up)."""
         self._start = time.perf_counter()

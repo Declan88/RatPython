@@ -163,7 +163,7 @@ class RemotePlayer:
         # bursts into gibs, see on_death), and while the flag stays down their model and
         # hitbox are gone.
         self.dead = False
-        self.on_death = None        # callback(feet_position, velocity), set by NetworkManager
+        self.on_death = None        # callback(feet_position, velocity, fur colour), set by NetworkManager
         self._death_seen = None
         self._pending_death = False
         self._alive_wanted = True
@@ -249,7 +249,7 @@ class RemotePlayer:
             if self.on_death is not None:
                 move = s.get("d", (0.0, 0.0))
                 speed = float(s.get("v", 0.0))
-                self.on_death(feet_pos, glm.vec3(move[0] * speed, 0.0, move[1] * speed))
+                self.on_death(feet_pos, glm.vec3(move[0] * speed, 0.0, move[1] * speed), self._color_wanted)
         elif self.dead and self._alive_wanted:
             self._set_dead(False)
         if self.dead:

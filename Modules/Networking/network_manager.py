@@ -67,7 +67,7 @@ class NetworkManager:
         self._death_count = 0   # times the local player has died (a counter too)
         self.local_alive = True
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
-        self.on_death = None    # callback(feet_position, velocity) when another player dies (bursts into gibs)
+        self.on_death = None    # callback(feet_position, velocity, fur colour) when another player dies (bursts into gibs)
         self.on_tracer = None   # callback(start, end, follow) to draw another player's tracer and muzzle flash
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
         self.local_name = ""    # our Steam persona name, sent in every packet
@@ -643,7 +643,7 @@ class NetworkManager:
                 self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
                 self.remote_players[sender_id].name = self._friend_name(sender_id)
                 self.remote_players[sender_id].on_death = (
-                    lambda position, velocity: self.on_death(position, velocity) if self.on_death else None)
+                    lambda *args: self.on_death(*args) if self.on_death else None)
                 self.remote_players[sender_id].on_tracer = (
                     lambda *args: self.on_tracer(*args) if self.on_tracer else None)
             self.remote_players[sender_id].receive_state(state)

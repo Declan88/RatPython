@@ -92,7 +92,10 @@ def to_physics_quat(q):
 
 
 def to_render_quat(pq):
-    r = glm.quat(pq.getW(), pq.getI(), pq.getJ(), pq.getK())
+    # getR(), not getW(): Panda's quaternion is a 4-vector (r, i, j, k) whose getW()
+    # is its LAST component (k), so using it produced a non-unit quaternion - a dynamic
+    # body's drawn rotation was wrong and, for anything rolling, visibly stretched.
+    r = glm.quat(pq.getR(), pq.getI(), pq.getJ(), pq.getK())
     return _AXIS_SWAP_INV * r * _AXIS_SWAP
 
 
