@@ -1249,6 +1249,18 @@ class Scene:
         self._attachments.append(attachment)
         return attachment
 
+    def joint_world_position(self, obj, joint_name):
+        """Where the named joint of skeletal object `obj` is in the world, in
+        the pose it was last updated to (a muzzle bone, a hand...). None if obj
+        has no such joint or hasn't been posed yet."""
+        bones = obj.get("bone_matrices")
+        joints = obj["skeleton"].joints
+        index = next((i for i, j in enumerate(joints) if j.name == joint_name), None)
+        if index is None or not bones:
+            return None
+        joint_in_model = bones[index] * glm.inverse(joints[index].inverse_bind_matrix)
+        return glm.vec3(self._get_model_matrix(obj) * joint_in_model[3])
+
     def detach_skeletal(self, child):
         self._attachments = [a for a in self._attachments if a["child"] is not child]
 

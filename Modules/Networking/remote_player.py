@@ -153,6 +153,8 @@ class RemotePlayer:
         self._hat_applied = None
         self._shot_seen = None     # last shot counter value seen
         self._pending_shots = 0
+        self._pending_tracers = []  # end points of shots to draw a tracer for
+        self.on_tracer = None       # callback(start, end), set by NetworkManager
         self._voice_position = glm.vec3(0.0)  # where this player's shots sound from
         self._color_wanted = None  # fur color from the latest packet (None = the rat's own)
         self._color_applied = None
@@ -182,6 +184,13 @@ class RemotePlayer:
         shots = int(state.get("f", 0))
         if self._shot_seen is not None and shots > self._shot_seen:
             self._pending_shots = min(self._pending_shots + shots - self._shot_seen, 3)
+            # The packet carries the end points of their last few shots; the
+            # newest ones are the shots just fired.
+            ends = state.get("e") or []
+            fresh = min(shots - self._shot_seen, len(ends))
+            if fresh > 0:
+                self._pending_tracers.extend(ends[-fresh:])
+                del self._pending_tracers[:-3]
         self._shot_seen = shots
         if state.get("n"):
             self.name = str(state["n"])[:32]
@@ -225,6 +234,18 @@ class RemotePlayer:
             # From about chest height at where they're standing now.
             # From about chest height, following this player while it plays.
             self.weapon.play_fire_sound(self.scene, self._voice_position, follow=lambda: self._voice_position)
+        for end in self._pending_tracers:
+            if self.on_tracer is not None:
+                end = glm.vec3(*end)
+                aim = end - self._voice_position
+                if glm.length(aim) > 1e-3:
+                    # From the muzzle bone of the gun in their hand (or, if
+                    # it isn't posed yet, a little ahead of the chest).
+                    muzzle = self.weapon.muzzle_position(self.scene)
+                    if muzzle is None:
+                        muzzle = self._voice_position + glm.normalize(aim) * 0.6
+                    self.on_tracer(muzzle, end)
+        self._pending_tracers.clear()
         if self._hat_wanted != self._hat_applied:
             self._hat_applied = self._hat_wanted   # even if unknown - don't retry every frame
             self.model.set_hat(self._hat_wanted)

@@ -1,3 +1,4 @@
+import numpy as np
 import pygame
 import glm
 
@@ -19,8 +20,42 @@ class SoundManager:
     with the Camera as the listener.
     """
 
+    INVERSE_EXPONENT = 0.7
+    # (distance in metres up to which this applies, low-pass cutoff in Hz or
+    # None for the untouched sound), nearest first.
+    MUFFLE_TIERS = ((20.0, None), (40.0, 9000.0), (70.0, 6000.0), (110.0, 3500.0),
+                    (160.0, 2200.0), (float("inf"), 1400.0))
+
     def __init__(self):
         self.emitters = []
+        self._listener = None   # (position, right vector) from the last update()
+        self._muffled = {}      # (path, cutoff Hz) -> low-passed sample array
+
+    @classmethod
+    def _muffle_cutoff(cls, dist):
+        return next(cutoff for limit, cutoff in cls.MUFFLE_TIERS if dist <= limit)
+
+    def _load_sound(self, path, cutoff):
+        sound = pygame.mixer.Sound(path)
+        if cutoff is None:
+            return sound
+        key = (path, cutoff)
+        samples = self._muffled.get(key)
+        if samples is None:
+            samples = self._muffled[key] = self._lowpass(pygame.sndarray.array(sound), cutoff)
+        return pygame.sndarray.make_sound(samples)
+
+    @staticmethod
+    def _lowpass(samples, cutoff):
+        """Zero-phase low-pass of a (frames, channels) integer sample array:
+        a smooth 4th-order roll-off applied in the frequency domain."""
+        rate = pygame.mixer.get_init()[0]
+        spectrum = np.fft.rfft(samples.astype(np.float64), axis=0)
+        freqs = np.fft.rfftfreq(samples.shape[0], 1.0 / rate)
+        spectrum *= (1.0 / (1.0 + (freqs / cutoff) ** 4))[:, None]
+        out = np.fft.irfft(spectrum, n=samples.shape[0], axis=0)
+        info = np.iinfo(samples.dtype)
+        return np.clip(out, info.min, info.max).astype(samples.dtype)
 
     def add_sound(
         self,
@@ -33,8 +68,22 @@ class SoundManager:
         universal=False,
         follow=None,
         channel=None,
+        falloff="legacy",
+        muffle=False,
     ):
-        """loop=True starts it as a looping ambient sound immediately
+        """falloff="inverse" swaps the flat point-light-style curve for a
+        realistic-for-a-game one: full volume inside min_distance, then
+        amplitude (min_distance / distance) ** INVERSE_EXPONENT - roughly -4 dB
+        per doubling of distance - fading out over the last quarter of
+        max_distance.
+
+        muffle=True (a one-shot only) plays a low-passed copy of the sound
+        picked by how far away it starts (see MUFFLE_TIERS): air soaks up
+        the highs first, so a distant gunshot loses its crack and is left as a
+        dull thump. The mixer can't filter live, so each cutoff is rendered
+        once per file and cached.
+
+        loop=True starts it as a looping ambient sound immediately
         (e.g. a hum, a fire crackling); loop=False plays it once and
         the emitter is automatically dropped once it finishes.
 
@@ -61,7 +110,10 @@ class SoundManager:
             pygame.mixer.init()
             pygame.mixer.set_num_channels(32)
 
-        sound = pygame.mixer.Sound(sound_path)
+        cutoff = None
+        if muffle and not universal and self._listener is not None:
+            cutoff = self._muffle_cutoff(glm.length(glm.vec3(position) - self._listener[0]))
+        sound = self._load_sound(sound_path, cutoff)
         sound.set_volume(volume)
         if channel is not None:
             self.emitters = [e for e in self.emitters if e["channel"] is not channel]
@@ -82,20 +134,56 @@ class SoundManager:
             "loop": bool(loop),
             "universal": bool(universal),
             "follow": follow,
+            "falloff": falloff,
         }
+        # Attenuate NOW, from where the listener was at the last update(): a
+        # new sound otherwise plays at full volume, dead centre, until the next
+        # update() runs - for a gunshot that's its loudest moment (the attack)
+        # coming out un-attenuated, e.g. a far-away player's shot arriving over
+        # the network after this frame's update() had already run.
+        if channel is not None and self._listener is not None:
+            self._apply(emitter, *self._listener)
         self.emitters.append(emitter)
         return emitter
 
+    @staticmethod
+    def _apply(emitter, listener_pos, right_vec):
+        """Sets the emitter's channel volume (distance falloff + L/R pan)."""
+        if emitter["follow"] is not None:
+            emitter["position"] = glm.vec3(emitter["follow"]())
+
+        if emitter["universal"]:
+            # No distance attenuation or panning - flat volume in
+            # both ears regardless of listener position/facing.
+            left_volume = right_volume = emitter["volume"]
+        else:
+            to_emitter = emitter["position"] - listener_pos
+            dist = glm.length(to_emitter)
+            direction = to_emitter / max(dist, 0.0001)
+
+            radius = max(emitter["max_distance"], 0.01)
+            effective_dist = max(dist, emitter["min_distance"])
+            if emitter["falloff"] == "inverse":
+                atten = (emitter["min_distance"] / effective_dist) ** SoundManager.INVERSE_EXPONENT
+                atten *= max(0.0, min(1.0, (radius - dist) / (0.25 * radius)))
+            else:
+                falloff = max(0.0, min(1.0, 1.0 - (effective_dist / radius) ** 4))
+                atten = falloff * falloff
+
+            pan = max(-1.0, min(1.0, glm.dot(direction, right_vec)))
+            base_volume = emitter["volume"] * atten
+            left_volume = base_volume * (1.0 - max(0.0, pan))
+            right_volume = base_volume * (1.0 + min(0.0, pan))
+
+        emitter["channel"].set_volume(left_volume, right_volume)
+
     def update(self, camera):
         """Call once per frame, passing the Camera as the listener."""
-        # print(
-        #     f"[SoundManager] update() called, {len(self.emitters)} emitter(s)"
-        # )  # TEMP DEBUG
+        right_vec = glm.normalize(glm.cross(camera.front, camera.up))
+        listener_pos = glm.vec3(camera.position)
+        self._listener = (listener_pos, right_vec)
         if not self.emitters:
             return
-
-        right_vec = glm.normalize(glm.cross(camera.front, camera.up))
-        listener_pos = camera.position
 
         still_active = []
         for emitter in self.emitters:
@@ -108,35 +196,7 @@ class SoundManager:
                 # it afterward would affect that different sound).
                 continue
 
-            if emitter["follow"] is not None:
-                emitter["position"] = glm.vec3(emitter["follow"]())
-
-            if emitter["universal"]:
-                # No distance attenuation or panning - flat volume in
-                # both ears regardless of listener position/facing.
-                left_volume = right_volume = emitter["volume"]
-            else:
-                to_emitter = emitter["position"] - listener_pos
-                dist = glm.length(to_emitter)
-                direction = to_emitter / max(dist, 0.0001)
-
-                radius = max(emitter["max_distance"], 0.01)
-                effective_dist = max(dist, emitter["min_distance"])
-                falloff = max(0.0, min(1.0, 1.0 - (effective_dist / radius) ** 4))
-                atten = falloff * falloff
-
-                pan = max(-1.0, min(1.0, glm.dot(direction, right_vec)))
-                base_volume = emitter["volume"] * atten
-                left_volume = base_volume * (1.0 - max(0.0, pan))
-                right_volume = base_volume * (1.0 + min(0.0, pan))
-
-            # print(
-            #     f"[SoundManager] dist={dist:.2f} atten={atten:.3f} L={left_volume:.3f} R={right_volume:.3f}"
-            # )  # TEMP DEBUG - remove once confirmed working
-
-            channel.set_volume(left_volume, right_volume)
-            readback = channel.get_volume()
-            # print(f"[SoundManager] readback after set_volume: {readback}")  # TEMP DEBUG
+            self._apply(emitter, listener_pos, right_vec)
             still_active.append(emitter)
 
         self.emitters = still_active

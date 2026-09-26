@@ -64,8 +64,13 @@ class NetworkManager:
         self.local_hat = None   # short hat name from the main menu, or None
         self.local_color = None  # (r, g, b) 0-1 fur color from the main menu, or None
         self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
+        self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
+        self.on_tracer = None   # callback(start, end) to draw another player's tracer
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
         self.local_name = ""    # our Steam persona name, sent in every packet
+        self.local_steam_id = 0
+        self._avatars = {}        # steam id -> 64x64 RGBA bytes, once Steam has them
+        self._avatar_tried = {}   # steam id -> last time we asked
         self._jump_count = 0
         self._last_sent_state = None
         self._last_send_time = 0.0
@@ -151,6 +156,7 @@ class NetworkManager:
             if now - self._last_prune_time >= 1.0:
                 self._last_prune_time = now
                 self._prune_remote_players()
+                self._refresh_names()
 
     def _schedule(self, delay_seconds, func):
         """Replaces taskMgr.doMethodLater - runs func() once, after at
@@ -356,11 +362,16 @@ class NetworkManager:
     # TRANSFORM SYNC
     # =============================================================
 
-    def notify_shot(self):
+    def notify_shot(self, end_point=None):
         """Call when the local player fires. Sent as a running counter in the
         movement packets (so a lost packet can't drop a shot) - other players
-        play the gunshot at our position when it goes up."""
+        play the gunshot at our position when it goes up. end_point: where the
+        bullet ended (its hit point, or the end of its range) - the last few
+        travel in the packets too, so other players can draw the tracer."""
         self._shot_count += 1
+        if end_point is not None:
+            self._recent_shot_ends.append([round(end_point.x, 1), round(end_point.y, 1), round(end_point.z, 1)])
+            del self._recent_shot_ends[:-3]
 
     def send_damage(self, victim_id, amount, weapon_name=""):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
@@ -413,6 +424,7 @@ class NetworkManager:
             "h": self.local_hat or "",
             "k": encode_color(self.local_color),
             "f": self._shot_count,
+            "e": self._recent_shot_ends,
             "n": self.local_name,
         }
 
@@ -442,6 +454,41 @@ class NetworkManager:
             return self.client.friend_name(steam_id)
         except Exception:
             return ""
+
+    def _refresh_names(self):
+        """Steam loads persona names lazily (non-friends most of all), so a
+        name that was empty when first asked for is asked for again here -
+        ours (sent in every packet) and any remote player's still-blank one."""
+        if not self.local_name:
+            try:
+                self.local_name = self.client.own_name()
+            except Exception:
+                pass
+            if not self.local_name:
+                self.local_name = self._friend_name(self.local_steam_id)
+            if self.local_name:
+                print(f"Your Steam name: {self.local_name}")
+        for steam_id, remote in self.remote_players.items():
+            if not remote.name:
+                remote.name = self._friend_name(steam_id)
+
+    def avatar_rgba(self, steam_id):
+        """64x64 RGBA bytes of a player's Steam profile picture, or None while
+        Steam is still fetching it (or the py_steam_net build predates
+        friend_avatar). Cached once found; misses retry at most once a second."""
+        if steam_id in self._avatars:
+            return self._avatars[steam_id]
+        now = time.perf_counter()
+        if now - self._avatar_tried.get(steam_id, -1.0) < 1.0:
+            return None
+        self._avatar_tried[steam_id] = now
+        try:
+            data = self.client.friend_avatar(steam_id)
+        except Exception:
+            return None
+        if data:
+            self._avatars[steam_id] = data
+        return data or None
 
     def _relay_ready(self):
         """Steam's relay network takes several seconds after launch to become
@@ -581,6 +628,8 @@ class NetworkManager:
                 print(f"\n--> Discovered peer in lobby: {sender_id}")
                 self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
                 self.remote_players[sender_id].name = self._friend_name(sender_id)
+                self.remote_players[sender_id].on_tracer = (
+                    lambda start, end: self.on_tracer(start, end) if self.on_tracer else None)
             self.remote_players[sender_id].receive_state(state)
         except Exception as e:
             print(f"Error parsing incoming packet from {sender_id}: {e}")

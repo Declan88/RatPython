@@ -112,7 +112,9 @@ from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
 from Modules.UI import Anchor, Crosshair, ProgressBar
+from Modules.Graphics.tracers import Tracers
 from Modules.UI.nametags import NameTags
+from Modules.UI.scoreboard import Scoreboard
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
@@ -508,7 +510,8 @@ def main():
     # H takes 10 damage, J heals 10 (see on_key_down); nothing else reads or
     # writes `health` yet. Hidden on the main menu, shown once a map starts.
     name_tags = NameTags(ui)
-    health = {"value": 100.0, "max": 100.0}
+    scoreboard = Scoreboard(ui)
+    health ={"value": 100.0, "max": 100.0}
     health_bar = ProgressBar(
         value=health["value"], max_value=health["max"], label_format="{value:.0f} / {max:.0f}",
         anchor=Anchor.BOTTOM_LEFT, offset=(130, -49), size=(300, 26), visible=False,
@@ -535,6 +538,8 @@ def main():
     in_menu = True
     pending_start = None
     net_mgr = NetworkManager(camera, None)
+    tracers = Tracers(window.ctx)
+    net_mgr.on_tracer = tracers.add
     # Another player's shot hit us: the shooter decided that, we apply it.
     net_mgr.on_damage = lambda amount, attacker_id, weapon_name: change_health(-amount)
     from Modules.Scenes import scene_base as _scene_base
@@ -704,7 +709,15 @@ def main():
                     follow=lambda: camera.position,
                 )
                 if shot is not None:
-                    net_mgr.notify_shot()
+                    end = (shot.hit.position if shot.hit is not None
+                           else camera.position + shot.direction * weapon.max_range)
+                    net_mgr.notify_shot(glm.vec3(end))
+                    # From the gun's muzzle bone to where the trace ended.
+                    muzzle = weapon.muzzle_position(current_scene)
+                    if muzzle is None:   # no gun model posed yet: from just off the eye
+                        right = glm.normalize(glm.cross(camera.front, camera.up))
+                        muzzle = camera.position + camera.front * 0.6 + right * 0.14 - camera.up * 0.12
+                    tracers.add(muzzle, end)
                     if shot.victim in net_mgr.remote_players:
                         net_mgr.send_damage(shot.victim, shot.damage, weapon.name)
 
@@ -772,14 +785,19 @@ def main():
 
         net_mgr.update()
         name_tags.update(net_mgr.remote_players, camera, window.ctx.screen.size)
+        scoreboard.visible = bool(keys[pygame.K_TAB])
+        if scoreboard.visible:
+            scoreboard.update(net_mgr)
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
         current_scene.render(camera, None)
+        tracers.render(camera)
         ui.render()
         if paper_doll is not None:
             paper_doll.render(window.ctx.screen.size)
         window.flip()
 
+    tracers.destroy()
     ui.destroy()
     window.quit()
     sys.exit()

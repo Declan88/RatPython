@@ -398,6 +398,22 @@ impl PySteamClient {
         }
     }
 
+    /// A user's Steam profile picture as 64x64 RGBA bytes (16384 of them), or
+    /// None until Steam has it - it asks Steam to fetch it (works for
+    /// non-friends in the same lobby too), so callers just ask again later.
+    pub fn friend_avatar<'py>(&self, py: Python<'py>, steam_id: u64) -> Option<Bound<'py, PyBytes>> {
+        let (client, _) = self.client.as_ref()?;
+        let friends = client.friends();
+        let id = SteamId::from_raw(steam_id);
+        if friends.request_user_information(id, false) {
+            return None;
+        }
+        friends
+            .get_friend(id)
+            .medium_avatar()
+            .map(|rgba| PyBytes::new(py, &rgba))
+    }
+
     pub fn own_steam_id(&self) -> u64 {
         if let Some((client, _)) = &self.client {
             client.user().steam_id().raw()

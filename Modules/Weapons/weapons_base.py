@@ -112,10 +112,11 @@ class WeaponsBase:
     # ---- gunfire sound -------------------------------------------------
     fire_sound = "Assets/Audio/Guns/USP/usp_unsil-1.wav"
     fire_volume = 1.0
-    # SoundManager's falloff is flat-ish out to about half of max_distance and
-    # then drops steeply to silence at max_distance: a gunshot is loud enough
-    # to be clearly heard across a whole map (~100m) but not through it, and
-    # full volume for anyone standing within a few metres.
+    # Realistic-for-a-game falloff (SoundManager's "inverse" curve): full
+    # volume within a few metres, then about -4 dB per doubling of distance,
+    # fading to silence over the last quarter of max_distance - and shots that
+    # start far away play a low-passed copy (muffle), so they sound like
+    # distant gunfire rather than just a quieter close one.
     fire_min_distance = 5.0
     fire_max_distance = 160.0
     fire_interval = 0.0       # minimum seconds between shots (0 = as fast as the owner fires)
@@ -166,6 +167,11 @@ class WeaponsBase:
     worldmodel_position = (0.07, 0.0, 0.02)
     worldmodel_rotation = (-90.0, 0.0, -90.0)
     worldmodel_scale = 1.0
+    # The bones bullets (tracers) come out of. The world model has a real muzzle
+    # bone; the first-person gun doesn't (Source keeps that as an attachment, not
+    # a bone), so it uses the bone at the front of the barrel instead.
+    worldmodel_muzzle_bone = "ValveBiped.flash"
+    viewmodel_muzzle_bone = "v_weapon.USP_Silencer"
 
     # ---- animations (state -> .glb, or None for the model's own clip) ----
     # One set for both parts: the arms and the gun share an armature (the gun
@@ -251,6 +257,18 @@ class WeaponsBase:
         self.recoil.kick()
         return Shot(hit, self.damage, aim, spread)
 
+    def muzzle_position(self, scene):
+        """Where this weapon's bullets come out, in the world: the first-person
+        gun's muzzle bone while that's what the owner is looking at, otherwise
+        the world model's (in the character's hand). None if neither is
+        attached/posed yet."""
+        gun = self._viewmodel.gun if self._viewmodel is not None else None
+        if gun is not None and gun.get("viewmodel_visible") and self.viewmodel_muzzle_bone:
+            return scene.joint_world_position(gun, self.viewmodel_muzzle_bone)
+        if self.worldmodel_obj is not None and self.worldmodel_muzzle_bone:
+            return scene.joint_world_position(self.worldmodel_obj, self.worldmodel_muzzle_bone)
+        return None
+
     def play_fire_sound(self, scene, position, follow=None):
         """The gunshot alone, with no rate limit - for replaying a shot some
         other player fired (their own weapon already rate-limited it)."""
@@ -264,6 +282,7 @@ class WeaponsBase:
             self.fire_sound, glm.vec3(position), volume=self.fire_volume,
             min_distance=self.fire_min_distance, max_distance=self.fire_max_distance,
             loop=False, follow=follow, channel=self._fire_channel,
+            falloff="inverse", muffle=True,
         )
         self._fire_channel = emitter["channel"]
         return emitter

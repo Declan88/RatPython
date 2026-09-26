@@ -312,8 +312,14 @@ class Image(Widget):
         super().__init__(**kw)
         self.path = path
         self.tint = tint
+        self._surface = None
         self._tex = None
         self._natural = (0, 0)
+
+    def set_rgba(self, size, data):
+        """Show raw RGBA bytes (top row first) instead of a file."""
+        self._surface = pygame.image.frombuffer(data, size, "RGBA").convert_alpha()
+        self._release_resources()
 
     def measure(self, parent_w, parent_h):
         if self.size == (0, 0) and self.size_frac == (0, 0):
@@ -322,8 +328,13 @@ class Image(Widget):
         return super().measure(parent_w, parent_h)
 
     def _load(self):
-        if self._tex is None and self.path and self.manager is not None:
-            surf = pygame.image.load(self.path).convert_alpha()
+        if self._tex is None and self.manager is not None:
+            if self._surface is not None:
+                surf = self._surface
+            elif self.path:
+                surf = pygame.image.load(self.path).convert_alpha()
+            else:
+                return
             self._tex = self.manager.renderer.texture_from_surface(surf)
             self._natural = surf.get_size()
 
