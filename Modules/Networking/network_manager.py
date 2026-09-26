@@ -66,6 +66,7 @@ class NetworkManager:
         self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
         self._death_count = 0   # times the local player has died (a counter too)
         self.local_alive = True
+        self.profiler = None    # Modules/Debug FrameProfiler, when the game wants network timings
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
         self.on_death = None    # callback(feet_position, velocity, fur colour) when another player dies (bursts into gibs)
         self.on_tracer = None   # callback(start, end, follow) to draw another player's tracer and muzzle flash
@@ -137,13 +138,22 @@ class NetworkManager:
         if self.client:
             self.client.run_callbacks()
 
+    @property
+    def is_host(self):
+        """Whether this player owns the lobby (the first member)."""
+        return bool(self._member_order) and self._member_order[0] == self.local_steam_id
+
     def update(self):
         if not self.client:
             return
+        prof = self.profiler if self.profiler is not None and self.profiler.enabled else None
+        t = time.perf_counter() if prof else 0.0
         self.client.run_callbacks()
         self._run_deferred()
         if self.current_lobby_id:
             self._send_hellos(time.perf_counter())
+        if prof:
+            t2 = time.perf_counter(); prof.add("  net: callbacks+hellos", t2 - t); t = t2
         if self.in_game:
             # handle_data only ever runs from here: py_steam_net hands over
             # incoming packets when (and only when) they're polled for. Nothing
@@ -151,15 +161,23 @@ class NetworkManager:
             # positions were never read, so their models never appeared.
             self.client.receive_messages(0, self.RECEIVE_BATCH)
             now = time.perf_counter()
+            if prof:
+                prof.add("  net: receive+parse", now - t)
             dt = now - self._last_update_time if self._last_update_time else 0.0
             self._last_update_time = now
             self._broadcast_transform(now)
+            if prof:
+                t2 = time.perf_counter(); prof.add("  net: send state", t2 - now); t = t2
             for remote in self.remote_players.values():
                 remote.update(dt)
+            if prof:
+                t2 = time.perf_counter(); prof.add("  net: remote players", t2 - t); t = t2
             if now - self._last_prune_time >= 1.0:
                 self._last_prune_time = now
                 self._prune_remote_players()
                 self._refresh_names()
+                if prof:
+                    prof.add("  net: prune+names (1/s)", time.perf_counter() - t)
 
     def _schedule(self, delay_seconds, func):
         """Replaces taskMgr.doMethodLater - runs func() once, after at
@@ -581,6 +599,9 @@ class NetworkManager:
                     # RELIABLE, so every position update waited behind the
                     # last one.)
                     self.client.send_message_to(member_id, 1, 0, payload)
+                    if self.profiler is not None:
+                        self.profiler.count("packets out")
+                        self.profiler.count("bytes out", len(payload))
         except Exception:
             pass
         self._last_sent_state = self._local_state
@@ -621,6 +642,9 @@ class NetworkManager:
         return steam_id in self._members
 
     def handle_data(self, sender_id, ch, msg_bytes):
+        if self.profiler is not None:
+            self.profiler.count("packets in")
+            self.profiler.count("bytes in", len(msg_bytes))
         if sender_id not in self._net_seen:
             self._net_seen.add(sender_id)
             t0 = self._net_log_t0.get(sender_id)

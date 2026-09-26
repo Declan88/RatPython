@@ -13,6 +13,7 @@ from Modules.Physics.physics_world import PhysicsWorld, CollisionGroup, to_physi
 from Modules.Graphics.pbr_shader import (
     create_program,
     bind_material,
+    bind_transform_only,
     bind_frame_uniforms,
     bind_point_lights,
     bind_probe_irradiance,
@@ -229,6 +230,9 @@ def _advance_upper_offset_blend(obj, dt):
 # unanswered for the whole load, the peer's connection attempt times out.
 LOAD_PUMP = None
 
+# See Scene.update: the shortest time between recomputations of a skeletal object's pose.
+POSE_UPDATE_INTERVAL = 1.0 / 120.0
+
 
 def _pump_load():
     if LOAD_PUMP is not None:
@@ -256,6 +260,7 @@ class Scene:
         self.skeletal_objects = []
         self.viewmodel_objects = []   # see add_viewmodel
         self.gibs = None              # Modules/Gore GibManager, made by the game when it wants one
+        self._light_cells = {}        # see _mover_lighting
         # Optional callable run just before the viewmodels are drawn, so it can
         # put something behind the first-person gun and arms (a muzzle flash).
         self.before_viewmodels = None
@@ -2488,6 +2493,32 @@ class Scene:
             aabbs, self.point_lights, self.physics.line_of_sight,
         )
 
+    _LIGHT_CELL_REFRESH = 0.1        # seconds a shared lighting sample is reused
+
+    _SKELETAL_LIGHT_CELL = 0.5      # metres: characters share a lighting sample within a cell
+
+    def _mover_lighting(self, obj, default_cell=None):
+        """(nearest point lights, probe irradiance) for a real-time-lit object. A small chaotic
+        mover (a gib: obj["light_cell"] = cell size in metres) shares one sample, refreshed a few
+        times a second, with everything else in the same cell - so a burst of six chunks costs one
+        lookup and one uniform bind instead of six of each; anything else is looked up fresh."""
+        position = obj["position"]
+        group = obj.get("light_group")
+        if group is not None:
+            key = ("group", group)      # everything in the group is lit by one sample (a death's gibs)
+        else:
+            cell = obj.get("light_cell", default_cell)
+            if not cell:
+                return (self._nearest_point_lights(position), self._sample_probe_irradiance(position))
+            key = (math.floor(position.x / cell), math.floor(position.y / cell), math.floor(position.z / cell))
+        entry = self._light_cells.get(key)
+        if entry is None or self._elapsed_time - entry[0] > self._LIGHT_CELL_REFRESH or self._elapsed_time < entry[0]:
+            entry = (self._elapsed_time, (self._nearest_point_lights(position), self._sample_probe_irradiance(position)))
+            self._light_cells[key] = entry
+            if len(self._light_cells) > 64:
+                self._light_cells = {key: entry}
+        return entry[1]
+
     def _sample_probe_irradiance(self, position):
         """The combined, unlimited-light-count diffuse point-light term
         for a real-time-lit object at world-space `position` - see
@@ -2915,6 +2946,12 @@ class Scene:
         and cheap enough given how few dynamic objects a scene actually
         has (nothing like the hundred-plus static objects a real level
         contains)."""
+        # An object that tracks its own bounds (aabb_world: ((min), (max)) tuples, e.g. a gib,
+        # whose manager updates it with its matrix once a frame) skips the numpy transform
+        # below, which costs more than the draw call it's guarding when repeated per pass.
+        explicit = obj.get("aabb_world")
+        if explicit is not None:
+            return explicit
         if not movable:
             cached = obj.get("_aabb_world")
             if cached is not None:
@@ -3017,6 +3054,15 @@ class Scene:
             skeleton = obj["skeleton"]
             upper_mask = obj.get("upper_joint_mask")
 
+            # The clocks below (clip time, locomotion phase, crossfade progress) advance every
+            # frame, but the pose itself - sampling every bone of every blended clip, the
+            # expensive part - is only recomputed POSE_UPDATE_INTERVAL apart. At the hundreds
+            # of fps this game can reach an animation only changes visibly a few times per
+            # 1/120 s; at or below 120 fps this always recomputes (nothing changes).
+            pose_age = obj.get("_pose_age", POSE_UPDATE_INTERVAL) + dt
+            skip_pose = pose_age < POSE_UPDATE_INTERVAL and obj.get("bone_matrices") is not None
+            obj["_pose_age"] = pose_age if skip_pose else 0.0
+
             # Transition-from-snapshot blend (see _begin_pose_snapshot): while
             # active, Skeleton._world_matrices fades from the captured pose to
             # whatever this frame computes, with a smoothstep ease.
@@ -3106,7 +3152,7 @@ class Scene:
             )
 
             if upper_mask is None:
-                if not weighted_lower:
+                if not weighted_lower or skip_pose:
                     continue
                 obj["bone_matrices"] = skeleton.compute_bone_matrices_multi(
                     weighted_lower,
@@ -3173,6 +3219,8 @@ class Scene:
 
             blended_offsets, offset_blend_weight = _advance_upper_offset_blend(obj, dt)
 
+            if skip_pose:
+                continue
             obj["bone_matrices"] = skeleton.compute_blended_bone_matrices_multi(
                 weighted_lower, weighted_upper, upper_mask,
                 lower_prev_animation=obj["prev_animation"], lower_prev_time=obj["prev_anim_time"],
@@ -3236,6 +3284,17 @@ class Scene:
         if _has_uniform(self.shadow_program, "u_base_alpha"):
             self.shadow_program["u_base_alpha"].value = float(obj.get("base_alpha", 1.0))
 
+    # A small caster (a gib, a player) only needs drawing into the cascades whose view-distance
+    # slice it could shadow something in - its own depth range plus how far its shadow can fall.
+    _CASCADE_REACH = 4.0      # metres either side of a small caster's own depth
+    _SKELETAL_SHADOW_RADIUS = 2.5
+
+    @staticmethod
+    def _in_cascade(center, radius, near_d, far_d, cam_pos, cam_forward):
+        depth = glm.dot(center - cam_pos, cam_forward)
+        reach = radius + Scene._CASCADE_REACH
+        return depth + reach >= near_d and depth - reach <= far_d
+
     def _render_shadows(self, camera):
         # Captured before _ensure_static_shadow_map (which sets its own
         # temporary viewport for its one-time bake pass and doesn't
@@ -3254,9 +3313,14 @@ class Scene:
         self.ctx.cull_face = "front"
 
         resolution = self.shadow_manager.resolution
+        cam_pos = glm.vec3(camera.position)
+        cam_forward = glm.normalize(glm.vec3(camera.front))
+        bounds = [self.shadow_manager.near, *self.shadow_manager.splits, self.shadow_manager.far]
         for cascade in range(self.shadow_manager.num_cascades):
             framebuffer = self.shadow_manager.framebuffers[cascade]
             light_vp = self.shadow_manager.light_mvps[cascade]
+            near_d, far_d = bounds[cascade], bounds[cascade + 1]
+            shadow_group = None        # material_group of the previous caster: skips re-binding its alpha state
 
             framebuffer.use()
             self.ctx.viewport = (0, 0, resolution, resolution)
@@ -3283,13 +3347,25 @@ class Scene:
             # movable_shadow_manager params are both fed this one
             # manager now instead.
             for obj in self.dynamic_objects:
+                if not obj.get("cast_shadow", True):
+                    continue
+                sphere = obj.get("shadow_sphere")     # (centre, radius) of a small mover
+                if sphere is not None and not self._in_cascade(sphere[0], sphere[1], near_d, far_d, cam_pos, cam_forward):
+                    continue
                 light_mvp = light_vp * self._get_model_matrix(obj)
                 self.shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
-                self._bind_shadow_alpha(obj)
+                group = obj.get("material_group")
+                if group is None or group != shadow_group:
+                    self._bind_shadow_alpha(obj)
+                shadow_group = group
                 obj["shadow_vao"].render()
 
             for obj in self.skeletal_objects:
                 if not obj.get("cast_shadow", True):
+                    continue
+                position = obj.get("position")
+                if position is not None and not self._in_cascade(
+                        glm.vec3(position), self._SKELETAL_SHADOW_RADIUS, near_d, far_d, cam_pos, cam_forward):
                     continue
                 light_mvp = light_vp * self._get_model_matrix(obj)
                 self.skeletal_shadow_program["u_light_mvp"].write(light_mvp.to_bytes())
@@ -3403,7 +3479,7 @@ class Scene:
             *((o, False) for o in self.static_objects),
             *((o, True) for o in self.dynamic_objects),
         ):
-            if obj.get("alpha_mode") == "BLEND":
+            if obj.get("alpha_mode") == "BLEND" or obj.get("ssr_depth") is False:
                 continue
             if not self._is_visible(obj, frustum_planes, movable=movable):
                 continue
@@ -3611,6 +3687,9 @@ class Scene:
             *((o, False) for o in self.static_objects),
             *((o, True) for o in self.dynamic_objects),
         )
+        last_group = None          # material_group of the previous object drawn (see below)
+        lights_bound_at = None     # where the lights/probe uniforms were last bound for
+        lights_bound = None        # ...and which (lights, probe) pair, for objects sharing a cell
         for obj, movable in tagged_objects:
             if not self._is_visible(obj, frustum_planes, movable=movable):
                 continue
@@ -3645,10 +3724,24 @@ class Scene:
             # docstring for why "nearest to THIS object" instead of
             # whatever the frame-level call left bound).
             if movable or not obj.get("lightmap_texture"):
-                bind_point_lights(self.pbr_program, self._nearest_point_lights(obj["position"]))
-                bind_probe_irradiance(self.pbr_program, self._sample_probe_irradiance(obj["position"]))
+                # (uniforms persist between draws: a second material of the same mover, at
+                # the same position, needs no rebind)
+                if lights_bound_at is None or obj["position"] != lights_bound_at:
+                    lit = self._mover_lighting(obj)
+                    if lit is not lights_bound:
+                        bind_point_lights(self.pbr_program, lit[0])
+                        bind_probe_irradiance(self.pbr_program, lit[1])
+                        lights_bound = lit
+                    lights_bound_at = obj["position"]
             model_matrix = self._get_model_matrix(obj)
-            bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
+            # Objects tagged with the same material_group (a burst of gibs) have identical
+            # textures and material buffers: after the first, only the transform changes.
+            group = obj.get("material_group")
+            if group is not None and group == last_group:
+                bind_transform_only(self.pbr_program, model_matrix, pbr_view_proj)
+            else:
+                bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
+            last_group = group
             obj["vao"].render()
 
         # Restored before the skeletal loop below - every skeletal object
@@ -3660,6 +3753,7 @@ class Scene:
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "back"
 
+        skeletal_lit = None
         for obj in self.skeletal_objects:
             if not obj.get("visible_in_color", True):
                 continue
@@ -3671,8 +3765,11 @@ class Scene:
             # conditional: every skeletal object needs its OWN nearest-
             # lights rebind, not whatever the frame-level call (or the
             # previous skeletal object's own rebind) left bound.
-            bind_point_lights(self.skeletal_program, self._nearest_point_lights(obj["position"]))
-            bind_probe_irradiance(self.skeletal_program, self._sample_probe_irradiance(obj["position"]))
+            lit = self._mover_lighting(obj, self._SKELETAL_LIGHT_CELL)
+            if lit is not skeletal_lit:
+                bind_point_lights(self.skeletal_program, lit[0])
+                bind_probe_irradiance(self.skeletal_program, lit[1])
+                skeletal_lit = lit
 
             # bind_material is fully generic on prog - reused as-is here
             # rather than duplicating a "bind_skeletal_material":

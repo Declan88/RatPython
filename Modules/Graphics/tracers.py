@@ -135,6 +135,7 @@ class Tracers:
         if not verts:
             return
 
+        self.buffer.orphan()
         self.buffer.write(np.array(verts, dtype="f4").tobytes())
         half = HALF_WIDTH * 2.0   # NDC spans 2 units over the screen height
         self.program["u_half_px"].value = (half, half)

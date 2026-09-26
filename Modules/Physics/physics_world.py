@@ -266,6 +266,19 @@ class PhysicsWorld:
         Fiedler's "Fix Your Timestep!")."""
         return self._accumulator / _PHYSICS_FIXED_TIMESTEP
 
+    def raycast_light(self, ax, ay, az, bx, by, bz, collision_mask=None):
+        """raycast() for callers that trace hundreds of times a frame (particles): plain floats in,
+        a plain (x, y, z, nx, ny, nz) tuple of render-space hit point and surface normal out (or
+        None) - no glm vectors, no RayHit, and the render->physics axis swap done inline."""
+        if collision_mask is None:
+            collision_mask = CollisionGroup.STATIC
+        result = self.world.rayTestClosest(Point3(ax, -az, ay), Point3(bx, -bz, by), collision_mask)
+        if not result.hasHit():
+            return None
+        p = result.getHitPos()
+        n = result.getHitNormal()
+        return (p.x, p.z, -p.y, n.x, n.z, -n.y)
+
     def line_of_sight(self, from_pos, to_pos, collision_mask=CollisionGroup.STATIC):
         """True if nothing in collision_mask (STATIC level geometry by
         default) sits between from_pos and to_pos, both render-space.
@@ -551,6 +564,11 @@ class PhysicsWorld:
         node.setLinearVelocity(to_physics_vec(glm.vec3(linear)))
         if angular is not None:
             node.setAngularVelocity(to_physics_vec(glm.vec3(angular)))
+
+    def get_body_pose(self, node_path):
+        """(position, rotation) of a body in render space - glm.vec3 and glm.quat - without
+        get_transform's euler-angle conversion (which a per-frame caller doesn't want)."""
+        return to_render_pos(node_path.getPos()), to_render_quat(node_path.getQuat())
 
     def get_body_quat(self, node_path):
         """The body's rotation as a render-space glm.quat."""

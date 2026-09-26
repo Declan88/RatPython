@@ -138,6 +138,7 @@ class UIRenderer:
                 x0, y0, 0.0, 1.0, *c,  x1, y0, 1.0, 1.0, *c,  x1, y1, 1.0, 0.0, *c,
                 x0, y0, 0.0, 1.0, *c,  x1, y1, 1.0, 0.0, *c,  x0, y1, 0.0, 0.0, *c,
             ))
+        self.vbo.orphan()     # a fresh buffer: writing the one the GPU may still be reading would stall
         self.vbo.write(np.asarray(verts, dtype="f4").tobytes())
 
         ctx = self.ctx

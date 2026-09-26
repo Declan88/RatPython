@@ -1588,6 +1588,13 @@ def bind_material(prog, item_data, model_matrix, view_proj):
     _bind_lightmap(prog, item_data)
 
 
+def bind_transform_only(prog, model_matrix, view_proj):
+    """bind_material's per-object part alone (u_mvp / u_model): for an object drawn right after one
+    with an identical material (same textures, same material buffer), which is already bound."""
+    _write_uniform(prog, "u_mvp", (view_proj * model_matrix).to_bytes())
+    _write_uniform(prog, "u_model", model_matrix.to_bytes())
+
+
 def bind_environment(prog, sky_color, ground_color):
     """Binds the hemisphere ambient uniforms - see Scene.
     environment_sky_color/environment_ground_color (set by

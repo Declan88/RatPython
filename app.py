@@ -111,12 +111,13 @@ from Modules.Window.window import WindowManager
 from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
-from Modules.UI import Anchor, Crosshair, Hitmarker, ProgressBar
+from Modules.UI import Anchor, Crosshair, Hitmarker, Label, ProgressBar
 from Modules.UI.death_screen import DeathScreen
 from Modules.Graphics.tracers import Tracers
 from Modules.Particles import ParticleManager
 from Modules.Particles.blood import register_blood
 from Modules.Gore import GibManager
+from Modules.Debug import FrameProfiler
 from Modules.Particles.impacts import IMPACT_FILE, MATERIAL_ALIASES, LIFETIME_SCALE, RADIUS_SCALE, keep_frame, spawn_impact
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
@@ -537,6 +538,9 @@ def main():
     crosshair = ui.root.add(Crosshair(visible=False))
     # Diagonal ticks over the crosshair when one of our shots hits another player.
     hitmarker = ui.root.add(Hitmarker())
+    # F9: a live breakdown of where each frame's time goes (see Modules/Debug/frame_profiler.py).
+    prof = FrameProfiler()
+    profile_label = ui.root.add(Label("", font_size=17, color=(255, 255, 170, 255), visible=False, offset=(14, 14)))
     hit_sound_channel = [None]   # every hit plays on the same channel, cutting off the last
 
     # Dying: health reaching 0 (from any source) flags `pending`; the main loop starts
@@ -576,6 +580,8 @@ def main():
     # Particles that collide (impact debris) trace against the level only.
     particles.raycast = lambda a, b: (
         current_scene.physics.raycast(a, b, CollisionGroup.STATIC) if current_scene is not None else None)
+    particles.raycast_fast = lambda ax, ay, az, bx, by, bz: (
+        current_scene.physics.raycast_light(ax, ay, az, bx, by, bz) if current_scene is not None else None)
 
     def remote_shot(start, end, follow=None):
         """Another player's shot: its tracer, a muzzle flash that stays on their gun, and
@@ -709,6 +715,10 @@ def main():
     def on_key_down(key):
         if in_menu:
             return
+        if key == pygame.K_F9:
+            prof.set_enabled(not prof.enabled)
+            profile_label.visible = prof.enabled
+            profile_label.text = ""
         if death["active"]:
             return
         toggle_third_person(key)
@@ -718,8 +728,14 @@ def main():
         elif key == pygame.K_j:
             change_health(10.0)
 
+    net_mgr.profiler = prof
+    prof.header = lambda: (
+        f"{'HOST' if net_mgr.is_host else 'CLIENT'}  other players: {len(net_mgr.remote_players)}  "
+        f"window {window.width}x{window.height}  vsync {window.vsync}")
+
     running = True
     while running:
+        prof.begin()
         running, dt = window.handle_events(
             camera, on_key_down=on_key_down, event_filter=count_click
         )
@@ -727,6 +743,7 @@ def main():
         if pending_start is not None:
             start_map, pending_start = pending_start, None
             start_game(start_map)
+        prof.mark("events")
 
         if in_menu:
             net_mgr.update()
@@ -792,6 +809,7 @@ def main():
         current_scene.update(dt)
         if current_scene.gibs is not None:
             current_scene.gibs.update(dt)     # before particles.update: the blood follows the gibs
+        prof.mark("input + scene.update")
         eye_position = player.get_position() + glm.vec3(
             0.0, player.get_eye_offset(), 0.0
         )
@@ -864,6 +882,8 @@ def main():
                             pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
                         hit_sound_channel[0] = hit_emitter["channel"]
 
+        prof.mark("camera + weapons")
+
         # get_position() is the hull CENTER, not feet - subtract half
         # the standing height (the same player_height passed to
         # CharacterController above, not a re-read of any private/
@@ -924,31 +944,44 @@ def main():
                 material, player.get_position(), volume=volume
             )
 
+        prof.mark("player model + state")
         current_scene.update_audio(camera)
+        prof.mark("audio")
 
         if death["active"]:
             death_screen.update()
             if death_screen.finished:
                 end_death()
 
+        prof.mark("death screen")
         net_mgr.update()
+        prof.mark("net_mgr.update")
         name_tags.update(net_mgr.remote_players, camera, window.ctx.screen.size)
         scoreboard.visible = bool(keys[pygame.K_TAB])
         if scoreboard.visible:
             scoreboard.update(net_mgr)
+        prof.mark("name tags")
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
         # First-person muzzle flashes (overlay effects) are drawn by the scene just
         # before the viewmodels, so the gun and arms sit in front of them.
         current_scene.before_viewmodels = lambda: particles.render(camera, overlay=True)
         current_scene.render(camera, None)
+        prof.mark("scene.render (CPU)")
         tracers.render(camera)
         particles.update(dt)
         particles.render(camera, overlay=False)
+        prof.mark("tracers + particles")
+        if prof.enabled:
+            profile_label.text = "\n".join(prof.lines)
         ui.render()
+        prof.mark("ui.render")
         if paper_doll is not None:
             paper_doll.render(window.ctx.screen.size)
+        prof.mark("paper doll")
         window.flip()
+        prof.mark("flip (GPU wait / vsync)")
+        prof.end_frame()
 
     particles.destroy()
     tracers.destroy()

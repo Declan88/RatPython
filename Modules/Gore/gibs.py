@@ -54,11 +54,12 @@ class _Part:
         self.center = center        # glm.vec3: chunk centre relative to the body's feet
         self.mass = mass
         self.size = size            # largest dimension, metres
+        self.radius = size * 0.5 * 1.15   # bounding sphere, for culling
         self.free = []              # pooled sets of object copies, ready to use
 
 
 class _Live:
-    __slots__ = ("part", "objects", "body", "age", "position", "effect")
+    __slots__ = ("part", "objects", "body", "age", "position", "alive")
 
     def __init__(self, part, objects, body):
         self.part = part
@@ -66,40 +67,54 @@ class _Live:
         self.body = body
         self.age = 0.0
         self.position = glm.vec3(0.0)
-        self.effect = None
+        self.alive = True
 
 
 def _split_model(path):
     """({chunk name: [trimesh geometries recentred on the chunk]}, {name: centre}).
-    The glb keeps every chunk in one pose, each as one mesh per material."""
+    The glb keeps every chunk in one pose, each as one mesh per material.
+
+    Vertex normals are carried through by hand (rotated with each node's transform, flipped for a
+    mirrored copy) and set explicitly: trimesh would otherwise recompute them on export - through
+    scipy, which isn't installed, so it logged a traceback per mesh before falling back."""
     scene = trimesh.load(path)
     groups = {}
     for node in scene.graph.nodes_geometry:
         transform, geometry_name = scene.graph[node]
-        geometry = scene.geometry[geometry_name].copy()
+        source = scene.geometry[geometry_name]
+        normals = np.asarray(source.vertex_normals, dtype="f8")      # as stored in the file
+        geometry = source.copy()
         geometry.apply_transform(transform)
+        rotation = np.asarray(transform, dtype="f8")[:3, :3]
+        rotated = normals @ np.linalg.inv(rotation)                  # (R^-1)^T applied to row vectors
+        rotated /= np.maximum(np.linalg.norm(rotated, axis=1, keepdims=True), 1e-12)
         name = re.sub(r"_[0-9a-f]{6}$", "", node)     # trimesh suffixes duplicate node names
-        groups.setdefault(name, []).append(geometry)
+        groups.setdefault(name, []).append((geometry, rotated))
+    result = {}
     centers = {}
-    for name, geometries in groups.items():
+    for name, entries in groups.items():
+        geometries = [g for g, _ in entries]
         low = np.min([g.bounds[0] for g in geometries], axis=0)
         high = np.max([g.bounds[1] for g in geometries], axis=0)
         # A chunk modelled as one HALF of the body (a mesh whose edge sits exactly on the
         # x = 0 mirror plane - the torso was exported without its mirror modifier applied)
         # is completed by mirroring it, so it isn't an open shell.
         if abs(high[0]) < 1e-4 or abs(low[0]) < 1e-4:
-            for g in list(geometries):
-                mirrored = g.copy()
+            for geometry, normals in list(entries):
+                mirrored = geometry.copy()
                 mirrored.vertices = mirrored.vertices * np.array([-1.0, 1.0, 1.0])
                 mirrored.invert()      # mirroring flips the winding: turn the faces back out
-                geometries.append(mirrored)
+                entries.append((mirrored, normals * np.array([-1.0, 1.0, 1.0])))
+            geometries = [g for g, _ in entries]
             low = np.min([g.bounds[0] for g in geometries], axis=0)
             high = np.max([g.bounds[1] for g in geometries], axis=0)
         center = (low + high) / 2.0
-        for g in geometries:
-            g.apply_translation(-center)
+        for geometry, normals in entries:
+            geometry.apply_translation(-center)
+            geometry.vertex_normals = normals      # last: transforms/invert above rewrite them
+        result[name] = geometries
         centers[name] = center
-    return groups, centers
+    return result, centers
 
 
 class GibManager:
@@ -109,6 +124,7 @@ class GibManager:
         self.parts = []
         self.live = []
         self._tint_mask = None
+        self._deaths = 0
         self._fur_overrides = {"specular_strength": 0}   # what the player rat's shading sets (see app.py)
         self._build(model_path)
         # The fur takes the player's colour through the same mask texture the rat uses
@@ -119,6 +135,10 @@ class GibManager:
                 if obj.get("material_name") == FUR_MATERIAL:
                     obj["tint_mask_texture"] = self._tint_mask
                     obj.update(self._fur_overrides)
+                else:
+                    obj["cast_shadow"] = False     # the small flesh cut faces add nothing to a shadow
+                obj["ssr_depth"] = False           # nor are tumbling chunks worth reflecting
+                obj["light_cell"] = 2.0            # lit from a lookup shared with the chunks around it
 
     def match_material(self, source_obj):
         """Makes the fur match another object's shading - the player's skeletal object:
@@ -138,9 +158,13 @@ class GibManager:
         draw objects, rebuilding a material buffer only when the colour actually changed."""
         new = None if tint is None else tuple(float(c) for c in tint)
         for obj in objects:
-            if obj.get("material_name") == FUR_MATERIAL and obj.get("tint_color") != new:
-                obj["tint_color"] = new
-                invalidate_material_ubo(obj)
+            if obj.get("material_name") == FUR_MATERIAL:
+                if obj.get("tint_color") != new:
+                    obj["tint_color"] = new
+                    invalidate_material_ubo(obj)
+                obj["material_group"] = ("gib fur", new)      # same textures + material buffer
+            else:
+                obj["material_group"] = ("gib flesh",)
 
     # ---- one-time setup ----
 
@@ -177,6 +201,9 @@ class GibManager:
         physics = self.scene.physics
         centre_of_mass = feet + glm.vec3(0.0, 0.8, 0.0)
 
+        group = []      # this death's gibs (their wounds share one blood effect)
+        self._deaths += 1
+        light_group = ("death", self._deaths)
         for part in self.parts:
             if len(self.live) >= MAX_LIVE_GIBS:
                 self._retire(self.live[0])
@@ -204,14 +231,25 @@ class GibManager:
             self._dress(objects, tint)
             live = _Live(part, objects, body)
             live.position = glm.vec3(position)
-            for obj in objects:
-                self._place(obj, position, rotation, 1.0)
-                self.scene.add_prop_object(obj)
-            # Blood spurts from the wound and trails behind the chunk as it flies.
-            live.effect = self.particles.spawn(
-                "gore_blood_spurt", position, follow=lambda live=live: live.position,
-                follow_particles=False, inherit_velocity=0.6)
+            self._place(objects, part.radius, position, rotation, 1.0)
             self.live.append(live)
+            group.append(live)
+
+        # Added to the scene fur first, then flesh, so objects sharing a material draw one after
+        # another (the renderer skips re-binding textures and material buffers between them).
+        drawn = [obj for live in group for obj in live.objects]
+        drawn.sort(key=lambda o: o.get("material_name") != FUR_MATERIAL)
+        for obj in drawn:
+            obj["light_group"] = light_group      # one lighting sample for the whole burst
+            self.scene.add_prop_object(obj)
+
+        # Blood spurts from every wound and trails behind the chunks as they fly: one effect
+        # for the whole death, emitting from each gib's current position.
+        def wounds(group=group):
+            return [(g.position.x, g.position.y, g.position.z) for g in group if g.alive] or None
+        self.particles.spawn(
+            "gore_blood_spurt", centre_of_mass, anchors=wounds, follow_particles=False,
+            inherit_velocity=0.6)
 
         self.particles.spawn("gore_blood_burst", centre_of_mass)
         self.particles.spawn("gore_blood_cloud", centre_of_mass)
@@ -221,12 +259,20 @@ class GibManager:
                 loop=False, falloff="inverse", muffle=True)
 
     @staticmethod
-    def _place(obj, position, rotation, scale):
+    def _place(objects, radius, position, rotation, scale):
+        """Moves a gib's draw objects: one matrix (and one bounding sphere / box, for culling)
+        shared by all of them."""
         matrix = glm.translate(glm.mat4(1.0), position) * glm.mat4_cast(rotation)
         if scale != 1.0:
             matrix = matrix * glm.scale(glm.mat4(1.0), glm.vec3(scale))
-        obj["transform"] = matrix
-        obj["position"] = position
+        r = radius * scale
+        aabb = ((position.x - r, position.y - r, position.z - r), (position.x + r, position.y + r, position.z + r))
+        sphere = (position, r)
+        for obj in objects:
+            obj["transform"] = matrix
+            obj["position"] = position
+            obj["aabb_world"] = aabb
+            obj["shadow_sphere"] = sphere
 
     # ---- per frame ----
 
@@ -242,23 +288,19 @@ class GibManager:
             if live.age >= LIFETIME:
                 expired.append(live)
                 continue
-            position, _ = physics.get_transform(live.body)
-            rotation = physics.get_body_quat(live.body)
+            position, rotation = physics.get_body_pose(live.body)
             live.position = position
             remaining = LIFETIME - live.age
             scale = 1.0
             if remaining < SHRINK_TIME:
                 t = remaining / SHRINK_TIME
                 scale = t * t * (3.0 - 2.0 * t)
-            for obj in live.objects:
-                self._place(obj, position, rotation, scale)
+            self._place(live.objects, live.part.radius, position, rotation, scale)
         for live in expired:
             self._retire(live)
 
     def _retire(self, live):
-        if live.effect is not None:
-            live.effect.stop()
-            live.effect.follow = None
+        live.alive = False
         self.scene.physics.remove_body(live.body)
         for obj in live.objects:
             self.scene.remove_prop_object(obj)

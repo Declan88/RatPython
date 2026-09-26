@@ -30,7 +30,8 @@ def _emit_spurt(fx, params, state, t, dt):
         return
     envelope = (1.0 - t / duration) ** float(params.get("decay", 1.5))
     beat = max(0.0, math.sin(2.0 * math.pi * float(params.get("beat_hz", 3.0)) * t)) ** 2
-    state["emitted"] += float(params.get("peak_rate", 100.0)) * envelope * (0.12 + 0.88 * beat) * dt
+    sources = len(fx.anchor_points) if fx.anchor_points is not None else 1     # per-anchor rate
+    state["emitted"] += float(params.get("peak_rate", 100.0)) * sources * envelope * (0.12 + 0.88 * beat) * dt
     whole = int(state["emitted"])
     state["emitted"] -= whole
     fx.emit(whole)
@@ -43,7 +44,7 @@ def _fn(name, **params):
 def _streaks(name, count, speed, life, length, radius, gravity=-700.0, emitter=None):
     return ParticleSystemDef(
         name,
-        {"max_particles": count if emitter is None else 500, "material": _STREAK_MATERIAL, "radius": 1.0,
+        {"max_particles": count if emitter is None else 1200, "material": _STREAK_MATERIAL, "radius": 1.0,
          "color": (255, 255, 255, 255)},
         emitters=[emitter or _fn("emit_instantaneously", num_to_emit=count)],
         initializers=[

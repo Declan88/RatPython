@@ -63,6 +63,9 @@ _SOURCE_TO_WORLD = np.array([[1.0, 0.0, 0.0],
 _IMAGE_EXTENSIONS = (".png", ".tga", ".jpg", ".jpeg", ".bmp")
 _FLOATS_PER_PARTICLE = 14    # position 3, radius 1, rotation 1, rgba 4, velocity 3, trail length 1, sheet cell 1
 MAX_TOTAL_PARTICLES = 16384
+_TRACE_LIFT = 0.05        # metres a collision trace starts above the particle
+_TRACE_BACKUP = 0.03      # metres a collision trace starts behind the particle (see _constraint_collision)
+SIM_RATE = 240.0          # highest rate particles are simulated at (see ParticleManager.update)
 _MAX_EFFECT_PARTICLES = 4096
 
 _VERT = """
@@ -131,7 +134,7 @@ def _material_key(name):
 
 
 def _clamp01(x):
-    return np.clip(x, 0.0, 1.0)
+    return np.minimum(np.maximum(x, 0.0), 1.0)      # (much cheaper than np.clip on small arrays)
 
 
 def _rand(rng, low, high, count, exponent=1.0):
@@ -170,6 +173,12 @@ class Effect:
         self.follow_particles = options.get("follow_particles", True)
         self.inherit_velocity = float(options.get("inherit_velocity", 0.0))
         self.anchor_velocity = np.zeros(3, "f4")
+        # anchors=callable -> (N, 3) positions of several things the effect emits from at once
+        # (five gibs' wounds): one effect instead of N, so one update and one draw batch.
+        self.anchors = options.get("anchors")
+        self.anchor_points = None
+        self.anchor_velocities = None
+        self._previous_points = None
         self.offset_scale = offset_scale   # scales Position Modify Offset (0 keeps it on the origin)
         self.time = 0.0
         self.stopped = False         # no more emission (running particles finish)
@@ -191,9 +200,16 @@ class Effect:
         self.sequence = np.zeros(cap, "f4")       # sprite sheet sequence
         self.trail_time = np.full(cap, 0.1, "f4")  # seconds of velocity a trail sprite stretches over
         self.created = np.zeros(cap, "f4")        # effect time at spawn
+        self.frozen = np.zeros(cap, "?")          # came to rest on a surface: no more movement or traces
+        self._packed = np.zeros((cap, _FLOATS_PER_PARTICLE), "f4")   # instance rows, see write_instances
+        self._tick = 0                            # bumped whenever the simulation steps
+        self._packed_tick = -1
+        self.has_frozen = False
+        self._max_dt = float(definition.params.get("maximum time step", 0.1)) or 0.1
+        self._cache = {}                          # per-operator values that never change (gravity...)
         self._arrays = (self.pos, self.vel, self.age, self.life, self.radius, self.radius0,
                         self.rotation, self.rotation_speed, self.color, self.alpha, self.alpha0,
-                        self.seed, self.sequence, self.trail_time, self.created)
+                        self.seed, self.sequence, self.trail_time, self.created, self.frozen)
         self.local_time = 0.0
         renderer = definition.renderers[0] if definition.renderers else None
         self.renderer = renderer.name if renderer is not None else "render_animated_sprites"
@@ -238,6 +254,21 @@ class Effect:
         return self.count == 0 and self.time >= self.delay and (
             self.stopped or all(state["done"] for state in self._emit_state))
 
+    def _update_anchors(self, dt):
+        points = self.anchors() if self.anchors is not None else None
+        if points is None or len(points) == 0:
+            self.anchors = None
+            self.anchor_points = None
+            return
+        points = np.asarray(points, "f4")
+        previous = self._previous_points
+        if previous is not None and len(previous) == len(points) and dt > 1e-6:
+            self.anchor_velocities = (points - previous) / dt
+        else:
+            self.anchor_velocities = np.zeros_like(points)
+        self._previous_points = points
+        self.anchor_points = points
+
     def _follow_anchor(self, dt):
         """Moves the effect (origin and every live particle) by however far
         its anchor has moved since last frame, so it stays attached to it.
@@ -267,8 +298,13 @@ class Effect:
         p = self.definition.params
         n0, n1 = self.count, self.count + amount
         sl = slice(n0, n1)
-        self.pos[sl] = self.origin
-        self.vel[sl] = self.anchor_velocity * self.inherit_velocity
+        if self.anchor_points is not None:
+            which = self.rng.integers(0, len(self.anchor_points), amount)
+            self.pos[sl] = self.anchor_points[which]
+            self.vel[sl] = self.anchor_velocities[which] * self.inherit_velocity
+        else:
+            self.pos[sl] = self.origin
+            self.vel[sl] = self.anchor_velocity * self.inherit_velocity
         self.age[sl] = 0.0
         self.life[sl] = 1.0
         self.radius[sl] = float(p.get("radius", 5.0)) * self.scale * self.radius_scale
@@ -278,6 +314,7 @@ class Effect:
         self.color[sl] = (r / 255.0, g / 255.0, b / 255.0)
         self.alpha0[sl] = a / 255.0
         self.seed[sl] = self.rng.random((amount, 4), dtype="f4")
+        self.frozen[sl] = False
         self.sequence[sl] = 0.0
         self.trail_time[sl] = 0.1
         self.created[sl] = self.local_time
@@ -289,13 +326,15 @@ class Effect:
         self.count = n1
 
     def update(self, dt):
-        dt = min(dt, float(self.definition.params.get("maximum time step", 0.1)) or dt)
+        dt = min(dt, self._max_dt)
         self.time += dt
         if self.time < self.delay:
             return
         local_time = self.time - self.delay
         self.local_time = local_time
         self._follow_anchor(dt)
+        if self.anchors is not None:
+            self._update_anchors(dt)
         if not self._children_spawned:
             self._children_spawned = True
             for child, child_delay in self._children:
@@ -313,7 +352,7 @@ class Effect:
         self.age[sl] += dt
         self.rotation[sl] += self.rotation_speed[sl] * dt
         self.alpha[sl] = self.alpha0[sl]      # alpha operators multiply it down from the spawn value
-        collide = self._constraints and self.manager.raycast is not None
+        collide = self._constraints and (self.manager.raycast_fast is not None or self.manager.raycast is not None)
         if collide:
             before = self.pos[sl].copy()
         for fn, impl in self._operators:
@@ -322,6 +361,7 @@ class Effect:
         if collide:
             for fn in self._constraints:
                 _CONSTRAINTS[fn.name](self, fn.params, before, n)
+        self._tick += 1
         alive = self.age[sl] < self.life[sl]
         if not alive.all():
             keep = np.nonzero(alive)[0]
@@ -332,7 +372,14 @@ class Effect:
 
     def write_instances(self, out, n, material):
         """Fills `out` (n, _FLOATS_PER_PARTICLE) float32 with the first n
-        particles; `material` gives the sprite sheet layout."""
+        particles; `material` gives the sprite sheet layout. The packed rows only change when
+        the simulation steps, so at frame rates above SIM_RATE most calls are a single copy."""
+        if self._packed_tick != self._tick:
+            self._pack(self._packed[:n], n, material)
+            self._packed_tick = self._tick
+        out[:] = self._packed[:n]
+
+    def _pack(self, out, n, material):
         out[:, 0:3] = self.pos[:n]
         out[:, 3] = self.radius[:n]
         out[:, 4] = np.radians(self.rotation[:n])
@@ -521,12 +568,19 @@ def _init_nothing(fx, p, sl, k):
 
 
 def _op_movement_basic(fx, p, sl, n, dt):
-    gravity = fx.world(p.get("gravity", (0, 0, 0)))
-    drag = float(p.get("drag", 0.0))
+    key = id(p)
+    cached = fx._cache.get(key)
+    if cached is None:
+        gravity = fx.world(p.get("gravity", (0, 0, 0)))
+        cached = fx._cache[key] = (gravity, float(p.get("drag", 0.0)), bool(gravity.any()))
+    gravity, drag, has_gravity = cached
     vel = fx.vel[sl]
-    vel += gravity * dt
+    if has_gravity:
+        vel += gravity * dt
     if drag:
         vel *= max(0.0, 1.0 - drag * dt * 30.0)   # Source applies drag per 1/30 s tick
+    if fx.has_frozen:
+        vel[fx.frozen[sl]] = 0.0                   # a particle that's come to rest stays put
     fx.pos[sl] += vel * dt
 
 
@@ -556,7 +610,9 @@ def _op_radius_scale(fx, p, sl, n, dt):
 
 def _op_alpha_fade_out_random(fx, p, sl, n, dt):
     low, high = float(p.get("fade out time min", 0.0)), float(p.get("fade out time max", 0.0))
-    fade = np.maximum(low + (high - low) * fx.seed[sl, 0] ** float(p.get("fade out time exponent", 1.0)), 1e-4)
+    exponent = float(p.get("fade out time exponent", 1.0))
+    seed = fx.seed[sl, 0]
+    fade = np.maximum(low + (high - low) * (seed if exponent == 1.0 else seed ** exponent), 1e-4)
     if p.get("proportional 0/1", True):
         remaining = 1.0 - fx.age[sl] / fx.life[sl]
     else:
@@ -579,22 +635,30 @@ def _oscillation(fx, p, sl, dt, rate_low, rate_high):
     """Per-particle sine wave amounts for this frame: (delta of the sine
     since last frame) * rate, so an oscillated field never drifts. The rate
     and frequency are picked per particle between the file's min and max."""
+    vector = isinstance(rate_low, np.ndarray)
     seed = fx.seed[sl]
-    freq = (np.asarray(p.get("oscillation frequency min", 1.0), "f4")
-            + (np.asarray(p.get("oscillation frequency max", 1.0), "f4")
-               - np.asarray(p.get("oscillation frequency min", 1.0), "f4")) * (seed[:, 1:2] if np.ndim(rate_low) else seed[:, 1]))
+    if vector:
+        s0, s1 = seed[:, 0:1], seed[:, 1:2]
+    else:
+        s0, s1 = seed[:, 0], seed[:, 1]
+    fmin = np.asarray(p.get("oscillation frequency min", 1.0), "f4")
+    fmax = np.asarray(p.get("oscillation frequency max", 1.0), "f4")
+    freq = fmin + (fmax - fmin) * s1
     phase = float(p.get("oscillation start phase", 0.0))
     age = fx.age[sl]
-    life = fx.life[sl]
-    t_frac = age / life
-    now = age[:, None] if np.ndim(rate_low) else age
-    before = now - dt
-    delta = np.sin(2.0 * np.pi * (freq * now + phase)) - np.sin(2.0 * np.pi * (freq * before + phase))
-    rate = rate_low + (rate_high - rate_low) * (seed[:, 0:1] if np.ndim(rate_low) else seed[:, 0])
+    now = age[:, None] if vector else age
+    # sin(a) - sin(b) with a = 2pi(f*t + phase), b = a - 2pi*f*dt: one product of a sine and a cosine
+    half = np.pi * freq * dt
+    delta = 2.0 * np.sin(half) * np.cos(2.0 * np.pi * (freq * now + phase) - half)
+    rate = rate_low + (rate_high - rate_low) * s0
     start = float(p.get("start time min", 0.0))
     end = float(p.get("end time max", 1.0))
-    window = (t_frac >= start) & (t_frac <= end) if p.get("start/end proportional", True) else (age >= start) & (age <= end)
-    return delta * rate * (window[:, None] if np.ndim(rate_low) else window)
+    proportional = p.get("start/end proportional", True)
+    if proportional and start <= 0.0 and end >= 1.0:
+        return delta * rate            # the whole life: no window to apply (almost always)
+    clock = age / fx.life[sl] if proportional else age
+    window = (clock >= start) & (clock <= end)
+    return delta * rate * (window[:, None] if vector else window)
 
 
 def _op_oscillate_scalar(fx, p, sl, n, dt):
@@ -625,31 +689,55 @@ def _constraint_collision(fx, p, before, n):
     """Keeps particles out of the world: a trace from each one's last position to
     its new one; on a hit it's put on the surface and its velocity is turned
     into a bounce/slide along it."""
-    raycast = fx.manager.raycast
+    manager = fx.manager
+    fast = manager.raycast_fast
+    slow = manager.raycast
     bounce = float(p.get("amount of bounce", 0.0))
     slide = float(p.get("amount of slide", 0.0))
     radius = fx.radius
-    for i in range(n):
+    pos = fx.pos
+    vel = fx.vel
+    frozen = fx.frozen
+    move = pos[:n] - before[:n]
+    dist2 = np.einsum("ij,ij->i", move, move)
+    # Only particles that actually moved, and haven't come to rest: a resting fleck would
+    # otherwise be traced every tick for the whole of its multi-second life.
+    for i in np.nonzero((dist2 > 1e-12) & ~frozen[:n])[0].tolist():
         a = before[i]
-        b = fx.pos[i]
-        move = b - a
-        dist = float(np.linalg.norm(move))
-        if dist < 1e-6:
-            continue
+        b = pos[i]
         # Look a little past the new position so a particle resting on a floor is
         # still "touching" it, and stay a hair off the surface.
-        direction = move / dist
-        reach = min(float(radius[i]) * 0.1, 0.05)
-        hit = raycast(glm.vec3(*a), glm.vec3(*(b + direction * reach)))
-        if hit is None:
-            continue
-        normal = np.array((hit.normal.x, hit.normal.y, hit.normal.z), "f4")
-        fx.pos[i] = np.array((hit.position.x, hit.position.y, hit.position.z), "f4") + normal * 0.003
-        v = fx.vel[i]
+        dist = float(dist2[i]) ** 0.5
+        reach = min(float(radius[i]) * 0.1, 0.05) / dist
+        end = b + move[i] * reach
+        # Start the trace a little BEHIND where the particle was: a ray that begins within
+        # the physics engine's contact margin of a surface reports no hit, so a slow particle
+        # sinking through a floor a few millimetres at a time would never be caught.
+        a = a - move[i] * (_TRACE_BACKUP / dist)
+        a[1] += _TRACE_LIFT       # ...and above it: shallow, grazing traces are the ones the engine misses
+        if fast is not None:
+            hit = fast(a[0], a[1], a[2], end[0], end[1], end[2])
+            if hit is None:
+                continue
+            point = (hit[0], hit[1], hit[2])
+            normal = np.array(hit[3:6], "f4")
+        else:
+            h = slow(glm.vec3(*a), glm.vec3(*end))
+            if h is None:
+                continue
+            point = (h.position.x, h.position.y, h.position.z)
+            normal = np.array((h.normal.x, h.normal.y, h.normal.z), "f4")
+        pos[i] = np.array(point, "f4") + normal * 0.003
+        v = vel[i]
         along = float(v @ normal)
         if along < 0.0:
             tangent = v - along * normal
-            fx.vel[i] = tangent * (1.0 - slide) - along * bounce * normal
+            v = vel[i] = tangent * (1.0 - slide) - along * bounce * normal
+            # Slid to a stop on something facing up: it's landed - freeze it.
+            if normal[1] > 0.7 and float(v @ v) < 0.0225:
+                frozen[i] = True
+                fx.has_frozen = True
+                vel[i] = 0.0
 
 
 _CONSTRAINTS = {"Collision via traces": _constraint_collision}
@@ -808,6 +896,10 @@ class ParticleManager:
         self._fallback = None
         # callable(from_vec3, to_vec3) -> RayHit or None, for particle collision.
         self.raycast = None
+        # Optional faster form: callable(ax, ay, az, bx, by, bz) -> (x, y, z, nx, ny, nz) or None
+        # (see PhysicsWorld.raycast_light); used instead of `raycast` when set.
+        self.raycast_fast = None
+        self._pending_dt = 0.0
 
     # ---- loading ----
 
@@ -1026,6 +1118,14 @@ class ParticleManager:
     def update(self, dt):
         if not self.effects:
             return
+        # Simulation runs at most SIM_RATE times a second: above that (this game reaches
+        # hundreds of fps) frames just accumulate their time and step once, with the sum. A
+        # particle moving at a fraction of a millimetre per tick looks identical, and the
+        # simulation - the expensive part - costs a fraction as much.
+        self._pending_dt += dt
+        if self._pending_dt < 1.0 / SIM_RATE:
+            return
+        dt, self._pending_dt = self._pending_dt, 0.0
         for effect in self.effects:
             effect.update(dt)
         self.effects = [e for e in self.effects if not e.finished]
@@ -1080,6 +1180,7 @@ class ParticleManager:
             batch = self._scratch[start:filled]
             if not material.additive:      # blended sprites: far ones first
                 batch = batch[np.argsort(-((batch[:, 0:3] - cam_pos) @ front_np))]
+            self._instances.orphan()      # (see UIRenderer.draw: never write a buffer still in flight)
             self._instances.write(np.ascontiguousarray(batch).tobytes())
             if material.additive:
                 ctx.blend_func = moderngl.ONE, moderngl.ONE
