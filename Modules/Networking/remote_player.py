@@ -32,6 +32,8 @@ _MAX_SNAPSHOTS = 40
 # A peer that goes quiet for this long is treated as standing still rather
 # than freezing mid-stride in whatever locomotion pose its last packet had.
 _STALE_SECONDS = 1.0
+# How often a remote player's animation-state logic runs (see RemotePlayer.update).
+_MODEL_INTERVAL = 1.0 / 100.0
 
 _DEFAULT_MODEL_PATH = "Assets/Models/rat.glb"
 # Blend-state table: (name, clip, min_speed), min_speed in m/s, same
@@ -171,6 +173,9 @@ class RemotePlayer:
         # bursts into gibs, see on_death), and while the flag stays down their model and
         # hitbox are gone.
         self.dead = False
+        self._model_debt = 0.0
+        self._model_never_run = True
+        self._hitbox_key = None
         self.on_death = None        # callback(feet_position, velocity, fur colour), set by NetworkManager
         self._death_seen = None
         self._pending_death = False
@@ -242,15 +247,24 @@ class RemotePlayer:
         s = self._state
         stale = now - self._last_packet > _STALE_SECONDS
         move = s.get("d", (0.0, 0.0))
-        self.model.update(
-            dt, feet_pos, yaw, 0.0 if stale else float(s.get("v", 0.0)),
-            is_crouched=bool(s.get("c", False)),
-            is_grounded=bool(s.get("g", True)),
-            is_sprinting=bool(s.get("s", False)),
-            move_direction=None if stale else glm.vec3(move[0], 0.0, move[1]),
-            just_jumped=self._pending_jump,
-        )
-        self._pending_jump = False
+        # The body follows the interpolated position every frame, but the animation-state logic
+        # (blend weights, facing ease, jump/crouch poses) only runs about 100 times a second, with the
+        # time that passed since it last did - at hundreds of fps that's most of a player's cost.
+        self._model_debt += dt
+        if self._model_debt + 0.5 * dt >= _MODEL_INTERVAL or self._model_never_run:
+            self._model_never_run = False
+            self.model.update(
+                self._model_debt, feet_pos, yaw, 0.0 if stale else float(s.get("v", 0.0)),
+                is_crouched=bool(s.get("c", False)),
+                is_grounded=bool(s.get("g", True)),
+                is_sprinting=bool(s.get("s", False)),
+                move_direction=None if stale else glm.vec3(move[0], 0.0, move[1]),
+                just_jumped=self._pending_jump,
+            )
+            self._model_debt = 0.0
+            self._pending_jump = False
+        else:
+            self.model.move_to(feet_pos)
         if self._pending_death:
             self._pending_death = False
             self._set_dead(True)
@@ -291,13 +305,17 @@ class RemotePlayer:
         # Hitbox centered vertically on the body (feet to eye), not at
         # floor level, and follows facing so a future directional query
         # (e.g. a cone/box in front of the shooter) lines up.
-        # (Parked far below the map while they're dead so shots pass through.)
-        self.scene.physics.update_hitbox(
-            self._hitbox,
-            glm.vec3(0.0, -1000.0, 0.0) if self.dead else feet_pos + glm.vec3(0.0, _BODY_HEIGHT / 2.0, 0.0),
-            glm.vec3(0.0, glm.radians(yaw), 0.0),
-        )
-        self._update_head_hitbox(feet_pos, yaw)
+        # (Parked far below the map while they're dead so shots pass through.) Only touched when
+        # they've actually moved or turned: a player standing still costs no physics writes.
+        key = (round(feet_pos.x, 3), round(feet_pos.y, 3), round(feet_pos.z, 3), round(yaw, 1), self.dead)
+        if key != self._hitbox_key:
+            self._hitbox_key = key
+            self.scene.physics.update_hitbox(
+                self._hitbox,
+                glm.vec3(0.0, -1000.0, 0.0) if self.dead else feet_pos + glm.vec3(0.0, _BODY_HEIGHT / 2.0, 0.0),
+                glm.vec3(0.0, glm.radians(yaw), 0.0),
+            )
+            self._update_head_hitbox(feet_pos, yaw)
 
     def _update_head_hitbox(self, feet_pos, yaw):
         """Puts the head box on the rat's head, turned the way the model is (the model's local +z

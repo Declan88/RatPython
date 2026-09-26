@@ -386,6 +386,9 @@ def _as_blend_space(spec, directional_clips):
     return _LocomotionBlendSpace(spec, directional_clips)
 
 
+PLAYER_CULL_BOX = (1.4, 0.4, 2.6)
+
+
 class PlayerModel:
     def __init__(self, scene, model_path, position=None, forward_offset_degrees=0.0,
                  feet_offset=0.0, visible_in_color=True, cast_shadow=True,
@@ -712,6 +715,12 @@ class PlayerModel:
             upper_rotation_offset_degrees=upper_rotation_offset_degrees,
             time_scale=time_scale,
         )
+        if self.obj is not None:
+            # Not drawn (or lit, or skinned for the colour pass) while a character is provably out
+            # of the camera's view: half width, metres below and above the feet - see
+            # Scene._skeletal_culled. Generous: arms out, a hat, a jump.
+            self.obj["frustum_cull"] = PLAYER_CULL_BOX
+            self.obj["max_shadow_distance"] = 60.0    # a shadow that far away isn't worth a draw
         # add_skeletal returns None on load failure (bad path, wrong
         # format, etc - see its own docstring) - every other method
         # below no-ops in that case rather than raising, so a missing/
@@ -859,6 +868,15 @@ class PlayerModel:
             return True
         self._no_input_elapsed += dt
         return self._no_input_elapsed < _NO_INPUT_CONFIRM_SECONDS
+
+    def move_to(self, position):
+        """Just moves the body to `position` (feet) without running the animation-state logic - for
+        the frames between update() calls of a remote player (see RemotePlayer.update)."""
+        if self.obj is None:
+            return
+        feet_pos = glm.vec3(position)
+        feet_pos.y += self._feet_offset
+        self.obj["position"] = feet_pos
 
     def update(self, dt, position, yaw_degrees, speed, is_crouched=False, is_grounded=True,
                is_sprinting=None, move_direction=None, just_jumped=False):

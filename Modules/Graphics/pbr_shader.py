@@ -1709,6 +1709,37 @@ def bind_point_lights(prog, point_lights):
         )
 
 
+def pack_lighting(point_lights, irradiance):
+    """The uniform data bind_point_lights + bind_probe_irradiance would write, prepared once (raw
+    bytes for the light arrays) so binding it again - the same lighting shared by many objects,
+    for a fraction of a second - costs a few uniform writes and no Python list building."""
+    lights = point_lights[:MAX_POINT_LIGHTS]
+    positions, colors, radii = [], [], []
+    for light in lights:
+        positions.extend(light["position"])
+        colors.extend(c * light["intensity"] for c in light["color"])
+        radii.append(light["radius"])
+
+    def padded(values, length):
+        return np.array(values + [0.0] * (length - len(values)), dtype=np.float32).tobytes()
+
+    return (len(lights), padded(positions, MAX_POINT_LIGHTS * 3), padded(colors, MAX_POINT_LIGHTS * 3),
+            padded(radii, MAX_POINT_LIGHTS), tuple(float(c) for c in irradiance))
+
+
+def bind_packed_lighting(prog, packed):
+    """Binds what pack_lighting prepared."""
+    count, positions, colors, radii, irradiance = packed
+    _write_uniform(prog, "u_num_point_lights", count)
+    if _has_uniform(prog, "u_point_light_pos"):
+        prog["u_point_light_pos"].write(positions)
+    if _has_uniform(prog, "u_point_light_color"):
+        prog["u_point_light_color"].write(colors)
+    if _has_uniform(prog, "u_point_light_radius"):
+        prog["u_point_light_radius"].write(radii)
+    _write_uniform(prog, "u_probe_irradiance", irradiance)
+
+
 def bind_probe_irradiance(prog, irradiance):
     """u_probe_irradiance - see that uniform's own comment. Call once
     PER OBJECT (not once per frame - this genuinely varies with world

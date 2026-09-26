@@ -10,10 +10,13 @@ import numpy as np
 from Modules.Audio.sound_manager import SoundManager
 from Modules.Audio.footstep_materials import get_footstep_sound
 from Modules.Physics.physics_world import PhysicsWorld, CollisionGroup, to_physics_vec
+from Modules.Graphics import pose_batch
 from Modules.Graphics.pbr_shader import (
     create_program,
     bind_material,
     bind_transform_only,
+    pack_lighting,
+    bind_packed_lighting,
     bind_frame_uniforms,
     bind_point_lights,
     bind_probe_irradiance,
@@ -232,6 +235,7 @@ LOAD_PUMP = None
 
 # See Scene.update: the shortest time between recomputations of a skeletal object's pose.
 POSE_UPDATE_INTERVAL = 1.0 / 120.0
+_POSE_INTERVALS = (POSE_UPDATE_INTERVAL, 1.0 / 100.0, 1.0 / 60.0, 1.0 / 30.0)   # every rate update() uses
 
 
 def _pump_load():
@@ -261,6 +265,8 @@ class Scene:
         self.viewmodel_objects = []   # see add_viewmodel
         self.gibs = None              # Modules/Gore GibManager, made by the game when it wants one
         self._light_cells = {}        # see _mover_lighting
+        self._pose_clocks = {}        # see update(): one clock per skeletal update rate
+        self._model_cache = None      # see _get_model_matrix: id(obj) -> matrix, only during render()
         # Optional callable run just before the viewmodels are drawn, so it can
         # put something behind the first-person gun and arms (a muzzle flash).
         self.before_viewmodels = None
@@ -1306,9 +1312,15 @@ class Scene:
             bones = parent.get("bone_matrices")
             if not bones:
                 continue
-            world = bones[att["joint"]] * att["bind_world"]
-            frame = glm.translate(glm.mat4(1.0), glm.vec3(world[3])) * glm.mat4(_extract_rotation(world))
-            child["transform"] = self._get_model_matrix(parent) * frame * att["local"]
+            # The joint's frame (a decompose - not cheap) only changes when the parent's pose does.
+            frame_local = att.get("_frame_local") if att.get("_bones") is bones else None
+            if frame_local is None:
+                world = bones[att["joint"]] * att["bind_world"]
+                frame = glm.translate(glm.mat4(1.0), glm.vec3(world[3])) * glm.mat4(_extract_rotation(world))
+                frame_local = frame * att["local"]
+                att["_frame_local"] = frame_local
+                att["_bones"] = bones
+            child["transform"] = self._get_model_matrix(parent) * frame_local
             child["position"] = parent["position"]
             child["visible_in_color"] = parent.get("visible_in_color", True)
 
@@ -2495,7 +2507,10 @@ class Scene:
 
     _LIGHT_CELL_REFRESH = 0.1        # seconds a shared lighting sample is reused
 
-    _SKELETAL_LIGHT_CELL = 0.5      # metres: characters share a lighting sample within a cell
+    _SKELETAL_LIGHT_CELL = 1.5      # metres: characters share a lighting sample within a cell
+    _NEAR_CHARACTER = 6.0           # metres: inside this a character animates at full rate
+    _FAR_CHARACTER = 15.0           # metres: past this a character gets cheaper everything
+    _SSR_CHARACTER_DISTANCE = 10.0  # ...and stops being drawn into the reflection depth pass
 
     def _mover_lighting(self, obj, default_cell=None):
         """(nearest point lights, probe irradiance) for a real-time-lit object. A small chaotic
@@ -2509,11 +2524,13 @@ class Scene:
         else:
             cell = obj.get("light_cell", default_cell)
             if not cell:
-                return (self._nearest_point_lights(position), self._sample_probe_irradiance(position))
+                return (self._nearest_point_lights(position), self._sample_probe_irradiance(position), None)
             key = (math.floor(position.x / cell), math.floor(position.y / cell), math.floor(position.z / cell))
         entry = self._light_cells.get(key)
         if entry is None or self._elapsed_time - entry[0] > self._LIGHT_CELL_REFRESH or self._elapsed_time < entry[0]:
-            entry = (self._elapsed_time, (self._nearest_point_lights(position), self._sample_probe_irradiance(position)))
+            lights = self._nearest_point_lights(position)
+            probe = self._sample_probe_irradiance(position)
+            entry = (self._elapsed_time, (lights, probe, pack_lighting(lights, probe)))
             self._light_cells[key] = entry
             if len(self._light_cells) > 64:
                 self._light_cells = {key: entry}
@@ -2881,8 +2898,20 @@ class Scene:
         if cached is not None:
             return cached
 
+        # While a frame is being rendered nothing moves: an object's matrix (asked for by the
+        # shadow cascades, the colour pass, the reflection depth pass and attachments) is built
+        # once. Outside a render (a muzzle position asked for mid-update) it's always fresh.
+        frame_cache = self._model_cache
+        if frame_cache is not None:
+            hit = frame_cache.get(id(obj))
+            if hit is not None:
+                return hit
+
         if "transform" in obj:
-            return glm.mat4(obj["transform"])
+            model = glm.mat4(obj["transform"])
+            if frame_cache is not None:
+                frame_cache[id(obj)] = model
+            return model
 
         model = glm.mat4(1.0)
         model = glm.translate(model, obj["position"])
@@ -2894,6 +2923,8 @@ class Scene:
 
         model = glm.scale(model, obj["scale"])
 
+        if frame_cache is not None:
+            frame_cache[id(obj)] = model
         return model
 
     @staticmethod
@@ -2986,6 +3017,32 @@ class Scene:
             obj["_aabb_world"] = aabb
         return aabb
 
+    @staticmethod
+    def _skeletal_signature(obj):
+        """Everything that makes two skeletal objects' bound material identical (see the grouped
+        draw in _render_scene)."""
+        emissive = obj.get("emissive")
+        return (
+            id(obj.get("texture")), id(obj.get("normal_texture")), id(obj.get("metallic_roughness_texture")),
+            id(obj.get("tint_mask_texture")), obj.get("tint_color"), obj.get("specular_strength"),
+            obj.get("metallic"), obj.get("roughness"), tuple(emissive) if emissive is not None else None,
+            obj.get("normal_scale"), obj.get("alpha_mode"), obj.get("base_alpha"), obj.get("double_sided"),
+        )
+
+    @staticmethod
+    def _skeletal_culled(obj, frustum_planes):
+        """True if a skeletal object that opted in (obj["frustum_cull"] = (half width, below, above),
+        metres around its position - a character) is provably outside the camera's frustum.
+        Skeletal objects have no mesh bounds of their own, so without this a player behind the
+        camera was drawn (skinned, lit, textured) for nothing."""
+        box = obj.get("frustum_cull")
+        if box is None:
+            return False
+        p = obj["position"]
+        half, below, above = box
+        return aabb_outside_frustum(
+            (p.x - half, p.y - below, p.z - half), (p.x + half, p.y + above, p.z + half), frustum_planes)
+
     def _is_visible(self, obj, frustum_planes, movable=False):
         """True unless obj's world AABB is PROVABLY entirely outside
         the given frustum (see frustum.py's own docstring) - an object
@@ -3048,6 +3105,16 @@ class Scene:
             if rot_speed != 0.0 and "rotation" in obj:
                 obj["rotation"].y += rot_speed * dt
 
+        pose_requests = []      # characters whose pose is computed together, after this loop
+        # One clock per skeletal update rate: everything on a rate ticks on the same frames, so the
+        # characters due are posed together as one batch (see pose_batch.py). (+ half a frame:
+        # whichever frame lands nearest the interval ticks, so a 144 fps display still updates every
+        # frame instead of every other one.)
+        pose_due = {}
+        for rate in _POSE_INTERVALS:
+            age = self._pose_clocks.get(rate, rate) + dt
+            pose_due[rate] = age + 0.5 * dt >= rate
+            self._pose_clocks[rate] = 0.0 if pose_due[rate] else age
         for obj in self.skeletal_objects:
             if obj.get("viewmodel") and not obj.get("viewmodel_visible"):
                 continue   # hidden first-person arms: no need to animate
@@ -3059,16 +3126,32 @@ class Scene:
             # expensive part - is only recomputed POSE_UPDATE_INTERVAL apart. At the hundreds
             # of fps this game can reach an animation only changes visibly a few times per
             # 1/120 s; at or below 120 fps this always recomputes (nothing changes).
-            pose_age = obj.get("_pose_age", POSE_UPDATE_INTERVAL) + dt
-            skip_pose = pose_age < POSE_UPDATE_INTERVAL and obj.get("bone_matrices") is not None
-            obj["_pose_age"] = pose_age if skip_pose else 0.0
+            interval = POSE_UPDATE_INTERVAL
+            view_dist = obj.get("_view_dist")
+            if view_dist is not None:
+                # A far or off-screen character's limbs can update less often: its body still
+                # moves every frame, only the pose (the expensive sampling) is coarser.
+                if obj.get("_culled") or view_dist > self._FAR_CHARACTER * 2.0:
+                    interval = _POSE_INTERVALS[3]       # 30 Hz
+                elif view_dist > self._NEAR_CHARACTER:
+                    interval = _POSE_INTERVALS[2]       # 60 Hz
+                else:
+                    interval = _POSE_INTERVALS[1]       # 100 Hz
+            skip_pose = not pose_due[interval] and obj.get("bone_matrices") is not None
+            if skip_pose and view_dist is not None and obj.get("pose_snap") is None:
+                # A character between its pose ticks does no per-frame animation bookkeeping at all:
+                # the time is carried over and applied in one step when its tick comes (every clock
+                # in here advances linearly, so the result is the same).
+                obj["_dt_debt"] = obj.get("_dt_debt", 0.0) + dt
+                continue
+            step = dt + obj.pop("_dt_debt", 0.0)
 
             # Transition-from-snapshot blend (see _begin_pose_snapshot): while
             # active, Skeleton._world_matrices fades from the captured pose to
             # whatever this frame computes, with a smoothstep ease.
             snap = obj.get("pose_snap")
             if snap is not None:
-                obj["pose_snap_elapsed"] += dt
+                obj["pose_snap_elapsed"] += step
                 w = min(1.0, obj["pose_snap_elapsed"] / obj["pose_snap_duration"])
                 if w >= 1.0:
                     obj["pose_snap"] = None
@@ -3103,7 +3186,7 @@ class Scene:
                 dominant_name, dominant_weight = max(lower_weights, key=lambda nw: nw[1], default=(None, 0.0))
                 dominant_clip = skeleton.animations.get(dominant_name) if dominant_name is not None else None
 
-                # Advances locomotion_phase (0..1, wrapped) by dt divided
+                # Advances locomotion_phase (0..1, wrapped) by step divided
                 # by the DOMINANT clip's own duration, then samples every
                 # candidate clip at that SAME phase fraction of ITS OWN
                 # duration - see add_skeletal's own locomotion_phase
@@ -3113,7 +3196,7 @@ class Scene:
                 # unrelated points in their stride, producing an
                 # incoherent pose.
                 if dominant_clip is not None and dominant_clip.duration > 0.0:
-                    obj["locomotion_phase"] = (obj["locomotion_phase"] + dt / dominant_clip.duration) % 1.0
+                    obj["locomotion_phase"] = (obj["locomotion_phase"] + step / dominant_clip.duration) % 1.0
                 phase = obj["locomotion_phase"]
                 weighted_lower = [
                     (name, phase * skeleton.animations[name].duration, weight)
@@ -3134,7 +3217,7 @@ class Scene:
                         if dominant_clip is not None and dominant_clip.duration > 0.0 else 0.0
                     )
             else:
-                _advance_clip_time(skeleton, obj, dt)
+                _advance_clip_time(skeleton, obj, step)
                 weighted_lower = [] if obj["animation"] is None else [(obj["animation"], obj["anim_time"], 1.0)]
 
             # Crossfade progress (see set_skeletal_animation/
@@ -3145,7 +3228,7 @@ class Scene:
             # anim_blend_elapsed catches up to anim_blend_duration, or
             # immediately if that duration is 0 (the old instant-cut
             # behavior, still available on request).
-            obj["anim_blend_elapsed"] = min(obj["anim_blend_elapsed"] + dt, obj["anim_blend_duration"])
+            obj["anim_blend_elapsed"] = min(obj["anim_blend_elapsed"] + step, obj["anim_blend_duration"])
             lower_blend_weight = (
                 1.0 if obj["anim_blend_duration"] <= 0.0
                 else obj["anim_blend_elapsed"] / obj["anim_blend_duration"]
@@ -3153,6 +3236,20 @@ class Scene:
 
             if upper_mask is None:
                 if not weighted_lower or skip_pose:
+                    continue
+                # A single-pose clip (a held weapon model: duration 0) that has finished blending
+                # in never changes: compute it once, not every tick.
+                only = weighted_lower[0][0] if len(weighted_lower) == 1 else None
+                if (only is not None and lower_blend_weight >= 1.0 and obj.get("pose_snap") is None
+                        and obj.get("_static_pose") == only and obj.get("bone_matrices") is not None):
+                    continue
+                clip = skeleton.animations.get(only) if only is not None else None
+                obj["_static_pose"] = only if (clip is not None and clip.duration <= 0.0
+                                               and lower_blend_weight >= 1.0) else None
+                request = pose_batch.make_request(
+                    skeleton, weighted_lower, obj["prev_animation"], obj["prev_anim_time"], lower_blend_weight)
+                if request is not None:
+                    pose_requests.append((obj, request))
                     continue
                 obj["bone_matrices"] = skeleton.compute_bone_matrices_multi(
                     weighted_lower,
@@ -3180,7 +3277,7 @@ class Scene:
                 dominant_clip = skeleton.animations.get(dominant_name) if dominant_name is not None else None
                 if dominant_clip is not None and dominant_clip.duration > 0.0:
                     obj["upper_locomotion_phase"] = (
-                        obj["upper_locomotion_phase"] + dt / dominant_clip.duration
+                        obj["upper_locomotion_phase"] + step / dominant_clip.duration
                     ) % 1.0
                 upper_phase = obj["upper_locomotion_phase"]
                 weighted_upper = [
@@ -3204,20 +3301,20 @@ class Scene:
                 # single-clip time normally and wrap it as a 1-entry
                 # weighted list, exactly equivalent to the old single-
                 # clip-only upper sampling.
-                _advance_clip_time(skeleton, obj, dt, "upper_animation", "upper_anim_time", "upper_anim_loop")
+                _advance_clip_time(skeleton, obj, step, "upper_animation", "upper_anim_time", "upper_anim_loop")
                 weighted_upper = [(obj["upper_animation"], obj["upper_anim_time"], 1.0)]
             else:
                 weighted_upper = None
 
             obj["upper_anim_blend_elapsed"] = min(
-                obj["upper_anim_blend_elapsed"] + dt, obj["upper_anim_blend_duration"]
+                obj["upper_anim_blend_elapsed"] + step, obj["upper_anim_blend_duration"]
             )
             upper_blend_weight = (
                 1.0 if obj["upper_anim_blend_duration"] <= 0.0
                 else obj["upper_anim_blend_elapsed"] / obj["upper_anim_blend_duration"]
             )
 
-            blended_offsets, offset_blend_weight = _advance_upper_offset_blend(obj, dt)
+            blended_offsets, offset_blend_weight = _advance_upper_offset_blend(obj, step)
 
             if skip_pose:
                 continue
@@ -3235,6 +3332,18 @@ class Scene:
                 upper_joint_mask_prev=obj["upper_joint_mask_prev"],
                 mask_blend_weight=offset_blend_weight,
             )
+
+        if pose_requests:
+            # Characters of the same model are evaluated together (pose_batch.evaluate's cost hardly
+            # grows with their number); anything else in the batch list gets its own group.
+            groups = {}
+            for obj, request in pose_requests:
+                groups.setdefault(pose_batch.structure_key(request[0]), []).append((obj, request))
+            for members in groups.values():
+                results = pose_batch.evaluate([request for _, request in members])
+                for (obj, request), (bones, last_pose) in zip(members, results):
+                    obj["bone_matrices"] = bones
+                    request[0].last_pose = last_pose
 
         # One bone-buffer upload per object per frame, AFTER every pose
         # above is final (the loop has several early `continue`s, so this
@@ -3363,6 +3472,9 @@ class Scene:
             for obj in self.skeletal_objects:
                 if not obj.get("cast_shadow", True):
                     continue
+                shadow_limit = obj.get("max_shadow_distance")
+                if shadow_limit is not None and obj.get("_view_dist", 0.0) > shadow_limit:
+                    continue
                 position = obj.get("position")
                 if position is not None and not self._in_cascade(
                         glm.vec3(position), self._SKELETAL_SHADOW_RADIUS, near_d, far_d, cam_pos, cam_forward):
@@ -3489,8 +3601,10 @@ class Scene:
             obj["shadow_vao"].render()
 
         for obj in self.skeletal_objects:
-            if not obj.get("visible_in_color", True):
+            if not obj.get("visible_in_color", True) or self._skeletal_culled(obj, frustum_planes):
                 continue
+            if obj.get("frustum_cull") is not None and obj.get("_view_dist", 0.0) > self._SSR_CHARACTER_DISTANCE:
+                continue        # too far to matter in a reflection: not worth a draw
             # No-op for a skeletal object in practice (_is_visible
             # always returns True for one - see its own docstring, no
             # cached AABB available), kept here anyway so this stays
@@ -3729,8 +3843,11 @@ class Scene:
                 if lights_bound_at is None or obj["position"] != lights_bound_at:
                     lit = self._mover_lighting(obj)
                     if lit is not lights_bound:
-                        bind_point_lights(self.pbr_program, lit[0])
-                        bind_probe_irradiance(self.pbr_program, lit[1])
+                        if lit[2] is not None:
+                            bind_packed_lighting(self.pbr_program, lit[2])
+                        else:
+                            bind_point_lights(self.pbr_program, lit[0])
+                            bind_probe_irradiance(self.pbr_program, lit[1])
                         lights_bound = lit
                     lights_bound_at = obj["position"]
             model_matrix = self._get_model_matrix(obj)
@@ -3754,32 +3871,68 @@ class Scene:
         self.ctx.cull_face = "back"
 
         skeletal_lit = None
+        cam_pos = glm.vec3(camera.position)
+        by_material = {}
+        seen = {}       # (position object, box) -> (distance, outside): a character and its gun share one
         for obj in self.skeletal_objects:
             if not obj.get("visible_in_color", True):
                 continue
-            model_matrix = self._get_model_matrix(obj)
+            if obj.get("frustum_cull") is not None:
+                # A character: remember how far it is (animation, shadow, reflection and lighting
+                # detail all scale with that - see Scene.update and the passes below) and skip it
+                # when it's out of view or past its draw distance.
+                key = (id(obj["position"]), obj["frustum_cull"])
+                found = seen.get(key)
+                if found is None:
+                    found = seen[key] = (glm.distance(glm.vec3(obj["position"]), cam_pos),
+                                         self._skeletal_culled(obj, frustum_planes))
+                dist, outside = found
+                obj["_view_dist"] = dist
+                limit = obj.get("max_draw_distance")
+                obj["_culled"] = outside
+                if outside or (limit is not None and dist > limit):
+                    continue
+            by_material.setdefault(self._skeletal_signature(obj), []).append(obj)
 
-            # Skeletal objects have no lightmapping pipeline at all (see
-            # the CULL_FACE comment just above) - always real-time-lit,
-            # so unlike the static/dynamic loop above this isn't
-            # conditional: every skeletal object needs its OWN nearest-
-            # lights rebind, not whatever the frame-level call (or the
-            # previous skeletal object's own rebind) left bound.
-            lit = self._mover_lighting(obj, self._SKELETAL_LIGHT_CELL)
-            if lit is not skeletal_lit:
-                bind_point_lights(self.skeletal_program, lit[0])
-                bind_probe_irradiance(self.skeletal_program, lit[1])
-                skeletal_lit = lit
+        # Drawn grouped by material so consecutive characters (ten players, ten guns) with the
+        # same textures and material buffer skip re-binding them - only the transform and the
+        # bones change from one to the next.
+        bound_signature = None
+        for signature, objects in by_material.items():
+            for obj in objects:
+                model_matrix = self._get_model_matrix(obj)
 
-            # bind_material is fully generic on prog - reused as-is here
-            # rather than duplicating a "bind_skeletal_material":
-            # skeletal_program declares the exact same uniform names (it
-            # reuses pbr_shader's fragment shader verbatim, see
-            # skeletal_shader.py's docstring), so this works unmodified.
-            bind_material(self.skeletal_program, obj, model_matrix, skeletal_view_proj)
-            bind_bone_matrices(obj)
-            obj["vao"].render()
-            self._draw_hat(obj)
+                # Skeletal objects have no lightmapping pipeline at all (see
+                # the CULL_FACE comment just above) - always real-time-lit,
+                # so unlike the static/dynamic loop above this isn't
+                # conditional: every skeletal object needs its OWN nearest-
+                # lights rebind, not whatever the frame-level call (or the
+                # previous skeletal object's own rebind) left bound.
+                lit = self._mover_lighting(
+                    obj, self._SKELETAL_LIGHT_CELL if obj.get("_view_dist", 0.0) < self._FAR_CHARACTER else 4.0)
+                if lit is not skeletal_lit:
+                    if lit[2] is not None:
+                        bind_packed_lighting(self.skeletal_program, lit[2])
+                    else:
+                        bind_point_lights(self.skeletal_program, lit[0])
+                        bind_probe_irradiance(self.skeletal_program, lit[1])
+                    skeletal_lit = lit
+
+                # bind_material is fully generic on prog - reused as-is here
+                # rather than duplicating a "bind_skeletal_material":
+                # skeletal_program declares the exact same uniform names (it
+                # reuses pbr_shader's fragment shader verbatim, see
+                # skeletal_shader.py's docstring), so this works unmodified.
+                if signature == bound_signature:
+                    bind_transform_only(self.skeletal_program, model_matrix, skeletal_view_proj)
+                else:
+                    bind_material(self.skeletal_program, obj, model_matrix, skeletal_view_proj)
+                    bound_signature = signature
+                bind_bone_matrices(obj)
+                obj["vao"].render()
+                if self._active_hat(obj) is not None:
+                    self._draw_hat(obj)
+                    bound_signature = None      # the hat rebinds an untinted material buffer
 
         return blended_objects, any_ssr_visible
 
@@ -3951,6 +4104,13 @@ class Scene:
     # =============================================================
 
     def render(self, camera, prog=None):
+        self._model_cache = {}
+        try:
+            self._render_frame(camera, prog)
+        finally:
+            self._model_cache = None
+
+    def _render_frame(self, camera, prog=None):
         self._update_attachments()
         if ENABLE_SHADOWS:
             self._render_shadows(camera)

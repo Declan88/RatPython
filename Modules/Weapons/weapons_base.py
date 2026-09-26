@@ -346,6 +346,9 @@ class WeaponsBase:
         if obj is None:
             return
         obj["specular_strength"] = 0
+        obj["frustum_cull"] = (1.4, 0.4, 2.6)      # same as its owner's (its position is the owner's)
+        obj["max_draw_distance"] = 30.0            # a pistol that far away is a couple of pixels
+        obj["max_shadow_distance"] = 8.0
         rotation = glm.mat4(glm.quat(glm.radians(glm.vec3(*self.worldmodel_rotation))))
         local = (
             glm.translate(glm.mat4(1.0), glm.vec3(*self.worldmodel_position))

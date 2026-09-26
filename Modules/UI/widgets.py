@@ -245,18 +245,27 @@ class Label(Widget):
         self._tex = None
         self._tex_key = None
         self._tex_size = (0, 0)
+        self._measure_key = None
+        self._measured = (0.0, 0.0)
 
     def _font_px(self):
         return max(1, round(self.font_size * self.manager.scale))
 
     def measure(self, parent_w, parent_h):
         if self.size == (0, 0) and self.size_frac == (0, 0) and self.manager is not None:
-            font = self.manager.get_font(self.font, self._font_px())
-            lines = self.text.split("\n")
-            w = max(font.size(line or " ")[0] for line in lines)
-            h = font.get_linesize() * len(lines)
-            s = self.manager.scale
-            return (w / s, h / s)
+            px = self._font_px()
+            key = (self.text, px, self.font)
+            if key != self._measure_key:
+                # (measured once per text/size: a many-line label was re-measuring every line
+                # every frame)
+                font = self.manager.get_font(self.font, px)
+                lines = self.text.split("\n")
+                w = max(font.size(line or " ")[0] for line in lines)
+                h = font.get_linesize() * len(lines)
+                s = self.manager.scale
+                self._measure_key = key
+                self._measured = (w / s, h / s)
+            return self._measured
         return super().measure(parent_w, parent_h)
 
     def _ensure_texture(self):

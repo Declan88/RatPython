@@ -171,6 +171,8 @@ def create_skeletal_shadow_program(ctx):
 
 
 def _pack_bone_matrices(bone_matrices):
+    if hasattr(bone_matrices, "gpu_bytes"):        # a pose_batch.BoneMatrices: already packed
+        return bone_matrices.gpu_bytes()
     padded = list(bone_matrices[:MAX_BONES])
     while len(padded) < MAX_BONES:
         padded.append(glm.mat4(1.0))
