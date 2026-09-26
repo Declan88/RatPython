@@ -78,6 +78,17 @@ def _split_model(path):
     for name, geometries in groups.items():
         low = np.min([g.bounds[0] for g in geometries], axis=0)
         high = np.max([g.bounds[1] for g in geometries], axis=0)
+        # A chunk modelled as one HALF of the body (a mesh whose edge sits exactly on the
+        # x = 0 mirror plane - the torso was exported without its mirror modifier applied)
+        # is completed by mirroring it, so it isn't an open shell.
+        if abs(high[0]) < 1e-4 or abs(low[0]) < 1e-4:
+            for g in list(geometries):
+                mirrored = g.copy()
+                mirrored.vertices = mirrored.vertices * np.array([-1.0, 1.0, 1.0])
+                mirrored.invert()      # mirroring flips the winding: turn the faces back out
+                geometries.append(mirrored)
+            low = np.min([g.bounds[0] for g in geometries], axis=0)
+            high = np.max([g.bounds[1] for g in geometries], axis=0)
         center = (low + high) / 2.0
         for g in geometries:
             g.apply_translation(-center)
