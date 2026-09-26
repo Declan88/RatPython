@@ -158,6 +158,15 @@ class RemotePlayer:
         self._voice_position = glm.vec3(0.0)  # where this player's shots sound from
         self._color_wanted = None  # fur color from the latest packet (None = the rat's own)
         self._color_applied = None
+        # Deaths travel as a counter like jumps and shots (so a lost packet can't drop
+        # one) plus an alive flag: a counter increase = they died just now (their body
+        # bursts into gibs, see on_death), and while the flag stays down their model and
+        # hitbox are gone.
+        self.dead = False
+        self.on_death = None        # callback(feet_position, velocity), set by NetworkManager
+        self._death_seen = None
+        self._pending_death = False
+        self._alive_wanted = True
 
     def receive_state(self, state):
         """state: the decoded packet dict from NetworkManager._broadcast_
@@ -192,6 +201,11 @@ class RemotePlayer:
                 self._pending_tracers.extend(ends[-fresh:])
                 del self._pending_tracers[:-3]
         self._shot_seen = shots
+        deaths = int(state.get("x", 0))
+        if self._death_seen is not None and deaths > self._death_seen:
+            self._pending_death = True
+        self._death_seen = deaths
+        self._alive_wanted = bool(state.get("a", 1))
         if state.get("n"):
             self.name = str(state["n"])[:32]
 
@@ -229,6 +243,18 @@ class RemotePlayer:
             just_jumped=self._pending_jump,
         )
         self._pending_jump = False
+        if self._pending_death:
+            self._pending_death = False
+            self._set_dead(True)
+            if self.on_death is not None:
+                move = s.get("d", (0.0, 0.0))
+                speed = float(s.get("v", 0.0))
+                self.on_death(feet_pos, glm.vec3(move[0] * speed, 0.0, move[1] * speed))
+        elif self.dead and self._alive_wanted:
+            self._set_dead(False)
+        if self.dead:
+            self._pending_shots = 0
+            self._pending_tracers.clear()
         while self._pending_shots > 0:
             self._pending_shots -= 1
             # From about chest height at where they're standing now.
@@ -244,7 +270,8 @@ class RemotePlayer:
                     muzzle = self.weapon.muzzle_position(self.scene)
                     if muzzle is None:
                         muzzle = self._voice_position + glm.normalize(aim) * 0.6
-                    self.on_tracer(muzzle, end)
+                    # (the flash stays on the gun's muzzle as it moves)
+                    self.on_tracer(muzzle, end, lambda: self.weapon.muzzle_position(self.scene))
         self._pending_tracers.clear()
         if self._hat_wanted != self._hat_applied:
             self._hat_applied = self._hat_wanted   # even if unknown - don't retry every frame
@@ -256,11 +283,20 @@ class RemotePlayer:
         # Hitbox centered vertically on the body (feet to eye), not at
         # floor level, and follows facing so a future directional query
         # (e.g. a cone/box in front of the shooter) lines up.
+        # (Parked far below the map while they're dead so shots pass through.)
         self.scene.physics.update_hitbox(
             self._hitbox,
-            feet_pos + glm.vec3(0.0, _BODY_HEIGHT / 2.0, 0.0),
+            glm.vec3(0.0, -1000.0, 0.0) if self.dead else feet_pos + glm.vec3(0.0, _BODY_HEIGHT / 2.0, 0.0),
             glm.vec3(0.0, glm.radians(yaw), 0.0),
         )
+
+    def _set_dead(self, dead):
+        """Hides (or shows again) their body and the gun in their hand."""
+        self.dead = dead
+        for obj in (self.model.obj, getattr(self.weapon, "worldmodel_obj", None)):
+            if obj is not None:
+                obj["visible_in_color"] = not dead
+                obj["cast_shadow"] = not dead
 
     def destroy(self):
         """Not called anywhere yet - network_manager.py has no lobby-

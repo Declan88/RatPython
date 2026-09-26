@@ -56,7 +56,7 @@ class CameraBoomArm:
         # very player capsule it's orbiting - same exclusion (and same
         # underlying phantom-hit reasoning) as CharacterController's own
         # _sweep_mask for its self-collision sweeps.
-        self._sweep_mask = collision_mask & ~CollisionGroup.PLAYER
+        self._sweep_mask = collision_mask & ~(CollisionGroup.PLAYER | CollisionGroup.GIB)
 
     def _sweep(self, from_pos, to_pos):
         from_ts = TransformState.makePos(to_physics_pos(from_pos))

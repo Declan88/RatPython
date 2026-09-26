@@ -246,7 +246,7 @@ class CharacterController:
         # PLAYER (contactTest's exclusion-by-identity-check, for
         # instance, is unaffected), it just can never satisfy our own
         # movement sweeps' mask.
-        self._sweep_mask = self.collision_mask & ~CollisionGroup.PLAYER
+        self._sweep_mask = self.collision_mask & ~(CollisionGroup.PLAYER | CollisionGroup.GIB)
 
         self._standing_shape = BulletBoxShape(to_physics_extent((self.radius, self.height / 2.0, self.radius)))
         self._crouch_shape = BulletBoxShape(to_physics_extent((self.radius, self._crouch_height / 2.0, self.radius)))
@@ -641,6 +641,15 @@ class CharacterController:
         (matches Source: holding jump auto-hops on landing rather than
         requiring a fresh press each time)."""
         self._jump_requested = True
+
+    def teleport(self, position):
+        """Puts the hull at `position` (render space, hull CENTER) with no velocity
+        and no interpolation smear - for respawning."""
+        self.node_path.setPos(to_physics_pos(position))
+        self.velocity = glm.vec3(0.0)
+        self._prev_position = to_render_pos(self.node_path.getPos())
+        self._smoothed_position = glm.vec3(self._prev_position)
+        self._grounded = False
 
     def is_on_ground(self):
         return self._grounded

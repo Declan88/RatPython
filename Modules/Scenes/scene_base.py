@@ -255,6 +255,10 @@ class Scene:
         self.dynamic_objects = []
         self.skeletal_objects = []
         self.viewmodel_objects = []   # see add_viewmodel
+        self.gibs = None              # Modules/Gore GibManager, made by the game when it wants one
+        # Optional callable run just before the viewmodels are drawn, so it can
+        # put something behind the first-person gun and arms (a muzzle flash).
+        self.before_viewmodels = None
         self._attachments = []        # see attach_skeletal
         self._skeletal_view_proj = None
         self.point_lights = []
@@ -1102,6 +1106,29 @@ class Scene:
             )
 
         return model
+
+    def load_prop_groups(self, model_path):
+        """Loads a (possibly multi-material) glb as a list of drawable objects, one
+        per material, WITHOUT adding them to the scene - see add_prop_object. For a
+        moving thing the game drives itself (gibs): set each object's "transform"
+        (and "position") every frame. Several copies can share the GPU data
+        (dict(obj)); release the originals once, with release_prop_object."""
+        return self._load_objects_by_material(model_path)
+
+    def add_prop_object(self, obj):
+        """Starts drawing (and shadow-casting) an object from load_prop_groups or a
+        copy of one."""
+        self.dynamic_objects.append(obj)
+
+    def remove_prop_object(self, obj):
+        try:
+            self.dynamic_objects.remove(obj)
+        except ValueError:
+            pass
+
+    def release_prop_object(self, obj):
+        """Frees the GPU data of an ORIGINAL object from load_prop_groups."""
+        self._release_object(obj)
 
     def _add_dynamic_collision(self, model_path, model, collision_shape, mass, collision_mask,
                                 gravity=True, kinematic=False, physical_material=None):
@@ -3885,6 +3912,8 @@ class Scene:
         # transparent_objects' own docstring for exactly why the skybox
         # part of this order matters.
         self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
+        if self.before_viewmodels is not None:
+            self.before_viewmodels()
         self._render_viewmodels()
 
 
@@ -3893,6 +3922,9 @@ class Scene:
     # =============================================================
 
     def destroy(self):
+        if self.gibs is not None:
+            self.gibs.destroy()
+            self.gibs = None
         for obj in self.static_objects:
             self._release_object(obj)
         for obj in self.dynamic_objects:

@@ -51,7 +51,7 @@ class NameTags:
             pill, label = tag
 
             obj = player.model.obj
-            if obj is None:
+            if obj is None or getattr(player, "dead", False):
                 pill.visible = False
                 continue
             head = obj["position"] + glm.vec3(0.0, HEAD_HEIGHT, 0.0)

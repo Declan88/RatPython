@@ -112,10 +112,12 @@ class RayHit:
     position/normal: where the ray struck and the surface's normal there;
     distance: metres from the ray's start; owner: whatever add_hitbox tagged
     the struck node with (a remote player's steam_id) or None for ordinary
-    level geometry/props; node: the Bullet node itself."""
-    __slots__ = ("position", "normal", "distance", "fraction", "owner", "node")
+    level geometry/props; node: the Bullet node itself; material: the
+    struck surface's physical_material name (see Scene.add_static) or None."""
+    __slots__ = ("position", "normal", "distance", "fraction", "owner", "node", "material")
 
-    def __init__(self, position, normal, distance, fraction, owner, node):
+    def __init__(self, position, normal, distance, fraction, owner, node, material=None):
+        self.material = material
         self.position = position
         self.normal = normal
         self.distance = distance
@@ -141,6 +143,9 @@ class CollisionGroup:
     # body, so it never physically collides with anything regardless of
     # this bit; Bullet only consults a ghost's mask for manual queries.
     HITBOX = BitMask32.bit(4)
+    # Gibs (Modules/Gore): collide with level geometry (whose mask is ALL) and each
+    # other, but never with the player hull, hitboxes or props.
+    GIB = BitMask32.bit(5)
     ALL = BitMask32.all_on()
 
 
@@ -304,6 +309,7 @@ class PhysicsWorld:
             fraction=fraction,
             owner=node.getPythonTag("owner") if node.hasPythonTag("owner") else None,
             node=node,
+            material=node.getPythonTag("physical_material") if node.hasPythonTag("physical_material") else None,
         )
 
     # ---------------------------------------------------------------
@@ -503,6 +509,59 @@ class PhysicsWorld:
             shape, mass, position, rotation, collision_mask, "dynamic_mesh",
             gravity=gravity, kinematic=kinematic, material=material,
         )
+
+    def make_hull_shape(self, points):
+        """A convex-hull collision shape from (N, 3) render-space points (relative to
+        the body's origin). Shapes can be shared by any number of bodies."""
+        shape = BulletConvexHullShape()
+        for v in points:
+            shape.addPoint(to_physics_pos(v))
+        return shape
+
+    def add_dynamic_shape(self, shape, position, rotation_quat, mass, collision_mask,
+                           restitution=0.3, friction=0.7, linear_damping=0.05,
+                           angular_damping=0.1, ccd_radius=None, name="dynamic_shape"):
+        """A dynamic body from a ready-made shape (see make_hull_shape), with the
+        contact settings a debris chunk wants. rotation_quat: glm.quat. ccd_radius
+        turns on continuous collision so fast small chunks can't tunnel through thin
+        floors. Returns its node path (remove with remove_body)."""
+        node_path = self._add_body(shape, mass, position, None, collision_mask, name)
+        node_path.setQuat(to_physics_quat(rotation_quat))
+        node = node_path.node()
+        node.setRestitution(restitution)
+        node.setFriction(friction)
+        node.setLinearDamping(linear_damping)
+        node.setAngularDamping(angular_damping)
+        if ccd_radius:
+            node.setCcdMotionThreshold(1e-7)
+            node.setCcdSweptSphereRadius(float(ccd_radius))
+        return node_path
+
+    def set_body_velocity(self, node_path, linear, angular=None):
+        """Sets a dynamic body's velocity (render-space m/s, and rad/s about the
+        render axes)."""
+        node = node_path.node()
+        node.setLinearVelocity(to_physics_vec(glm.vec3(linear)))
+        if angular is not None:
+            node.setAngularVelocity(to_physics_vec(glm.vec3(angular)))
+
+    def get_body_quat(self, node_path):
+        """The body's rotation as a render-space glm.quat."""
+        return to_render_quat(node_path.getQuat())
+
+    def remove_body(self, node_path):
+        """Takes a rigid body out of the world for good."""
+        node = node_path.node()
+        if isinstance(node, BulletRigidBodyNode):
+            try:
+                self.world.removeRigidBody(node)
+            except Exception:
+                pass
+        node_path.removeNode()
+        try:
+            self._node_paths.remove(node_path)
+        except ValueError:
+            pass
 
     # ---------------------------------------------------------------
     # BOUNDS-DERIVED COLLIDERS (box/sphere sized automatically from a

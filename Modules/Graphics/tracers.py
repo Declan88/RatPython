@@ -19,20 +19,30 @@ import numpy as np
 
 SPEED = 320.0          # metres per second the streak's head travels
 LENGTH = 9.0           # metres from head to tail
-BASE_WIDTH = 0.03      # ribbon half-width at the camera, metres
-WIDTH_PER_METRE = 0.004  # extra half-width per metre of distance from the camera
-MAX_WIDTH = 0.35
+HALF_WIDTH = 0.0035  # ribbon half-width, as a fraction of the screen height (constant on screen)
 MAX_TRACERS = 96
+NEAR_MARGIN = 0.15     # metres in front of the camera a streak is trimmed to
 
 _VERT = """
 #version 330
 uniform mat4 u_view_proj;
+uniform vec2 u_half_px;      // ribbon half-width in NDC units (x, y)
+uniform vec2 u_aspect;       // (aspect, 1): puts NDC direction in square units
 in vec3 in_pos;
-in vec2 in_uv;
+in vec3 in_other;            // the streak's other end, to know which way it runs on screen
+in vec2 in_uv;               // x: 0 at the tail -> 1 at the head, y: -1..1 across
 out vec2 v_uv;
 void main() {
     v_uv = in_uv;
-    gl_Position = u_view_proj * vec4(in_pos, 1.0);
+    vec4 c = u_view_proj * vec4(in_pos, 1.0);
+    vec4 o = u_view_proj * vec4(in_other, 1.0);
+    vec2 dir = (o.xy / o.w - c.xy / c.w) * u_aspect;
+    float len = length(dir);
+    dir = len > 1e-6 ? dir / len : vec2(1.0, 0.0);
+    vec2 normal = vec2(-dir.y, dir.x) / u_aspect;
+    // Expanded in screen space so the streak is the same thickness along its
+    // whole length however close to the camera it starts.
+    gl_Position = c + vec4(normal * in_uv.y * u_half_px * c.w, 0.0, 0.0);
 }
 """
 
@@ -43,11 +53,11 @@ in vec2 v_uv;
 out vec4 fragColor;
 void main() {
     float across = 1.0 - abs(v_uv.y);
-    float core = across * across * across;
-    float halo = across * across * 0.3;
+    float core = across * across;
+    float halo = across * 0.35;
     float along = clamp(v_uv.x, 0.0, 1.0);
-    float body = 0.1 + 0.9 * along * along;          // bright head, fading tail
-    float nose = 1.0 - smoothstep(0.93, 1.0, along); // soft round-ish tip
+    float body = 0.15 + 0.85 * along * along;        // bright head, fading tail
+    float nose = 1.0 - smoothstep(0.93, 1.0, along); // soft tip
     vec3 hot = vec3(1.0, 0.96, 0.82);
     vec3 warm = vec3(1.0, 0.55, 0.15);
     vec3 colour = mix(warm, hot, core) * (core + halo) * body * nose;
@@ -71,8 +81,8 @@ class Tracers:
     def __init__(self, ctx):
         self.ctx = ctx
         self.program = ctx.program(vertex_shader=_VERT, fragment_shader=_FRAG)
-        self.buffer = ctx.buffer(reserve=MAX_TRACERS * 6 * 5 * 4, dynamic=True)
-        self.vao = ctx.vertex_array(self.program, [(self.buffer, "3f 2f", "in_pos", "in_uv")])
+        self.buffer = ctx.buffer(reserve=MAX_TRACERS * 6 * 8 * 4, dynamic=True)
+        self.vao = ctx.vertex_array(self.program, [(self.buffer, "3f 3f 2f", "in_pos", "in_other", "in_uv")])
         self.active = []
 
     def add(self, start, end, now=None):
@@ -92,6 +102,7 @@ class Tracers:
             return
         now = time.perf_counter() if now is None else now
         cam_pos = glm.vec3(camera.position)
+        forward = glm.vec3(camera.front)
         verts = []
         alive = []
         for t in self.active:
@@ -103,26 +114,31 @@ class Tracers:
             a, b = max(tail, 0.0), min(head, t.distance)
             if b <= a:
                 continue
+            # Keep the ribbon in front of the camera (a projected point behind
+            # it would flip): trim the part closer than the near margin.
+            f0 = glm.dot(t.start + t.direction * a - cam_pos, forward)
+            f1 = glm.dot(t.start + t.direction * b - cam_pos, forward)
+            if f1 <= NEAR_MARGIN:
+                continue
+            if f0 < NEAR_MARGIN:
+                a += (b - a) * (NEAR_MARGIN - f0) / (f1 - f0)
             p0 = t.start + t.direction * a
             p1 = t.start + t.direction * b
-            mid = (p0 + p1) * 0.5
-            to_cam = cam_pos - mid
-            side = glm.cross(t.direction, to_cam)
-            if glm.length(side) < 1e-6:     # looking straight down the streak: it's a dot
-                continue
-            width = min(MAX_WIDTH, BASE_WIDTH + WIDTH_PER_METRE * glm.length(to_cam))
-            side = glm.normalize(side) * width
             u0, u1 = (a - tail) / LENGTH, (b - tail) / LENGTH
-            corners = ((p0 - side, u0, -1.0), (p0 + side, u0, 1.0),
-                       (p1 + side, u1, 1.0), (p1 - side, u1, -1.0))
+            # (this end, the other end, u, side) for the four corners.
+            corners = ((p0, p1, u0, -1.0), (p0, p1, u0, 1.0),
+                       (p1, p0, u1, 1.0), (p1, p0, u1, -1.0))
             for i in (0, 1, 2, 0, 2, 3):
-                p, u, v = corners[i]
-                verts.extend((p.x, p.y, p.z, u, v))
+                p, o, u, v = corners[i]
+                verts.extend((p.x, p.y, p.z, o.x, o.y, o.z, u, v))
         self.active = alive
         if not verts:
             return
 
         self.buffer.write(np.array(verts, dtype="f4").tobytes())
+        half = HALF_WIDTH * 2.0   # NDC spans 2 units over the screen height
+        self.program["u_half_px"].value = (half, half)
+        self.program["u_aspect"].value = (camera.aspect, 1.0)
         self.program["u_view_proj"].write(
             (camera.get_projection_matrix() * camera.get_view_matrix()).to_bytes())
 
@@ -133,7 +149,7 @@ class Tracers:
         ctx.enable(moderngl.BLEND)
         ctx.blend_func = moderngl.ONE, moderngl.ONE
         ctx.screen.depth_mask = False
-        self.vao.render(moderngl.TRIANGLES, vertices=len(verts) // 5)
+        self.vao.render(moderngl.TRIANGLES, vertices=len(verts) // 8)
         ctx.screen.depth_mask = True
         ctx.disable(moderngl.BLEND)
         ctx.enable(moderngl.CULL_FACE)

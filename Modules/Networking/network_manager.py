@@ -64,8 +64,11 @@ class NetworkManager:
         self.local_hat = None   # short hat name from the main menu, or None
         self.local_color = None  # (r, g, b) 0-1 fur color from the main menu, or None
         self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
+        self._death_count = 0   # times the local player has died (a counter too)
+        self.local_alive = True
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
-        self.on_tracer = None   # callback(start, end) to draw another player's tracer
+        self.on_death = None    # callback(feet_position, velocity) when another player dies (bursts into gibs)
+        self.on_tracer = None   # callback(start, end, follow) to draw another player's tracer and muzzle flash
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
         self.local_name = ""    # our Steam persona name, sent in every packet
         self.local_steam_id = 0
@@ -373,6 +376,15 @@ class NetworkManager:
             self._recent_shot_ends.append([round(end_point.x, 1), round(end_point.y, 1), round(end_point.z, 1)])
             del self._recent_shot_ends[:-3]
 
+    def notify_death(self):
+        """Call when the local player dies (their state packets then carry it: the
+        counter other players play the gibs from, and the alive flag they hide the body by)."""
+        self._death_count += 1
+        self.local_alive = False
+
+    def notify_respawn(self):
+        self.local_alive = True
+
     def send_damage(self, victim_id, amount, weapon_name=""):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
         a hit (against the victim's hitbox as the shooter sees it) and the
@@ -425,6 +437,8 @@ class NetworkManager:
             "k": encode_color(self.local_color),
             "f": self._shot_count,
             "e": self._recent_shot_ends,
+            "x": self._death_count,
+            "a": int(self.local_alive),
             "n": self.local_name,
         }
 
@@ -628,8 +642,10 @@ class NetworkManager:
                 print(f"\n--> Discovered peer in lobby: {sender_id}")
                 self.remote_players[sender_id] = RemotePlayer(self.scene, sender_id)
                 self.remote_players[sender_id].name = self._friend_name(sender_id)
+                self.remote_players[sender_id].on_death = (
+                    lambda position, velocity: self.on_death(position, velocity) if self.on_death else None)
                 self.remote_players[sender_id].on_tracer = (
-                    lambda start, end: self.on_tracer(start, end) if self.on_tracer else None)
+                    lambda *args: self.on_tracer(*args) if self.on_tracer else None)
             self.remote_players[sender_id].receive_state(state)
         except Exception as e:
             print(f"Error parsing incoming packet from {sender_id}: {e}")

@@ -170,6 +170,17 @@ class WeaponsBase:
     # The bones bullets (tracers) come out of. The world model has a real muzzle
     # bone; the first-person gun doesn't (Source keeps that as an attachment, not
     # a bone), so it uses the bone at the front of the barrel instead.
+    # The particle system (Assets/Particles, see Modules/Particles) played at the
+    # muzzle on every shot; None for no flash.
+    muzzle_particle = "muzzle_pistols"
+    # The flash's colour range, two (r, g, b) 0-255 endpoints each particle picks
+    # between - replaces the particle file's own colours (None keeps them).
+    muzzle_color = ((255, 180, 0), (255, 235, 180))
+    muzzle_size = 0.7          # scale of the whole flash
+    # The particle file offsets its particles from the origin (up to ~25 cm sideways
+    # at full size), which pulls the flash off the barrel; this scales that (0 = all
+    # on the muzzle).
+    muzzle_offset_scale = 0.0
     worldmodel_muzzle_bone = "ValveBiped.flash"
     viewmodel_muzzle_bone = "v_weapon.USP_Silencer"
 

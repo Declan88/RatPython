@@ -111,10 +111,21 @@ from Modules.Window.window import WindowManager
 from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
-from Modules.UI import Anchor, Crosshair, ProgressBar
+from Modules.UI import Anchor, Crosshair, Hitmarker, ProgressBar
+from Modules.UI.death_screen import DeathScreen
 from Modules.Graphics.tracers import Tracers
+from Modules.Particles import ParticleManager
+from Modules.Particles.blood import register_blood
+from Modules.Gore import GibManager
+from Modules.Particles.impacts import IMPACT_FILE, MATERIAL_ALIASES, LIFETIME_SCALE, RADIUS_SCALE, keep_frame, spawn_impact
+from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
+
+SPAWN_POSITION = (0.0, 2.0, 3.0)   # where the player (re)spawns: hull centre, metres
+RESPAWN_SECONDS = 3.0
+HITMARKER_SOUND = "Assets/Audio/Player/hitmarker.wav"
+HITMARKER_VOLUME = 0.6
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
@@ -126,6 +137,7 @@ from Modules.Player.player_model import PlayerModel
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 from Modules.Player.viewmodel import ViewModel
 from Modules.Weapons import USP
+from Modules.Weapons.weapons_base import WeaponsBase
 
 
 def load_steam_api_dll():
@@ -206,6 +218,7 @@ def main():
         if key not in scenes:
             show_loading_screen(window, f"Loading {key}...")
             scenes[key] = SCENE_CLASSES[key](window.ctx)
+            scenes[key].gibs = GibManager(scenes[key], particles)
             # See WindowManager.reset_frame_timer's own docstring - a
             # multi-second construction just ran on this same thread,
             # and the NEXT dt computed would otherwise include all of it.
@@ -254,7 +267,7 @@ def main():
         player_height = 1.39225 * 9 / 8
         player = CharacterController(
             current_scene.physics,
-            position=(0.0, 2.0, 3.0),
+            position=SPAWN_POSITION,
             height=player_height,
             max_slope_degrees=47.0,
         )
@@ -520,12 +533,25 @@ def main():
     ui.root.add(health_bar)
     # Screen-centre crosshair; its gap is the current weapon's real spread.
     crosshair = ui.root.add(Crosshair(visible=False))
+    # Diagonal ticks over the crosshair when one of our shots hits another player.
+    hitmarker = ui.root.add(Hitmarker())
+    hit_sound_channel = [None]   # every hit plays on the same channel, cutting off the last
+
+    # Dying: health reaching 0 (from any source) flags `pending`; the main loop starts
+    # the death at a safe point (begin_death) and ends it (end_death) when the
+    # screen's countdown runs out. `eye_drop` eases the camera down to the floor.
+    death = {"pending": False, "active": False, "eye_drop": 0.0}
+    death_screen = ui.root.add(DeathScreen(RESPAWN_SECONDS))
 
     def change_health(delta):
+        if death["active"] and delta < 0.0:
+            return   # already dead
         health["value"] = max(0.0, min(health["max"], health["value"] + delta))
         health_bar.value = health["value"]
         low = health["value"] <= health["max"] * 0.3
         health_bar.fill_color = (220, 70, 70, 255) if low else (90, 200, 110, 255)
+        if health["value"] <= 0.0 and not death["active"]:
+            death["pending"] = True
 
     # The game starts on the main menu and loads nothing else. Host/Join
     # (see Modules/UI/lobby_menu.py) talk to NetworkManager - created here,
@@ -539,7 +565,35 @@ def main():
     pending_start = None
     net_mgr = NetworkManager(camera, None)
     tracers = Tracers(window.ctx)
-    net_mgr.on_tracer = tracers.add
+    particles = ParticleManager(window.ctx, material_aliases=MATERIAL_ALIASES,
+                                radius_scale=RADIUS_SCALE, frame_filter=keep_frame,
+                                lifetime_scale=LIFETIME_SCALE)
+    particles.load("Assets/Particles/Muzzle/muzzleflashes.pcf")
+    particles.load(IMPACT_FILE)
+    register_blood(particles)
+    # Particles that collide (impact debris) trace against the level only.
+    particles.raycast = lambda a, b: (
+        current_scene.physics.raycast(a, b, CollisionGroup.STATIC) if current_scene is not None else None)
+
+    def remote_shot(start, end, follow=None):
+        """Another player's shot: its tracer, a muzzle flash that stays on their gun, and
+        the impact where it ended (looked up here - only the end point is sent)."""
+        tracers.add(start, end)
+        aim = glm.vec3(end) - glm.vec3(start)
+        if glm.length(aim) > 1e-3:
+            if current_scene is not None:
+                spawn_impact(particles, current_scene.physics.raycast(
+                    start, glm.vec3(end) + glm.normalize(aim) * 0.1))
+            particles.spawn(WeaponsBase.muzzle_particle, start, forward=aim,
+                            colors=WeaponsBase.muzzle_color, size=WeaponsBase.muzzle_size,
+                            offset_scale=WeaponsBase.muzzle_offset_scale, follow=follow)
+    net_mgr.on_tracer = remote_shot
+
+    def remote_death(position, velocity):
+        """Another player died: their body bursts into gibs where they stood."""
+        if current_scene is not None and current_scene.gibs is not None:
+            current_scene.gibs.spawn(position, velocity)
+    net_mgr.on_death = remote_death
     # Another player's shot hit us: the shooter decided that, we apply it.
     net_mgr.on_damage = lambda amount, attacker_id, weapon_name: change_health(-amount)
     from Modules.Scenes import scene_base as _scene_base
@@ -572,6 +626,38 @@ def main():
         net_mgr.scene = current_scene
         net_mgr.in_game = True
 
+    def set_local_body_visible(visible):
+        """Shows or hides the local player's body (and gun) - hidden while dead."""
+        for obj in (local_player_model.obj, getattr(weapon, "worldmodel_obj", None)):
+            if obj is not None:
+                obj["visible_in_color"] = visible and third_person
+                obj["cast_shadow"] = visible
+
+    def begin_death():
+        death["pending"] = False
+        death["active"] = True
+        death["eye_drop"] = 0.0
+        feet = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
+        if current_scene.gibs is not None:
+            current_scene.gibs.spawn(feet, player.velocity)
+        net_mgr.notify_death()
+        set_local_body_visible(False)
+        crosshair.visible = False
+        player.set_move_direction(glm.vec3(0.0))
+        player.set_sprinting(False)
+        death_screen.show()
+
+    def end_death():
+        death["active"] = False
+        player.teleport(SPAWN_POSITION)
+        change_health(health["max"])
+        if weapon is not None:
+            weapon.recoil.reset()
+        set_local_body_visible(True)
+        crosshair.visible = True
+        death_screen.hide()
+        net_mgr.notify_respawn()
+
     menu_ui = menu_scene.build_ui(ui, net_mgr, MAPS, on_start=request_start)
     ui.set_cursor_free(True)
 
@@ -593,6 +679,8 @@ def main():
 
     def on_key_down(key):
         if in_menu:
+            return
+        if death["active"]:
             return
         toggle_third_person(key)
         toggle_ui_demo(key)
@@ -645,6 +733,9 @@ def main():
         # Ground-relative movement, driven by camera yaw (mouse-look)
         # but ignoring pitch - walking shouldn't speed up/slow down
         # just from looking up or down.
+        if death["pending"] and not death["active"]:
+            begin_death()
+        alive = not death["active"]
         move_dir = glm.vec3(0.0)
         if keys[pygame.K_w]:
             move_dir += camera.get_flat_forward()
@@ -654,11 +745,12 @@ def main():
             move_dir -= camera.get_flat_right()
         if keys[pygame.K_d]:
             move_dir += camera.get_flat_right()
-        player.set_move_direction(move_dir)
-        player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
-        player.set_crouching(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL])
-        if keys[pygame.K_SPACE]:
-            player.jump()
+        if alive:
+            player.set_move_direction(move_dir)
+            player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+            player.set_crouching(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL])
+            if keys[pygame.K_SPACE]:
+                player.jump()
         # No player.update(dt) here - CharacterController's Source-style
         # ground/air movement math runs once per fixed physics tick (a
         # PhysicsWorld pre-substep callback, registered in its __init__),
@@ -669,9 +761,16 @@ def main():
         # torus) and step physics - camera position then follows
         # wherever physics moved the player capsule to this frame.
         current_scene.update(dt)
+        if current_scene.gibs is not None:
+            current_scene.gibs.update(dt)     # before particles.update: the blood follows the gibs
         eye_position = player.get_position() + glm.vec3(
             0.0, player.get_eye_offset(), 0.0
         )
+        if not alive:
+            # The view sinks to the floor over half a second, like the body dropping.
+            death["eye_drop"] = min(1.0, death["eye_drop"] + dt / 0.5)
+            ease = death["eye_drop"] * death["eye_drop"] * (3.0 - 2.0 * death["eye_drop"])
+            eye_position.y -= (player.get_eye_offset() - 0.25) * ease
         if third_person:
             # Same pivot first-person already uses (the player's own eye
             # position) - camera.front/yaw/pitch (mouse look) and all
@@ -685,9 +784,9 @@ def main():
         # After the camera has its final position/look for this frame.
         # Recoil moves the camera a little further each frame (see Recoil) -
         # after mouse look, before anything reads camera.front for this frame.
-        if weapon is not None:
+        if weapon is not None and alive:
             weapon.recoil.apply(camera, dt)
-        viewmodel.update(camera, not third_person)
+        viewmodel.update(camera, not third_person and alive)
 
         # Left mouse fires: one shot per click (every click counts, even two
         # inside one frame), or - for an automatic weapon - continuously while
@@ -697,7 +796,7 @@ def main():
         clicks, trigger_clicks[0] = trigger_clicks[0], 0
         if weapon is not None:
             crosshair.set_spread(weapon.spread_degrees(), camera.fov)
-        if weapon is not None and not ui.cursor_free:
+        if weapon is not None and not ui.cursor_free and alive:
             if weapon.automatic:
                 clicks = 1 if pygame.mouse.get_pressed()[0] else 0
             for _ in range(clicks):
@@ -718,8 +817,22 @@ def main():
                         right = glm.normalize(glm.cross(camera.front, camera.up))
                         muzzle = camera.position + camera.front * 0.6 + right * 0.14 - camera.up * 0.12
                     tracers.add(muzzle, end)
+                    spawn_impact(particles, shot.hit)
+                    if weapon.muzzle_particle:
+                        # overlay while the first-person gun is what's on screen (its depth is squashed)
+                        particles.spawn(weapon.muzzle_particle, muzzle, forward=shot.direction,
+                                        up=camera.up, overlay=not third_person,
+                                        colors=weapon.muzzle_color, size=weapon.muzzle_size,
+                                        offset_scale=weapon.muzzle_offset_scale,
+                                        follow=lambda: weapon.muzzle_position(current_scene))
                     if shot.victim in net_mgr.remote_players:
                         net_mgr.send_damage(shot.victim, shot.damage, weapon.name)
+                        hitmarker.trigger()
+                        # Flat, in both ears, at any distance: it's feedback for us, not a sound in the world.
+                        hit_emitter = current_scene.sound_manager.add_sound(
+                            HITMARKER_SOUND, camera.position, volume=HITMARKER_VOLUME, loop=False,
+                            universal=True, channel=hit_sound_channel[0])
+                        hit_sound_channel[0] = hit_emitter["channel"]
 
         # get_position() is the hull CENTER, not feet - subtract half
         # the standing height (the same player_height passed to
@@ -783,6 +896,11 @@ def main():
 
         current_scene.update_audio(camera)
 
+        if death["active"]:
+            death_screen.update()
+            if death_screen.finished:
+                end_death()
+
         net_mgr.update()
         name_tags.update(net_mgr.remote_players, camera, window.ctx.screen.size)
         scoreboard.visible = bool(keys[pygame.K_TAB])
@@ -790,13 +908,19 @@ def main():
             scoreboard.update(net_mgr)
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
+        # First-person muzzle flashes (overlay effects) are drawn by the scene just
+        # before the viewmodels, so the gun and arms sit in front of them.
+        current_scene.before_viewmodels = lambda: particles.render(camera, overlay=True)
         current_scene.render(camera, None)
         tracers.render(camera)
+        particles.update(dt)
+        particles.render(camera, overlay=False)
         ui.render()
         if paper_doll is not None:
             paper_doll.render(window.ctx.screen.size)
         window.flip()
 
+    particles.destroy()
     tracers.destroy()
     ui.destroy()
     window.quit()
