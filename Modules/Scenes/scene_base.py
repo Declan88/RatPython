@@ -241,7 +241,8 @@ _POSE_INTERVALS = (POSE_UPDATE_INTERVAL, 1.0 / 100.0, 1.0 / 60.0, 1.0 / 30.0)   
 
 
 def _pump_load():
-    pygame.event.pump()      # keeps Windows treating the window as responsive
+    if pygame.display.get_init():
+        pygame.event.pump()      # keeps Windows treating the window as responsive
     if LOAD_PUMP is not None:
         try:
             LOAD_PUMP()
@@ -3140,6 +3141,10 @@ class Scene:
                     interval = _POSE_INTERVALS[2]       # 60 Hz
                 else:
                     interval = _POSE_INTERVALS[1]       # 100 Hz
+            if not obj.get("visible_in_color", True) and not obj.get("viewmodel"):
+                # Shadow-only (the local player's own body and gun in first person): only its
+                # shadow is ever seen, so its limbs don't need the near-character rate.
+                interval = max(interval, _POSE_INTERVALS[2])
             skip_pose = not pose_due[interval] and obj.get("bone_matrices") is not None
             if skip_pose and view_dist is not None and obj.get("pose_snap") is None:
                 # A character between its pose ticks does no per-frame animation bookkeeping at all:

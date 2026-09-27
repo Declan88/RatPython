@@ -65,7 +65,8 @@ _FLOATS_PER_PARTICLE = 14    # position 3, radius 1, rotation 1, rgba 4, velocit
 MAX_TOTAL_PARTICLES = 16384
 _TRACE_LIFT = 0.05        # metres a collision trace starts above the particle
 _TRACE_BACKUP = 0.03      # metres a collision trace starts behind the particle (see _constraint_collision)
-SIM_RATE = 240.0          # highest rate particles are simulated at (see ParticleManager.update)
+NEAR_FADE = 0.35         # sprites fade out from radius/distance = 0.35 and are gone at 0.7 (see _VERT)
+SIM_RATE = 60.0           # highest rate particles are simulated at (see ParticleManager.update)
 _MAX_EFFECT_PARTICLES = 4096
 
 _VERT = """
@@ -74,6 +75,7 @@ uniform mat4 u_view_proj;
 uniform vec3 u_right;
 uniform vec3 u_up;
 uniform vec3 u_cam_pos;
+uniform float u_near_fade;    // 0 = off; else how close (radius / distance) a sprite may get before it fades
 uniform sampler2D u_rects;    // per sheet frame: left, top, right, bottom (0-1, from the image's top left)
 in vec2 in_corner;          // -1..1
 in vec3 in_center;
@@ -107,6 +109,16 @@ void main() {
     v_uv = vec2(mix(r.x, r.z, uv.x), 1.0 - mix(r.w, r.y, uv.y));
     v_color = in_color;
     gl_Position = u_view_proj * vec4(world, 1.0);
+    if (u_near_fade > 0.0) {
+        // A sprite right in front of the camera would cover the screen, and dozens of them
+        // (a bullet hitting the wall beside you) cost a full screen of blending each. Fade
+        // them out as they get big on screen, and drop the ones that would fill it.
+        float reach = in_trail > 0.0 ? max(in_radius, in_trail * 0.5) : in_radius;
+        float dist = max(distance(in_center, u_cam_pos), 1e-3);
+        float fade = clamp((u_near_fade * 2.0 - reach / dist) / u_near_fade, 0.0, 1.0);
+        v_color.a *= fade;
+        if (fade <= 0.0) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);    // off screen: never rasterised
+    }
 }
 """
 
@@ -886,6 +898,8 @@ class ParticleManager:
         self.program = ctx.program(vertex_shader=_VERT, fragment_shader=_FRAG)
         corners = np.array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1], dtype="f4")
         self._quad = ctx.buffer(corners.tobytes())
+        self._sim_tick = 0        # counts simulation steps (render reuses its packed instances between them)
+        self._draw_cache = None   # (signature, [(material, additive, start, count)]) for the non-overlay pass
         self._instances = ctx.buffer(reserve=MAX_TOTAL_PARTICLES * _FLOATS_PER_PARTICLE * 4, dynamic=True)
         self._scratch = np.zeros((MAX_TOTAL_PARTICLES, _FLOATS_PER_PARTICLE), "f4")
         self.vao = ctx.vertex_array(self.program, [
@@ -893,6 +907,9 @@ class ParticleManager:
             (self._instances, "3f 1f 1f 4f 3f 1f 1f/i", "in_center", "in_radius", "in_rotation",
              "in_color", "in_vel", "in_trail", "in_cell"),
         ])
+        self.program["u_texture"].value = 0
+        self.program["u_rects"].value = 1
+        self._batch_buffers = {}   # (material, overlay) -> (instance buffer, vao): see _pack_batches
         self._fallback = None
         # callable(from_vec3, to_vec3) -> RayHit or None, for particle collision.
         self.raycast = None
@@ -1103,11 +1120,13 @@ class ParticleManager:
         self._fallback_texture()
         front = glm.normalize(glm.vec3(camera.front))
         where = glm.vec3(camera.position) + front * 4.0
-        for i, name in enumerate(self.definitions):
-            self.spawn(name, where, overlay=(i % 2 == 0))
+        for name in self.definitions:      # both ways: a batch buffer exists per material AND overlay
+            self.spawn(name, where, overlay=True)
+            self.spawn(name, where, overlay=False)
         self.update(0.02)
         self.update(0.02)          # children start once their parent has run
-        self.render(camera)
+        self.render(camera, overlay=True)
+        self.render(camera, overlay=False)
         self.clear()
 
     def clear(self):
@@ -1126,6 +1145,7 @@ class ParticleManager:
         if self._pending_dt < 1.0 / SIM_RATE:
             return
         dt, self._pending_dt = self._pending_dt, 0.0
+        self._sim_tick += 1
         for effect in self.effects:
             effect.update(dt)
         self.effects = [e for e in self.effects if not e.finished]
@@ -1137,11 +1157,6 @@ class ParticleManager:
                 and (overlay is None or e.overlay == overlay)]
         if not live:
             return
-        # One batch per material: the effects sharing one are packed together.
-        batches = {}
-        for effect in live:
-            batches.setdefault((effect.definition.material, effect.overlay), []).append(effect)
-
         cam_pos = np.array([camera.position.x, camera.position.y, camera.position.z], "f4")
         front = glm.normalize(glm.vec3(camera.front))
         right = glm.normalize(glm.cross(front, glm.vec3(camera.up)))
@@ -1150,18 +1165,66 @@ class ParticleManager:
         program["u_view_proj"].write((camera.get_projection_matrix() * camera.get_view_matrix()).to_bytes())
         program["u_right"].value = tuple(right)
         program["u_up"].value = tuple(up)
-        program["u_texture"].value = 0
-        program["u_rects"].value = 1
         program["u_cam_pos"].value = tuple(cam_pos)
+
+        # Non-overlay effects only change when the simulation steps (at most SIM_RATE times a
+        # second, far fewer than frames at 1000 fps), so their packed, sorted instances are
+        # reused until it does. The blended sort order can be a few milliseconds stale - invisible.
+        # Overlay effects (the muzzle flash) follow the gun, so they're repacked every frame.
+        cacheable = overlay is False
+        signature = (self._sim_tick, tuple(map(id, live)))
+        cache = self._draw_cache if cacheable and self._draw_cache and self._draw_cache[0] == signature else None
+        if cache is not None:
+            draws = cache[1]
+        else:
+            draws = self._pack_batches(live, cam_pos, np.array(tuple(front), "f4"))
+            if cacheable:
+                self._draw_cache = (signature, draws)
 
         ctx = self.ctx
         ctx.depth_func = "<"
         ctx.disable(moderngl.CULL_FACE)
         ctx.enable(moderngl.BLEND)
         ctx.screen.depth_mask = False
+        for material, overlay_batch, additive, vao, count in draws:
+            program["u_near_fade"].value = 0.0 if overlay_batch else NEAR_FADE      # (the muzzle flash stays)
+            if overlay_batch or not self.depth_test:
+                ctx.disable(moderngl.DEPTH_TEST)
+            else:
+                ctx.enable(moderngl.DEPTH_TEST)
+            if additive:
+                ctx.blend_func = moderngl.ONE, moderngl.ONE
+            else:
+                ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
+            material.rects_texture.use(1)
+            material.texture.use(0)
+            vao.render(moderngl.TRIANGLES, vertices=6, instances=count)
+        ctx.screen.depth_mask = True
+        ctx.disable(moderngl.BLEND)
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.enable(moderngl.CULL_FACE)
+        ctx.cull_face = "back"
 
+    def _batch_buffer(self, key):
+        entry = self._batch_buffers.get(key)
+        if entry is None:
+            buffer = self.ctx.buffer(reserve=MAX_TOTAL_PARTICLES * _FLOATS_PER_PARTICLE * 4, dynamic=True)
+            vao = self.ctx.vertex_array(self.program, [
+                (self._quad, "2f", "in_corner"),
+                (buffer, "3f 1f 1f 4f 3f 1f 1f/i", "in_center", "in_radius", "in_rotation",
+                 "in_color", "in_vel", "in_trail", "in_cell"),
+            ])
+            entry = self._batch_buffers[key] = (buffer, vao)
+        return entry
+
+    def _pack_batches(self, live, cam_pos, front_np):
+        """Packs the live effects' particles into one buffer per (material, overlay) - one draw
+        call each. Returns [(material, overlay, additive, vao, count)]."""
+        batches = {}
+        for effect in live:
+            batches.setdefault((effect.definition.material, effect.overlay), []).append(effect)
+        draws = []
         filled = 0
-        front_np = np.array(tuple(front), "f4")
         for (material_name, overlay), effects in batches.items():
             start = filled
             material = self._material(material_name)
@@ -1173,33 +1236,25 @@ class ParticleManager:
                 filled += n
             if filled == start:
                 continue
-            if overlay or not self.depth_test:
-                ctx.disable(moderngl.DEPTH_TEST)
-            else:
-                ctx.enable(moderngl.DEPTH_TEST)
             batch = self._scratch[start:filled]
             if not material.additive:      # blended sprites: far ones first
                 batch = batch[np.argsort(-((batch[:, 0:3] - cam_pos) @ front_np))]
-            self._instances.orphan()      # (see UIRenderer.draw: never write a buffer still in flight)
-            self._instances.write(np.ascontiguousarray(batch).tobytes())
-            if material.additive:
-                ctx.blend_func = moderngl.ONE, moderngl.ONE
-            else:
-                ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
-            material.rects_texture.use(1)
-            material.texture.use(0)
-            self.vao.render(moderngl.TRIANGLES, vertices=6, instances=filled - start)
-
-        ctx.screen.depth_mask = True
-        ctx.disable(moderngl.BLEND)
-        ctx.enable(moderngl.DEPTH_TEST)
-        ctx.enable(moderngl.CULL_FACE)
-        ctx.cull_face = "back"
+            buffer, vao = self._batch_buffer((material_name, overlay))
+            # Orphan (never write a buffer still in flight - see UIRenderer.draw), re-allocating only
+            # what this batch needs (rounded up): the full-size buffer would be a 900 KB allocation
+            # per batch, which the driver has to find memory for every time.
+            buffer.orphan(((len(batch) * _FLOATS_PER_PARTICLE * 4) // 16384 + 1) * 16384)
+            buffer.write(np.ascontiguousarray(batch).tobytes())
+            draws.append((material, overlay, material.additive, vao, filled - start))
+        return draws
 
     def destroy(self):
         self.vao.release()
         self._quad.release()
         self._instances.release()
+        for buffer, vao in self._batch_buffers.values():
+            vao.release()
+            buffer.release()
         self.program.release()
         for material in self._materials.values():
             material.rects_texture.release()

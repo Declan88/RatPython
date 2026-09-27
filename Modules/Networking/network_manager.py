@@ -138,6 +138,28 @@ class NetworkManager:
         if self.client:
             self.client.run_callbacks()
 
+    def leave_lobby(self):
+        """Leaves the current lobby and forgets every other player (back to the main menu)."""
+        if self.client and self.current_lobby_id:
+            try:
+                self.client.leave_lobby(self.current_lobby_id)
+            except Exception as e:
+                print(f"[Net] leave_lobby failed: {e}")
+        for remote in self.remote_players.values():
+            remote.destroy()
+        self.remote_players.clear()
+        self.current_lobby_id = None
+        self.in_game = False
+        self._members = set()
+        self._member_order = []
+        self._heard_from.clear()
+        self._net_seen.clear()
+        self._retry_at.clear()
+        self._failed_logged.clear()
+        self._last_sent_state = None
+        self._pending_host = self._pending_join = None
+        self.local_alive = True
+
     @property
     def is_host(self):
         """Whether this player owns the lobby (the first member)."""

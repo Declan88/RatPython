@@ -1,1 +1,1 @@
-from .frame_profiler import FrameProfiler
+from .frame_profiler import FrameProfiler, FunctionProfiler

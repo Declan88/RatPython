@@ -1,3 +1,4 @@
+import gc
 import sys
 import pygame
 import os
@@ -128,6 +129,7 @@ from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
 from Modules.UI import Anchor, Crosshair, Hitmarker, Label, ProgressBar
 from Modules.UI.death_screen import DeathScreen
+from Modules.UI.pause_menu import PauseMenu
 from Modules.Graphics.tracers import Tracers
 from Modules.Particles import ParticleManager
 from Modules.Particles.blood import register_blood
@@ -563,6 +565,11 @@ def main():
     # screen's countdown runs out. `eye_drop` eases the camera down to the floor.
     death = {"pending": False, "active": False, "eye_drop": 0.0}
     death_screen = ui.root.add(DeathScreen(RESPAWN_SECONDS))
+    # ESC in a game: resume / disconnect to the main menu / quit. Added last so it draws on top.
+    pause = {"on": False, "quit": False}
+    pause_menu = ui.root.add(PauseMenu(
+        on_resume=lambda: set_paused(False), on_disconnect=lambda: disconnect(),
+        on_quit=lambda: pause.update(quit=True)))
 
     def change_health(delta):
         if death["active"] and delta < 0.0:
@@ -633,7 +640,16 @@ def main():
     def start_game(map_key):
         nonlocal in_menu, paper_doll
         menu_ui.visible = False
-        setup_game(map_key)
+        # Coming back to the map we disconnected from: everything for it is still built.
+        reuse = current_scene is not None and current_scene_key == map_key and player is not None
+        if reuse:
+            current_scene.sound_manager.resume_all()
+            player.teleport(SPAWN_POSITION)
+            change_health(health["max"])
+            if weapon is not None:
+                weapon.recoil.reset()
+        else:
+            setup_game(map_key)
         health_bar.visible = True
         crosshair.visible = True
         name_tags.visible = True
@@ -641,8 +657,10 @@ def main():
             local_player_model.set_hat(net_mgr.local_hat)
             local_player_model.set_tint(net_mgr.local_color)
             viewmodel.set_tint(net_mgr.local_color)
-            paper_doll = PaperDoll(window.ctx, local_player_model.obj)
-        prime_effects()
+            if not reuse:
+                paper_doll = PaperDoll(window.ctx, local_player_model.obj)
+        if not reuse:
+            prime_effects()
         in_menu = False
         ui.set_cursor_free(False)
         camera.yaw, camera.pitch, camera.front = game_look
@@ -656,6 +674,29 @@ def main():
             if obj is not None:
                 obj["visible_in_color"] = visible and third_person
                 obj["cast_shadow"] = visible
+
+    def set_paused(on):
+        pause["on"] = on
+        pause_menu.visible = on
+        ui.set_cursor_free(on)
+
+    def disconnect():
+        """Leaves the lobby and returns to the main menu (the map stays loaded in case it's picked again)."""
+        nonlocal in_menu
+        set_paused(False)
+        net_mgr.leave_lobby()
+        if death["active"] or death["pending"]:
+            death["active"] = death["pending"] = False
+            death_screen.hide()
+            set_local_body_visible(True)
+        current_scene.sound_manager.pause_all()
+        health_bar.visible = False
+        crosshair.visible = False
+        name_tags.visible = False
+        menu_ui.visible = True
+        in_menu = True
+        ui.set_cursor_free(True)
+        window.reset_frame_timer()
 
     def begin_death():
         death["pending"] = False
@@ -682,6 +723,39 @@ def main():
         death_screen.hide()
         net_mgr.notify_respawn()
 
+    def prime_shooting(prime_camera):
+        """Plays a shot for real - the gun and arm animations (and the player rig's upper-body
+        override), the muzzle flash pass between the world and the viewmodels, a tracer, the
+        impact effects - for about a second into the back buffer, so the first real shot doesn't
+        build any of it (pose caches, buffers, blend setups) in the middle of a frame."""
+        if weapon is None:
+            return
+        previous_hook = current_scene.before_viewmodels
+        current_scene.before_viewmodels = lambda: particles.render(prime_camera, overlay=True)
+        muzzle = glm.vec3(prime_camera.position) + prime_camera.front * 0.6
+        end = glm.vec3(prime_camera.position) + prime_camera.front * 8.0
+        weapon.play("shoot")
+        if weapon.muzzle_particle:
+            particles.spawn(weapon.muzzle_particle, muzzle, forward=prime_camera.front, up=prime_camera.up,
+                            overlay=True, colors=weapon.muzzle_color, size=weapon.muzzle_size,
+                            offset_scale=weapon.muzzle_offset_scale)
+        tracers.add(muzzle, end)
+        for _ in range(10):
+            current_scene.update(0.1)
+            window.ctx.clear(0.1, 0.1, 0.1, 1.0)
+            current_scene.render(prime_camera, None)
+            tracers.render(prime_camera)
+            particles.update(0.1)
+            particles.render(prime_camera, overlay=False)
+        weapon.play("idle")
+        current_scene.update(0.1)
+        window.ctx.clear(0.1, 0.1, 0.1, 1.0)
+        current_scene.render(prime_camera, None)
+        current_scene.before_viewmodels = previous_hook
+        particles.clear()
+        player.teleport(SPAWN_POSITION)       # the frames above let it fall a little
+        weapon.recoil.reset()
+
     def prime_effects():
         """Warms everything a first death, shot or hit would load or compile lazily - gib
         meshes and materials, blood and impact textures, sounds, the hit marker and death screen
@@ -702,10 +776,15 @@ def main():
                 current_scene.gibs.match_material(local_player_model.obj)
             current_scene.gibs.prime(prime_camera, tint=net_mgr.local_color)
         particles.prime(prime_camera)
+        prime_shooting(prime_camera)
         hitmarker.prime()
         death_screen.show()       # one invisible frame builds its text
         ui.render()
         death_screen.hide()
+        # Everything built so far lives for the rest of the game: keep the garbage collector from
+        # re-scanning it (a full collection mid-game is a visible hitch).
+        gc.collect()
+        gc.freeze()
         window.reset_frame_timer()
 
     menu_ui = menu_scene.build_ui(ui, net_mgr, MAPS, on_start=request_start)
@@ -722,6 +801,9 @@ def main():
         """window.handle_events' event filter: counts left clicks (from the
         event queue, so none is lost between frames) and then lets the UI have
         the event as before."""
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and not in_menu:
+            set_paused(not pause["on"])
+            return True
         if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                 and not in_menu and not ui.cursor_free):
             trigger_clicks[0] += 1
@@ -755,6 +837,8 @@ def main():
             camera, on_key_down=on_key_down, event_filter=count_click
         )
 
+        if pause["quit"]:
+            break
         if pending_start is not None:
             start_map, pending_start = pending_start, None
             start_game(start_map)
@@ -806,7 +890,10 @@ def main():
             move_dir -= camera.get_flat_right()
         if keys[pygame.K_d]:
             move_dir += camera.get_flat_right()
-        if alive:
+        if alive and pause["on"]:
+            player.set_move_direction(glm.vec3(0.0))
+            player.set_sprinting(False)
+        elif alive:
             player.set_move_direction(move_dir)
             player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
             player.set_crouching(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL])
@@ -988,7 +1075,10 @@ def main():
         particles.render(camera, overlay=False)
         prof.mark("tracers + particles")
         if prof.enabled:
-            profile_label.text = "\n".join(prof.lines)
+            text = "\n".join(prof.lines)
+            if text != profile_label.text:
+                prof.ignore_frame()       # re-drawing the overlay's own text is a spike we caused
+                profile_label.text = text
         ui.render()
         prof.mark("ui.render")
         if paper_doll is not None:

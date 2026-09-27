@@ -27,12 +27,16 @@ class FrameProfiler:
         self.header = lambda: ""  # callable -> extra header text (role, players); set by the game
         self.counters = {}       # name -> running count (packets in...), rate shown per second
         self._counter_base = {}
+        self._marks = {}         # this frame's stage times (mark() only)
+        self._ignore = False
+        self._worst = (0.0, {})  # the slowest frame of the window: total seconds, stage times
 
     def set_enabled(self, on):
         self.enabled = bool(on)
         self._acc.clear()
         self._order.clear()
         self._frames = 0
+        self._worst = (0.0, {})
         self._counter_base = dict(self.counters)
         self._window_start = self._last_log = time.perf_counter()
         self.lines = ["profiling..."] if on else []
@@ -40,6 +44,7 @@ class FrameProfiler:
     def begin(self):
         if self.enabled:
             self._t = time.perf_counter()
+            self._marks = {}
 
     def mark(self, name):
         """Charges the time since the previous mark (or begin) to `name`."""
@@ -47,6 +52,7 @@ class FrameProfiler:
             return
         now = time.perf_counter()
         self.add(name, now - self._t)
+        self._marks[name] = self._marks.get(name, 0.0) + now - self._t
         self._t = now
 
     def add(self, name, seconds):
@@ -59,6 +65,10 @@ class FrameProfiler:
             self._order.append(name)
         self._acc[name] += seconds
 
+    def ignore_frame(self):
+        """Keeps this frame out of the 'worst frame' line (a spike the profiler itself caused)."""
+        self._ignore = True
+
     def count(self, name, amount=1):
         self.counters[name] = self.counters.get(name, 0) + amount
 
@@ -67,6 +77,10 @@ class FrameProfiler:
             return
         self._frames += 1
         now = time.perf_counter()
+        frame_total = sum(self._marks.values())
+        if frame_total > self._worst[0] and not self._ignore:
+            self._worst = (frame_total, self._marks)
+        self._ignore = False
         span = now - self._window_start
         if span < 1.0:
             return
@@ -75,6 +89,10 @@ class FrameProfiler:
         lines = [f"{frames / span:6.0f} fps   {span / frames * 1000:6.2f} ms/frame"]
         for name in self._order:
             lines.append(f"{name:<26s} {self._acc[name] / frames * 1000:6.3f} ms")
+        worst_total, worst_marks = self._worst
+        if worst_marks:
+            top = sorted(worst_marks.items(), key=lambda kv: -kv[1])[:3]
+            lines.append(f"worst frame {worst_total * 1000:.2f} ms: " + ", ".join(f"{k} {v * 1000:.2f}" for k, v in top))
         rates = [f"{k} {(v - self._counter_base.get(k, 0)) / span:.0f}/s" for k, v in self.counters.items()]
         if rates:
             lines.append("   ".join(rates))
@@ -82,6 +100,7 @@ class FrameProfiler:
         self._counter_base = dict(self.counters)
         self._acc = {k: 0.0 for k in self._acc}
         self._frames = 0
+        self._worst = (0.0, {})
         self._window_start = now
         if now - self._last_log >= _LOG_INTERVAL:
             self._last_log = now
@@ -96,3 +115,47 @@ class FrameProfiler:
                 f.write("\n".join(lines) + "\n")
         except OSError:
             pass
+
+
+class FunctionProfiler:
+    """F8: records every Python function call until F8 is pressed again, then writes the most
+    expensive ones to ~/.ratwar/function_profile.txt. Slow while recording (expect a much lower
+    fps) - it's for finding WHICH functions cost what, not for measuring fps."""
+
+    def __init__(self):
+        self.profile = None
+
+    @property
+    def active(self):
+        return self.profile is not None
+
+    def toggle(self):
+        import cProfile
+        if self.profile is None:
+            self.profile = cProfile.Profile()
+            self.profile.enable()
+            return None
+        self.profile.disable()
+        profile, self.profile = self.profile, None
+        return self._write(profile)
+
+    @staticmethod
+    def _write(profile):
+        import io
+        import pstats
+        try:
+            folder = os.path.join(os.path.expanduser("~"), ".ratwar")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "function_profile.txt")
+            out = io.StringIO()
+            stats = pstats.Stats(profile, stream=out)
+            out.write("== by time spent inside each function itself ==\n")
+            stats.sort_stats("tottime").print_stats(45)
+            out.write("\n== by time including everything it calls ==\n")
+            stats.sort_stats("cumtime").print_stats(45)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(out.getvalue())
+            return path
+        except OSError:
+            return None
+
