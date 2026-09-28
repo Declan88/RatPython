@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from Modules.settings import settings
 import math
+import os
+import time as _time
 from pathlib import Path
+
+
+def _dbg_active():  # TEMP DEBUG (RATWAR_AUTOTEST)
+    until = os.environ.get("RATWAR_DEBUG_UNTIL")
+    return until is not None and _time.perf_counter() < float(until)
 
 import moderngl
 import pygame
@@ -170,12 +177,35 @@ def _begin_pose_snapshot(obj, duration):
     which reads as looking one way and turning back. A snapshot of the real
     last pose has no such gap. Returns True if a snapshot was taken; the
     caller then makes its own crossfade instant so the two don't stack."""
+    if duration <= 0.0:
+        # A real hard cut (e.g. ViewModel.play's one-shot states) must
+        # actually BE instant - cancel any snapshot blend still in flight
+        # from an EARLIER call on this same obj this frame (e.g. Scene.
+        # set_weapon's own "idle" transition, which uses the default
+        # nonzero blend and runs right before a one-shot "draw" on the
+        # very next line). Without this, that leftover obj["pose_snap"]
+        # keeps blending on subsequent frames (see Scene.update()'s own
+        # per-frame pose-snap advance) toward whatever the NEW one-shot
+        # clip's rapidly-changing pose is - two unrelated poses
+        # interpolated joint-by-joint, which reads as the mesh briefly
+        # flying apart rather than a clean cut (confirmed: this is what
+        # was actually causing the pistol's draw animation to look
+        # "totally wrong" for its first second or so before snapping
+        # correct - not anything in the draw clip's own keyframes).
+        if _dbg_active() and obj.get("viewmodel"):
+            print(f"[PS DEBUG] _begin_pose_snapshot obj={id(obj)} duration<=0 -> pose_snap cleared, returning False")
+        obj["pose_snap"] = None
+        return False
     last = obj["skeleton"].last_pose
-    if last is None or duration <= 0.0:
+    if last is None:
+        if _dbg_active() and obj.get("viewmodel"):
+            print(f"[PS DEBUG] _begin_pose_snapshot obj={id(obj)} duration={duration} but last_pose is None -> False")
         return False
     obj["pose_snap"] = list(last)
     obj["pose_snap_elapsed"] = 0.0
     obj["pose_snap_duration"] = duration
+    if _dbg_active() and obj.get("viewmodel"):
+        print(f"[PS DEBUG] _begin_pose_snapshot obj={id(obj)} duration={duration} -> SNAPSHOT TAKEN, True")
     return True
 
 
@@ -1716,7 +1746,11 @@ class Scene:
         restart the crossfade from scratch each time and it would never
         finish."""
         if animation_name == obj["animation"] and obj["locomotion_weights"] is None:
+            if _dbg_active() and obj.get("viewmodel"):
+                print(f"[SSA DEBUG] set_skeletal_animation obj={id(obj)} name={animation_name!r} blend_duration={blend_duration} -> NO-OP (already current)")
             return
+        if _dbg_active() and obj.get("viewmodel"):
+            print(f"[SSA DEBUG] set_skeletal_animation obj={id(obj)} {obj['animation']!r} -> {animation_name!r} blend_duration={blend_duration} loop={loop} start_time={start_time} cur_anim_time={obj['anim_time']:.4f} locomotion_weights_was={obj['locomotion_weights']}")
         if _begin_pose_snapshot(obj, blend_duration):
             blend_duration = 0.0
         obj["prev_animation"] = obj["animation"]
@@ -3168,6 +3202,8 @@ class Scene:
                     skeleton._pose_snap = (snap, w * w * (3.0 - 2.0 * w))
             else:
                 skeleton._pose_snap = None
+            if _dbg_active() and obj.get("viewmodel"):
+                print(f"[FRAME DEBUG] obj={id(obj)} skel={id(skeleton)} animation={obj['animation']!r} anim_time={obj['anim_time']:.4f} anim_blend_dur={obj['anim_blend_duration']:.4f} anim_blend_elapsed={obj['anim_blend_elapsed']:.4f} prev_animation={obj['prev_animation']!r} prev_anim_time={obj['prev_anim_time']:.4f} pose_snap={'ACTIVE w=%.3f' % skeleton._pose_snap[1] if skeleton._pose_snap is not None else 'None'} skip_pose={skip_pose}")
 
             # Every track (lower, and upper if this obj has a split) is
             # fed into Skeleton's weighted-list sampler either way - a
@@ -3257,8 +3293,27 @@ class Scene:
                 request = pose_batch.make_request(
                     skeleton, weighted_lower, obj["prev_animation"], obj["prev_anim_time"], lower_blend_weight)
                 if request is not None:
+                    if _dbg_active() and obj.get("viewmodel"):
+                        ref = skeleton.compute_bone_matrices_multi(
+                            weighted_lower,
+                            prev_animation_name=obj["prev_animation"], prev_time=obj["prev_anim_time"],
+                            blend_weight=lower_blend_weight,
+                        )
+                        from Modules.Graphics import pose_batch as _pb
+                        fast_bones, fast_last_pose = _pb.evaluate([request])[0]
+                        max_diff = 0.0
+                        worst_joint = -1
+                        for ji in range(len(ref)):
+                            fm = fast_bones[ji]
+                            rm = ref[ji]
+                            d = max(abs(fm[c][r] - rm[c][r]) for c in range(4) for r in range(4))
+                            if d > max_diff:
+                                max_diff, worst_joint = d, ji
+                        print(f"[POSEBATCH DEBUG] obj={id(obj)} anim={weighted_lower} FAST-PATH ENGAGED max_diff={max_diff:.6f} worst_joint={worst_joint}({skeleton.joints[worst_joint].name if worst_joint>=0 else '?'})")
                     pose_requests.append((obj, request))
                     continue
+                if _dbg_active() and obj.get("viewmodel"):
+                    print(f"[POSEBATCH DEBUG] obj={id(obj)} anim={weighted_lower} fast path NOT engaged (reference path used)")
                 obj["bone_matrices"] = skeleton.compute_bone_matrices_multi(
                     weighted_lower,
                     prev_animation_name=obj["prev_animation"], prev_time=obj["prev_anim_time"],

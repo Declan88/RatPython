@@ -36,6 +36,12 @@ _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
 _SPINE4 = "ValveBiped.Bip01_Spine4"
 
 
+def _debug_active():  # TEMP DEBUG (RATWAR_AUTOTEST)
+    import os
+    until = os.environ.get("RATWAR_DEBUG_UNTIL")
+    return until is not None and time.perf_counter() < float(until)
+
+
 def _first_clip_name(path, skin_index=0):
     """Name of the first animation in a glb that actually animates the given
     skin's joints (None if none does) - a file holding several rigs has one
@@ -54,11 +60,19 @@ def _first_clip_name(path, skin_index=0):
     return None
 
 
-def _load_state_clip(scene, obj, path, clip_name, skin_index=0):
+def _load_state_clip(scene, obj, path, clip_name, skin_index=0, time_scale=1.0):
     """Merges the clip of `path` that animates its skin `skin_index` onto obj's
     skeleton as `clip_name`. Returns the name to play (clip_name), or None when
     there was nothing to load. A path of None means the clip already lives in
-    the model's own file: the skeleton's first clip is used as-is."""
+    the model's own file: the skeleton's first clip is used as-is.
+
+    time_scale: scales every keyframe TIME (not the poses) by this factor as
+    it's merged in, same mechanism this project already uses to correct a
+    file baked at the wrong fps (see load_animation_clips' own docstring) -
+    here it's what a speed multiplier like USP's own draw_speed actually
+    does: 1/draw_speed shrinks the clip's timeline, so it plays through the
+    same poses in less real time. Baked in at load time rather than adjusted
+    per-frame, so it costs nothing beyond the one-time merge."""
     if obj is None or "skeleton" not in obj:
         return None
     animations = obj["skeleton"].animations
@@ -69,7 +83,8 @@ def _load_state_clip(scene, obj, path, clip_name, skin_index=0):
     source = _first_clip_name(path, skin_index)
     if source is None:
         return None
-    added = scene.load_additional_animations(obj, path, rename={source: clip_name}, skin_index=skin_index)
+    added = scene.load_additional_animations(
+        obj, path, rename={source: clip_name}, skin_index=skin_index, time_scale=time_scale)
     return clip_name if clip_name in added else None
 
 
@@ -106,10 +121,25 @@ class Shot:
         self.spread = spread         # the cone half-angle (degrees) it was drawn from
 
 
+class FireMode:
+    """A weapon's fire_mode (below) - what shots_this_frame does with a
+    frame's clicks/held state. SEMI and AUTO are built into shots_this_frame
+    itself; CUSTOM is a marker meaning "this class overrides shots_this_frame
+    with its own logic" (burst fire, etc.) - see that method's own docstring."""
+    SEMI = "semi"
+    AUTO = "auto"
+    CUSTOM = "custom"
+
+
 class WeaponsBase:
     name = "weapon"
     # Prefix for clip names this weapon adds to a rig (see module docstring).
     animation_prefix = "pistol"
+    # A square icon file - the weapon select HUD (Modules/UI/weapon_hud.py)
+    # and the kill feed (Modules/UI/killfeed.py's own WEAPON_ICONS, keyed by
+    # `name` since a kill feed entry only ever has the weapon's name off the
+    # wire, not the class) both show it. None draws no icon.
+    icon = None
 
     # ---- gunfire sound -------------------------------------------------
     fire_sound = "Assets/Audio/Guns/USP/usp_unsil-1.wav"
@@ -121,8 +151,42 @@ class WeaponsBase:
     # distant gunfire rather than just a quieter close one.
     fire_min_distance = 5.0
     fire_max_distance = 160.0
-    fire_interval = 0.0       # minimum seconds between shots (0 = as fast as the owner fires)
-    automatic = False         # True: holding the trigger keeps firing; False: one shot per click
+    fire_interval = 0.0        # minimum seconds between shots (0 = as fast as the owner can trigger it)
+    fire_mode = FireMode.SEMI  # see FireMode/shots_this_frame - was a bare `automatic` bool before
+
+    # ---- ammo / reload --------------------------------------------------
+    # 0 = no ammo tracking at all (unlimited, never needs a reload - the
+    # behavior every weapon had before this existed). A positive value is
+    # the magazine's capacity; fire() refuses to shoot at 0 rounds left
+    # (see can_fire) until start_reload() finishes. Both reload and draw
+    # (below) finish exactly when their OWN real animation does - see
+    # _one_shot_still_playing - not a guessed duration constant (an earlier
+    # version of this used reload_time/draw_time timers, which kept drifting
+    # out of sync with the actual clip's real length - see git history).
+    magazine_size = 12
+
+    # ---- draw --------------------------------------------------------
+    # Playback-speed multiplier for the "draw" state (see viewmodel_
+    # animations' own "draw" entry) - 1.5 = 50% faster. Baked into the
+    # clip's own timeline when it's loaded (see _load_state_clip's own
+    # time_scale param), so the animation itself visibly speeds up, and
+    # can_fire/start_reload (bound to the same real clip - see drawing's own
+    # docstring) unblock exactly that much sooner too, automatically.
+    draw_speed = 1.0
+
+    @property
+    def drawing(self):
+        """True while this weapon's draw animation is still ACTUALLY playing
+        on the first-person viewmodel (see ViewModel.is_one_shot_active) -
+        fire()/start_reload() both refuse while this is true, same idea as
+        `reloading`. Resolves False immediately (nothing to wait for) for a
+        weapon with no viewmodel at all (e.g. a remote player's own copy -
+        see RemotePlayer) or no "draw" clip loaded."""
+        return self._one_shot_still_playing("draw")
+
+    def _one_shot_still_playing(self, state):
+        vm = self._viewmodel
+        return vm is not None and vm.is_one_shot_active(state)
 
     # ---- accuracy ------------------------------------------------------
     # Shots land within a cone of half-angle "spread" degrees around the aim.
@@ -157,10 +221,18 @@ class WeaponsBase:
     max_range = 500.0         # metres a shot's line trace reaches
 
     # ---- models --------------------------------------------------------
-    # First person: ONE glb holding both the arms and the gun, each with its own
-    # rig (skin index) and its own baked animation.
+    # First person: viewmodel_model holds the arms, each with its own rig
+    # (skin index) and baked animation. The gun normally lives in that same
+    # file as a second skin (viewmodel_gun_skin) - pistol.glb's own
+    # convention - but viewmodel_gun_model lets it come from a SEPARATE
+    # file instead (None means "same file as the arms"), for a weapon whose
+    # gun was modeled/exported on its own (e.g. GoudaGun's Gouda_Anims.glb,
+    # which has no arms of its own at all - see gouda_gun.py). Either way
+    # the gun's rig needs the same joint names as viewmodel_model's arms
+    # rig for viewmodel_animations' clips to play on both correctly.
     viewmodel_model = f"{_POSE_DIR}/pistol.glb"
     viewmodel_arms_skin = 0
+    viewmodel_gun_model = None
     viewmodel_gun_skin = 1
     worldmodel = f"{_POSE_DIR}/pistolWM.glb"
     # The character joint the world model is held by, and its placement in
@@ -193,6 +265,12 @@ class WeaponsBase:
     # (viewmodel_gun_skin) plays on the arms too - joints the arms don't have
     # are simply skipped. States in viewmodel_one_shot_states play once and
     # then drop back to idle.
+    #
+    # A value can also be (path, skin_index) instead of a bare path, to read
+    # a DIFFERENT rig than viewmodel_gun_skin from that one file - needed for
+    # USP's own "reload" entry (see usp.py): unlike pistol_idle.glb/pistol_
+    # shoot.glb, pistol_reload.glb's gun rig happens to be its skin 0, not 1
+    # (confirmed by inspecting the file directly - it has only one skin).
     viewmodel_animations = {
         "idle": f"{_POSE_DIR}/pistol_idle.glb",
         "shoot": f"{_POSE_DIR}/pistol_shoot.glb",
@@ -224,12 +302,56 @@ class WeaponsBase:
         self._viewmodel = None
         self._clips = {}   # (part, state) -> clip name actually loaded
         self._moving = False
+        # magazine_size <= 0 means "no ammo tracking" (every weapon's old,
+        # only behavior) - ammo then just sits unused, can_fire/fire never
+        # consult it, and start_reload always refuses (nothing to refill).
+        self.ammo = self.magazine_size
+        self._reloading = False
 
     # ---- firing --------------------------------------------------------
 
+    @property
+    def reloading(self):
+        return self._reloading
+
     def can_fire(self, now=None):
+        if self._reloading or self.drawing:
+            return False
+        if self.magazine_size > 0 and self.ammo <= 0:
+            return False
         now = time.perf_counter() if now is None else now
-        return now - self._last_fire >= self.fire_interval
+        # A tiny epsilon, not a bare >= - two calls exactly fire_interval
+        # apart can otherwise miss a shot to plain float error (e.g.
+        # 0.4 - 0.3 == 0.09999999999999998 in IEEE 754, just under 0.1)
+        # rather than any real timing issue.
+        return now - self._last_fire >= self.fire_interval - 1e-9
+
+    def shots_this_frame(self, click_edges, trigger_held):
+        """How many times to call fire() this frame - the fire_mode-driven
+        replacement for a caller (app.py) directly branching on a bare
+        `automatic` bool. click_edges: real trigger pulls since last frame
+        (each one a fresh press, even if several land in the same frame -
+        see app.py's own trigger_clicks); trigger_held: whether the mouse
+        button is down RIGHT NOW, for a frame-by-frame check.
+
+        FireMode.SEMI (default): exactly click_edges - one shot per press,
+        holding the trigger down does nothing further until it's released
+        and pressed again.
+
+        FireMode.AUTO: 1 every frame the trigger's held (0 otherwise) -
+        fire_interval (checked inside fire()/can_fire, not here) is what
+        actually paces the real rate of fire; this just keeps offering it
+        a shot to take every frame while held.
+
+        FireMode.CUSTOM: this base implementation fires nothing - the whole
+        point of CUSTOM is a subclass overrides this method itself with
+        bespoke logic (burst fire, a charge-up weapon, ...) instead of
+        picking between the two built-in shapes above."""
+        if self.fire_mode == FireMode.AUTO:
+            return 1 if trigger_held else 0
+        if self.fire_mode == FireMode.SEMI:
+            return click_edges
+        return 0
 
     def spread_degrees(self, now=None):
         """The weapon's accuracy right now: the half-angle (degrees) of the
@@ -257,6 +379,8 @@ class WeaponsBase:
             return None
         spread = self.spread_degrees(now)
         self._last_fire = now
+        if self.magazine_size > 0:
+            self.ammo -= 1
         self._spread_at_last_shot = min(self.spread_max, spread + self.spread_per_shot)
         self.play_fire_sound(scene, position, follow)
         self.play("shoot")
@@ -277,6 +401,43 @@ class WeaponsBase:
             headshot = head is not None and head.owner == hit.owner
         damage = self.damage * self.headshot_multiplier if headshot else self.damage
         return Shot(hit, damage, aim, spread, headshot)
+
+    # ---- ammo / reload --------------------------------------------------
+
+    def start_reload(self, now=None):
+        """Begins a reload (plays the "reload" state - see viewmodel_
+        animations/worldmodel_animations) if the magazine isn't already full
+        and one isn't already running. update() (call once a frame
+        regardless of input) finishes it once the animation actually does
+        (see _one_shot_still_playing) - not a guessed duration. Returns
+        whether one actually started - False for a weapon with no ammo
+        tracking (magazine_size <= 0), one already full, one already
+        reloading, or still mid-draw."""
+        if self.magazine_size <= 0 or self._reloading or self.drawing or self.ammo >= self.magazine_size:
+            return False
+        self._reloading = True
+        self.play("reload")
+        return True
+
+    def update(self, now=None):
+        """Call once a frame regardless of input (app.py's main loop does):
+        auto-starts a reload the instant the magazine runs dry (so running
+        empty mid-fight reloads on its own, same as most games - no need to
+        remember the reload key), and finishes an in-progress reload once its
+        OWN animation has actually finished playing (see
+        _one_shot_still_playing - a weapon with no viewmodel/no reload clip
+        at all finishes instantly, same as it always refilling used to when
+        this was a guessed timer), refilling the magazine and dropping back
+        to idle. A no-op for a weapon with no ammo tracking at all
+        (magazine_size <= 0)."""
+        if self._reloading:
+            if not self._one_shot_still_playing("reload"):
+                self._reloading = False
+                self.ammo = self.magazine_size
+                self.play("idle")
+            return
+        if self.magazine_size > 0 and self.ammo <= 0:
+            self.start_reload(now)
 
     def muzzle_position(self, scene):
         """Where this weapon's bullets come out, in the world: the first-person
@@ -313,12 +474,34 @@ class WeaponsBase:
     def player_clip(self, state="idle"):
         return f"{self.animation_prefix}_{state}"
 
-    def equip_player(self, scene, player_model):
-        """Puts the world model in the character's hand and poses its upper
-        body with this weapon's player animation. player_model: a
-        PlayerModel (Modules/Player/player_model.py). The pose needs one built
-        with an override_upper_body_root_joints split (the local player's is);
-        on one without, only the world model is attached."""
+    def equip_player(self, scene, player_model, activate=True):
+        """Puts the world model in the character's hand and merges this
+        weapon's player animation, then - unless activate=False - ACTIVATES
+        it (see set_active: shows the world model and takes over the
+        player's upper-body pose). player_model: a PlayerModel (Modules/
+        Player/player_model.py). The pose needs one built with an
+        override_upper_body_root_joints split (the local player's is); on
+        one without, only the world model is attached.
+
+        activate=False PRIMES this weapon (loads everything) WITHOUT
+        touching the player's current pose or showing its world model - for
+        pre-loading a weapon the player isn't holding yet (see app.py's own
+        setup_game, which primes every non-current slot this way right after
+        equipping the real one) without stealing the pose out from under
+        whichever weapon actually IS active.
+
+        If this exact weapon is already primed for this (scene, player_model)
+        pair - i.e. this isn't the first time it's been equipped there, just
+        switching back to it (or re-priming it, which is then just a no-op) -
+        this is just set_active(activate): no re-loading, no rebuilding its
+        world model from scratch. That's what makes app.py's own weapon
+        switching near-instant on anything but a weapon's very first equip
+        (see switch_weapon's own docstring) - an earlier version of this
+        fully tore down and rebuilt the world model on EVERY switch, which is
+        what caused a stutter each time."""
+        if scene is self._scene and player_model is self._player_model and self.worldmodel_obj is not None:
+            self.set_active(activate)
+            return
         self.unequip_player()
         self._scene = scene
         self._player_model = player_model
@@ -330,14 +513,66 @@ class WeaponsBase:
             clip = _load_state_clip(scene, player_obj, path, self.player_clip(state))
             if clip is not None:
                 self._clips[("player", state)] = clip
-        idle = self._clips.get(("player", "idle"))
-        if idle is not None and getattr(player_model, "_override_upper_body_root_joints", None) is not None:
-            player_model.set_upper_override(idle)
-            offsets = self._upper_offsets()
-            if offsets:
-                player_model.set_upper_rotation_offset(offsets)
 
         self._attach_worldmodel(scene, player_obj)
+        self.set_active(activate)
+
+    def set_active(self, active):
+        """Shows/hides this weapon's world model, and - only while
+        active - makes it the player's upper-body pose AND plays "draw" (see
+        can_fire/start_reload, both of which refuse until it's actually
+        finished playing - drawing) fresh, matching the draw animation
+        restarting from the beginning every time. Falls back to whatever
+        ViewModel.set_weapon already set (idle) for a weapon with no "draw"
+        clip of its own - play()/ViewModel.play() both just skip a state with
+        nothing loaded for it rather than clearing what's already showing.
+        Near-instant either way: no loading, unlike equip_player's own
+        first-time path (see its docstring) - this is what a weapon SWITCH
+        actually does once both weapons involved are already primed."""
+        if self.worldmodel_obj is not None:
+            self.worldmodel_obj["visible_in_color"] = active
+            self.worldmodel_obj["cast_shadow"] = active
+        if not active:
+            return
+        if _debug_active():
+            print(f"[WB DEBUG] set_active(True) weapon={self.name} -> play('draw')")
+        self.play("draw")
+        idle = self._clips.get(("player", "idle"))
+        if (idle is not None and self._player_model is not None
+                and getattr(self._player_model, "_override_upper_body_root_joints", None) is not None):
+            self._player_model.set_upper_override(idle)
+            offsets = self._upper_offsets()
+            if offsets:
+                self._player_model.set_upper_rotation_offset(offsets)
+
+    def deactivate(self):
+        """Hides this weapon WITHOUT unloading it - see equip_player's own
+        docstring on why this (not unequip_player) is what a weapon switch
+        calls on the outgoing weapon. Also cancels an in-progress reload
+        rather than letting it keep running unseen: the viewmodel it was
+        playing on is about to show the NEXT weapon's animations instead
+        (there's only one active one-shot slot per ViewModel - see
+        is_one_shot_active), so _one_shot_still_playing("reload") would
+        read as finished the moment anything else plays, silently
+        refilling the magazine in the background whether or not the
+        player switches back. Cancelling here means switching back to
+        this weapon later needs a fresh reload, same as most shooters -
+        the magazine keeps whatever it had before the reload started.
+
+        Also resets recoil: recoil.apply() (app.py's main loop) only runs
+        for the currently ACTIVE weapon, so an unsettled kick from a shot
+        fired right before switching away would otherwise sit frozen
+        (recoil.update never gets called while inactive to drain it) and
+        resume easing itself back to neutral the instant this weapon is
+        drawn again - since the viewmodel is camera-relative, that read as
+        the gun visibly sliding into place right after the (otherwise
+        instant, blend_duration=0.0) draw cut."""
+        if _debug_active():
+            print(f"[WB DEBUG] deactivate() weapon={self.name}")
+        if self._reloading:
+            self._reloading = False
+        self.recoil.reset()
+        self.set_active(False)
 
     def _attach_worldmodel(self, scene, player_obj):
         if not self.worldmodel:
@@ -387,12 +622,17 @@ class WeaponsBase:
             if offsets:
                 model.set_upper_rotation_offset(offsets)
 
-    def equip_viewmodel(self, viewmodel):
+    def equip_viewmodel(self, viewmodel, activate=True):
         """Shows this weapon's first-person gun on `viewmodel` (a ViewModel -
         Modules/Player/viewmodel.py) and gives its arms this weapon's arm
-        animations."""
+        animations. activate=False PRIMES it (loads everything) without
+        showing it or hiding whichever weapon IS currently shown - see
+        equip_player's own activate docstring, which this mirrors."""
         self._viewmodel = viewmodel
-        viewmodel.set_weapon(self)
+        if activate:
+            viewmodel.set_weapon(self)
+        else:
+            viewmodel.prime_weapon(self)
 
     def unequip_player(self):
         if self.worldmodel_obj is not None and self._scene is not None:

@@ -291,6 +291,42 @@ class AnimationClip:
         # intended loop and this stays a plain, predictable "however
         # many frames are actually in the file" duration).
         self.duration = max((c.times[-1] for c in channels if len(c.times) > 0), default=0.0)
+        self._effective_duration = None
+
+    @property
+    def effective_duration(self):
+        """`duration`, minus any trailing static hold - the last authored
+        keyframes repeating the same pose with no actual motion (seen in
+        pistol_draw.glb: its "done moving" point is ~1.63s into a 3.2s
+        clip, the rest just re-stating the final pose - likely padding to
+        line up with a shared timeline of sibling clips at export time).
+        A one-shot's gameplay completion (WeaponsBase.drawing/reloading,
+        via ViewModel.is_one_shot_active) waits for THIS, not `duration` -
+        otherwise the player stands frozen on the already-finished pose
+        for the hold's length before they're allowed to fire, which reads
+        as a stuck/laggy draw even though the animation itself is done.
+        For a clip with no such hold (every other clip here, confirmed by
+        inspecting the raw glTF directly) this equals `duration` exactly,
+        so it's a no-op there. Computed lazily and cached since it's
+        O(channels x keyframes) - only needed once per clip, not sampled
+        every frame like sample_pose."""
+        if self._effective_duration is None:
+            latest = 0.0
+            for ch in self.channels:
+                values = ch.values
+                if len(values) < 2:
+                    continue
+                final = values[-1]
+                cutoff = ch.times[0]
+                for i in range(len(values) - 2, -1, -1):
+                    if any(abs(a - b) > 1e-4 for a, b in zip(values[i], final)):
+                        cutoff = ch.times[i + 1]
+                        break
+                else:
+                    cutoff = ch.times[0]
+                latest = max(latest, cutoff)
+            self._effective_duration = latest if latest > 0.0 else self.duration
+        return self._effective_duration
 
     def sample_pose(self, joint_count, time):
         """Returns a list of length joint_count: local_translation (vec3

@@ -58,6 +58,10 @@ def baked_clip(skeleton, name):
     joint_count = len(skeleton.joints)
     key = _fingerprint(clip, joint_count)
     cached = _baked.get(key)
+    import os, time as _t
+    _until = os.environ.get("RATWAR_DEBUG_UNTIL")
+    if _until is not None and _t.perf_counter() < float(_until):
+        print(f"[BAKE DEBUG] skeleton={id(skeleton)} clip={name!r} joint_count={joint_count} key={key} cache_hit={cached is not None}")
     if cached is None:
         cached = _baked[key] = _bake(clip, joint_count) or False
     return cached or None

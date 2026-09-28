@@ -178,6 +178,9 @@ class RemotePlayer:
         self._hitbox_key = None
         self.on_death = None        # callback(feet_position, velocity, fur colour), set by NetworkManager
         self._death_seen = None
+        self._kill_seen = None
+        self.kills = 0    # kills this player has been credited for (see NetworkManager.local_kills)
+        self.deaths = 0   # times this player has died
         self._pending_death = False
         self._alive_wanted = True
 
@@ -218,6 +221,10 @@ class RemotePlayer:
         if self._death_seen is not None and deaths > self._death_seen:
             self._pending_death = True
         self._death_seen = deaths
+        self.deaths = deaths
+        kills = int(state.get("ki", 0))
+        self._kill_seen = kills
+        self.kills = kills
         self._alive_wanted = bool(state.get("a", 1))
         if state.get("n"):
             self.name = str(state["n"])[:32]

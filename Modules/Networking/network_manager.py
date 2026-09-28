@@ -65,12 +65,28 @@ class NetworkManager:
         self.local_color = None  # (r, g, b) 0-1 fur color from the main menu, or None
         self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
         self._death_count = 0   # times the local player has died (a counter too)
+        self._kill_count = 0    # kills WE'VE been credited for - see notify_death/_send_kill_credit
+        # Who last damaged us, and when (perf_counter seconds) - notify_death
+        # credits a kill to whoever this points at, if they're still "recent"
+        # enough (see KILL_CREDIT_WINDOW), same idea as a real shooter's own
+        # last-hit-wins kill attribution.
+        self._last_attacker_id = None
+        self._last_attacker_time = 0.0
+        self._last_attacker_weapon = ""
+        self._last_attacker_headshot = False
         self.local_alive = True
         self.profiler = None    # Modules/Debug FrameProfiler, when the game wants network timings
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
         self.on_death = None    # callback(feet_position, velocity, fur colour) when another player dies (bursts into gibs)
         self.on_tracer = None   # callback(start, end, follow) to draw another player's tracer and muzzle flash
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
+        # callback(killer_steam_id, victim_steam_id, weapon_name, headshot) for
+        # EVERY kill in the match this client learns about (see
+        # _broadcast_kill/_receive_killfeed) - not just our own, so a kill
+        # feed UI built off this is the same for every player, CS:GO-style.
+        self.on_killfeed = None
+        self.on_chat = None      # callback(sender_steam_id, text) for a chat message from someone else
+        self.on_admin_kill = None  # callback(sender_steam_id) - see send_admin_kill; verify sender is the admin yourself
         self.local_name = ""    # our Steam persona name, sent in every packet
         self.local_steam_id = 0
         self._avatars = {}        # steam id -> 64x64 RGBA bytes, once Steam has them
@@ -416,25 +432,66 @@ class NetworkManager:
             self._recent_shot_ends.append([round(end_point.x, 1), round(end_point.y, 1), round(end_point.z, 1)])
             del self._recent_shot_ends[:-3]
 
+    # How long after their last hit on us a shot still counts as the killing
+    # blow, seconds - long enough that a death from bleed-out/fall/a laggy
+    # last packet still credits the right person, short enough that an old,
+    # unrelated hit from minutes ago can't retroactively "steal" a kill.
+    KILL_CREDIT_WINDOW = 8.0
+
     def notify_death(self):
         """Call when the local player dies (their state packets then carry it: the
-        counter other players play the gibs from, and the alive flag they hide the body by)."""
+        counter other players play the gibs from, and the alive flag they hide the body by).
+        Also broadcasts the kill (who did it, with what, whether it was a
+        headshot) to the WHOLE lobby - see _broadcast_kill - if whoever hit us
+        most recently did so recently enough (see KILL_CREDIT_WINDOW). A
+        self-inflicted or environmental death (no recent attacker) broadcasts
+        nothing - there's no kill to credit or show."""
         self._death_count += 1
         self.local_alive = False
+        attacker_id, attacker_time = self._last_attacker_id, self._last_attacker_time
+        self._last_attacker_id = None
+        if attacker_id is not None and time.perf_counter() - attacker_time <= self.KILL_CREDIT_WINDOW:
+            self._broadcast_kill(attacker_id, self._last_attacker_weapon, self._last_attacker_headshot)
+
+    def _broadcast_kill(self, killer_id, weapon_name, headshot):
+        """Reliable 1-message announcement, to EVERY lobby member (not just
+        killer_id), that WE just died to killer_id - the ONLY way anyone
+        learns of this kill: each client is the sole authority on its own
+        death, the same way it's already the sole authority on its own
+        health/damage (see send_damage's own docstring). killer_id's own
+        client is the one that turns this into its kill COUNT going up (see
+        _receive_killfeed) - everyone else just shows it in their feed."""
+        if not self.current_lobby_id:
+            return
+        payload = json.dumps(
+            {"kf": 1, "k": int(killer_id), "w": str(weapon_name), "hs": int(bool(headshot))},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            for member_id in self.client.get_lobby_members(self.current_lobby_id):
+                if member_id != self.local_steam_id:
+                    self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
+        except Exception:
+            pass
 
     def notify_respawn(self):
         self.local_alive = True
 
-    def send_damage(self, victim_id, amount, weapon_name=""):
+    def send_damage(self, victim_id, amount, weapon_name="", headshot=False):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
         a hit (against the victim's hitbox as the shooter sees it) and the
         victim applies it to their own health - see on_damage. RELIABLE, unlike
-        the movement stream: a hit must not be lost or reordered. Returns
-        whether it was sent."""
+        the movement stream: a hit must not be lost or reordered. headshot is
+        carried along purely so the VICTIM can pass it back in the kill feed
+        broadcast if this turns out to be the killing blow (see notify_death) -
+        it has no effect on the damage itself (weapon.fire already folded any
+        headshot multiplier into `amount` before this was even called).
+        Returns whether it was sent."""
         if victim_id == self.local_steam_id or not self.current_lobby_id:
             return False
         payload = json.dumps(
-            {"dmg": round(float(amount), 2), "w": str(weapon_name)}, separators=(",", ":")
+            {"dmg": round(float(amount), 2), "w": str(weapon_name), "hs": int(bool(headshot))},
+            separators=(",", ":"),
         ).encode("utf-8")
         try:
             self.client.send_message_to(victim_id, self.HELLO_FLAGS, 0, payload)
@@ -448,8 +505,94 @@ class NetworkManager:
         except (KeyError, TypeError, ValueError):
             return
         amount = max(0.0, min(amount, 1000.0))   # it comes off the wire: keep it sane
-        if amount > 0.0 and self.on_damage is not None:
-            self.on_damage(amount, sender_id, str(message.get("w", "")))
+        if amount > 0.0:
+            self._last_attacker_id = sender_id
+            self._last_attacker_time = time.perf_counter()
+            self._last_attacker_weapon = str(message.get("w", ""))
+            self._last_attacker_headshot = bool(message.get("hs", False))
+            if self.on_damage is not None:
+                self.on_damage(amount, sender_id, self._last_attacker_weapon, self._last_attacker_headshot)
+
+    def _receive_killfeed(self, sender_id, message):
+        """sender_id is the VICTIM (see _broadcast_kill's own docstring -
+        they're the one who sent this)."""
+        try:
+            killer_id = int(message.get("k", 0))
+        except (TypeError, ValueError):
+            return
+        weapon_name = str(message.get("w", ""))
+        headshot = bool(message.get("hs", False))
+        if killer_id == self.local_steam_id:
+            self._kill_count += 1
+        if self.on_killfeed is not None:
+            self.on_killfeed(killer_id, sender_id, weapon_name, headshot)
+
+    def send_chat(self, text):
+        """Broadcasts a chat message to every OTHER lobby member (not
+        ourselves - the sender shows their own message locally right away
+        instead, see ChatBox._submit, so there's no need to also receive it
+        back over the wire). RELIABLE, like every other non-movement message
+        here - a chat line must not be lost or reordered."""
+        text = str(text)[:240]
+        if not text or not self.current_lobby_id:
+            return
+        payload = json.dumps({"chat": 1, "m": text}, separators=(",", ":")).encode("utf-8")
+        try:
+            for member_id in self.client.get_lobby_members(self.current_lobby_id):
+                if member_id != self.local_steam_id:
+                    self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
+        except Exception:
+            pass
+
+    def send_admin_kill(self, victim_id):
+        """The /kill command's remote-target path (see Modules/Chat/
+        commands.py and app.py's own kill_player): tells victim_id an admin
+        wants them dead. RELIABLE. The RECEIVING client is what actually
+        decides to die (same self-authority principle send_damage's own
+        docstring already documents) - and specifically only if the sender
+        really is commands.ADMIN_STEAM_ID (see _receive_admin_kill), which
+        every client can check for itself against that same hardcoded
+        constant, so a non-admin spoofing this message accomplishes nothing."""
+        if victim_id == self.local_steam_id or not self.current_lobby_id:
+            return False
+        payload = json.dumps({"ak": 1}, separators=(",", ":")).encode("utf-8")
+        try:
+            self.client.send_message_to(victim_id, self.HELLO_FLAGS, 0, payload)
+            return True
+        except Exception:
+            return False
+
+    def _receive_admin_kill(self, sender_id):
+        if self.on_admin_kill is not None:
+            self.on_admin_kill(sender_id)
+
+    def _receive_chat(self, sender_id, message):
+        text = str(message.get("m", ""))[:240]
+        if text and self.on_chat is not None:
+            self.on_chat(sender_id, text)
+
+    def display_name(self, steam_id):
+        """The name to show for steam_id anywhere in the UI (scoreboard, kill
+        feed, name tags) - "You"/local_name for ourselves, a remote player's
+        own replicated name, or a placeholder if neither is known yet."""
+        if steam_id == self.local_steam_id:
+            return self.local_name or "You"
+        player = self.remote_players.get(steam_id)
+        if player is not None and player.name:
+            return player.name
+        return f"Player {steam_id % 10000}"
+
+    @property
+    def local_kills(self):
+        """Kills the local player has been credited for - see notify_death/
+        _broadcast_kill/_receive_killfeed. Scoreboard/GameMode.standings()
+        read this rather than the private counter directly."""
+        return self._kill_count
+
+    @property
+    def local_deaths(self):
+        """Times the local player has died - see notify_death."""
+        return self._death_count
 
     def set_local_state(self, feet_pos, yaw, pitch, speed, crouched, grounded,
                         sprinting, move_direction, jumped):
@@ -478,6 +621,7 @@ class NetworkManager:
             "f": self._shot_count,
             "e": self._recent_shot_ends,
             "x": self._death_count,
+            "ki": self._kill_count,
             "a": int(self.local_alive),
             "n": self.local_name,
         }
@@ -681,6 +825,15 @@ class NetworkManager:
             state = json.loads(msg_bytes.decode("utf-8"))
             if "dmg" in state:
                 self._receive_damage(sender_id, state)
+                return
+            if "kf" in state:
+                self._receive_killfeed(sender_id, state)
+                return
+            if "chat" in state:
+                self._receive_chat(sender_id, state)
+                return
+            if "ak" in state:
+                self._receive_admin_kill(sender_id)
                 return
             if "p" not in state or "y" not in state:
                 return  # not this version's movement packet

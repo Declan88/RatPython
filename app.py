@@ -1,5 +1,6 @@
 import gc
 import sys
+import time
 import pygame
 import os
 import ctypes
@@ -142,11 +143,24 @@ from Modules.UI.scoreboard import Scoreboard
 
 SPAWN_POSITION = (0.0, 2.0, 3.0)   # where the player (re)spawns: hull centre, metres
 RESPAWN_SECONDS = 3.0
+# A standing, shootable target near spawn purely for testing the kill feed/
+# sound without a second PC - see setup_game/the shooting code's own dummy
+# branch. 1 is a reserved id no real Steam64 id can ever equal (those are all
+# 17 digits), so it can never collide with a real player's.
+TEST_DUMMY_STEAM_ID = 1
+TEST_DUMMY_OFFSET = (3.0, 0.0, -2.0)   # metres from SPAWN_POSITION, feet-height
+TEST_DUMMY_RESPAWN_SECONDS = 1.5
 HITMARKER_SOUND = "Assets/Audio/Player/hitmarker.wav"
 HITMARKER_VOLUME = 1.0   # the sound manager applies a volume twice (on the sound and on its channel), so 1.0 is what plays at full
 HITMARKER_HEADSHOT_PITCH = 1.45   # a headshot's hitmarker sound is this much higher (playback speed)
 HITMARKER_GAIN = 10.0     # ...so anything louder has to amplify the samples themselves (soft-clipped)
+KILL_SOUND = "Assets/Audio/player/Kill.wav"
+KILL_SOUND_VOLUME = 1.0
+KILL_SOUND_GAIN = 4.0
 from Modules.Graphics.paper_doll import PaperDoll
+from Modules.UI.killfeed import KillFeed
+from Modules.UI.chatbox import ChatBox
+from Modules.Chat import commands
 from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
 from Modules.Scenes.torus_scene import TorusScene
@@ -156,8 +170,9 @@ from Modules.Physics.character_controller import CharacterController
 from Modules.Player.player_model import PlayerModel
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 from Modules.Player.viewmodel import ViewModel
-from Modules.Weapons import USP
+from Modules.Weapons import USP, GoudaGun
 from Modules.Weapons.weapons_base import WeaponsBase
+from Modules.UI.weapon_hud import WeaponHUD
 
 
 def load_steam_api_dll():
@@ -211,6 +226,8 @@ def load_steam_api_dll():
 load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
+from Modules.Networking.remote_player import RemotePlayer
+from Modules.GameModes import Deathmatch
 
 
 def main():
@@ -255,13 +272,23 @@ def main():
     player_height = None
     local_player_model = None
     viewmodel = None  # first-person arms glued to the camera
-    weapon = None     # the local player's current weapon (Modules/Weapons)
+    weapon = None     # the local player's CURRENT weapon (Modules/Weapons) - weapon_slots[current_slot]
+    # Every weapon the local player owns, and which one's out - see switch_weapon,
+    # called by setup_game (below) for the initial equip and by the scroll-wheel
+    # handling further down.
+    weapon_slots = [USP(), GoudaGun()]
+    current_slot = 0
     boom_arm = None
     third_person = False
     toggle_third_person = lambda key: None
+    test_dummy = None  # a standing, shootable RemotePlayer for testing the kill feed/sound alone - see setup_game
+    # deaths: the dummy's own death counter (receive_state's "x" - see RemotePlayer);
+    # respawn_at: perf_counter() time to show it again, or None while it's up.
+    # pos/yaw: its fixed spot, resent on every receive_state call (required every time).
+    dummy_state = {"deaths": 0, "respawn_at": None, "pos": None, "yaw": 180.0}
 
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, toggle_third_person
+        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, toggle_third_person, test_dummy
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
@@ -287,7 +314,7 @@ def main():
         player_height = 1.39225 * 9 / 8
         player = CharacterController(
             current_scene.physics,
-            position=SPAWN_POSITION,
+            position=game_mode.choose_spawn_position(),
             height=player_height,
             max_slope_degrees=47.0,
         )
@@ -532,9 +559,81 @@ def main():
         # its gun and arm animations on the first-person viewmodel, its world
         # model in the character's hand, and the pose of the player rig's upper
         # body (plus that pose's rotation corrections - see WeaponsBase).
-        weapon = USP()
+        # force=True: a fresh map means a fresh scene/player_model to equip
+        # onto even if the SLOT itself (current_slot) hasn't changed - the
+        # ammo/reload state on the weapon itself carries over unaffected
+        # (weapon_slots is built once, outside setup_game, not recreated
+        # per map).
+        switch_weapon(current_slot, force=True)
+        # Prime every OTHER slot too (loads its models/animations WITHOUT
+        # showing them or disturbing the real current weapon's pose - see
+        # equip_player/equip_viewmodel's own activate=False), so the FIRST
+        # scroll to it is just as instant as every switch after - see
+        # switch_weapon's own docstring for why a switch between
+        # already-primed weapons has no loading cost at all.
+        for i, other in enumerate(weapon_slots):
+            if i != current_slot:
+                other.equip_viewmodel(viewmodel, activate=False)
+                other.equip_player(current_scene, local_player_model, activate=False)
+
+    def switch_weapon(slot_index, force=False):
+        """Switches to weapon_slots[slot_index] (a no-op if it's already
+        out, unless force) - the initial equip in setup_game above (which
+        also primes every OTHER slot up front, right after), and every
+        later scroll-wheel switch (see the main loop).
+
+        The outgoing weapon (if any) is only DEACTIVATED (hidden), not
+        unequipped - WeaponsBase.equip_player/equip_viewmodel both notice a
+        weapon that's already primed for the current scene and just
+        reactivate it instead of reloading anything, which is what makes
+        switching back and forth near-instant instead of the load-time
+        stutter a full unequip/re-equip cycle used to cause on every single
+        switch (see WeaponsBase.equip_player's own docstring)."""
+        nonlocal weapon, current_slot
+        if not force and weapon is not None and slot_index == current_slot:
+            return
+        if weapon is not None:
+            weapon.deactivate()
+        current_slot = slot_index % len(weapon_slots)
+        weapon = weapon_slots[current_slot]
         weapon.equip_viewmodel(viewmodel)
         weapon.equip_player(current_scene, local_player_model)
+
+    def spawn_test_dummy():
+        """The test dummy: reuses RemotePlayer wholesale (the same model,
+        hitboxes - body AND head, for headshot testing too - weapon, gib-on-
+        death and auto-hide/show-again machinery a real remote player gets)
+        rather than building any of that again - see the shooting code's own
+        dummy branch for how a hit on it is turned into a kill without any
+        network traffic at all (it isn't a real match participant). NOT
+        spawned automatically - only the /adddummy command (see
+        Modules/Chat/commands.py) calls this, so it never shows up
+        uninvited. Calling it again while one's already up replaces it
+        (fresh position/state) rather than stacking a second one."""
+        nonlocal test_dummy
+        if current_scene is None:
+            return "No map loaded."
+        if test_dummy is not None:
+            test_dummy.destroy()
+        dummy_xz = (SPAWN_POSITION[0] + TEST_DUMMY_OFFSET[0], SPAWN_POSITION[2] + TEST_DUMMY_OFFSET[2])
+        ground = current_scene.physics.raycast(
+            glm.vec3(dummy_xz[0], SPAWN_POSITION[1] + 5.0, dummy_xz[1]),
+            glm.vec3(dummy_xz[0], SPAWN_POSITION[1] - 20.0, dummy_xz[1]),
+            CollisionGroup.STATIC,
+        )
+        dummy_feet_y = ground.position.y if ground is not None else SPAWN_POSITION[1] + TEST_DUMMY_OFFSET[1]
+        dummy_state["deaths"] = 0
+        dummy_state["respawn_at"] = None
+        dummy_state["pos"] = (dummy_xz[0], dummy_feet_y, dummy_xz[1])
+        test_dummy = RemotePlayer(current_scene, TEST_DUMMY_STEAM_ID)
+        test_dummy.name = "Test Dummy"
+        test_dummy.receive_state({
+            "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
+            "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0, "x": 0, "a": 1,
+        })
+        if current_scene.gibs is not None:
+            test_dummy.on_death = lambda pos, vel, color: current_scene.gibs.spawn(pos, vel, tint=color)
+        return "Test dummy spawned."
 
     ui = UIManager(window)
     ui_demo = build_demo(ui)
@@ -553,12 +652,32 @@ def main():
     ui.root.add(health_bar)
     # Screen-centre crosshair; its gap is the current weapon's real spread.
     crosshair = ui.root.add(Crosshair(visible=False))
+    # Current weapon + ammo, bottom-right, with the other weapon slots shown
+    # dim above it - see Modules/UI/weapon_hud.py. Shown/hidden alongside
+    # the crosshair; updated every frame from the shooting code below.
+    weapon_hud = ui.root.add(WeaponHUD())
     # Diagonal ticks over the crosshair when one of our shots hits another player.
     hitmarker = ui.root.add(Hitmarker())
     # F9: a live breakdown of where each frame's time goes (see Modules/Debug/frame_profiler.py).
     prof = FrameProfiler()
     profile_label = ui.root.add(Label("", font_size=17, color=(255, 255, 170, 255), visible=False, offset=(14, 14)))
     hit_sound_channel = [None]   # every hit plays on the same channel, cutting off the last
+    kill_sound_channel = [None]  # ditto, for Kill.wav
+    # Kill feed, top-left - see net_mgr.on_killfeed wiring below.
+    kill_feed = ui.root.add(KillFeed())
+    # Text chat + admin commands (Modules/Chat/commands.py) - Enter opens it
+    # (see on_key_down), bottom-left. commands_ctx is filled in below once
+    # change_health/spawn_test_dummy exist; the callables inside are only
+    # ever invoked later, once chat is actually used, so the empty dict here
+    # is fine in the meantime (mirrors particles.raycast's own forward
+    # reference to current_scene just above setup_game).
+    commands_ctx = {}
+    chatbox = ui.root.add(ChatBox(
+        is_admin=lambda: commands.is_admin(net_mgr.local_steam_id),
+        local_name=lambda: net_mgr.display_name(net_mgr.local_steam_id),
+        send_chat=lambda text: net_mgr.send_chat(text),
+        ctx=commands_ctx,
+    ))
 
     # Dying: health reaching 0 (from any source) flags `pending`; the main loop starts
     # the death at a safe point (begin_death) and ends it (end_death) when the
@@ -591,7 +710,123 @@ def main():
     MAPS = [("Main Map", "mainmap"), ("Torus (test)", "torus")]
     in_menu = True
     pending_start = None
+    # TEMP DEBUG (RATWAR_AUTOTEST): auto-start mainmap and drive a weapon
+    # switch without real input, for headless repro of the viewmodel
+    # skinning bug - see the frame-counted trigger near the end of the
+    # main loop below.
+    if os.environ.get("RATWAR_AUTOTEST"):
+        pending_start = "mainmap"
+        os.environ["RATWAR_DEBUG_UNTIL"] = str(time.perf_counter() + 600.0)
+    autotest_frame = [0]
     net_mgr = NetworkManager(camera, None)
+    # The active game mode: decides (re)spawn position and owns scoring's
+    # display (see Modules/GameModes/game_mode.py) - a single hardcoded
+    # spawn point, same as SPAWN_POSITION always was, until a map defines
+    # real spawn markers to hand it instead.
+    game_mode = Deathmatch(net_mgr, spawn_points=[SPAWN_POSITION])
+
+    def dummy_or_display_name(steam_id):
+        return "Test Dummy" if steam_id == TEST_DUMMY_STEAM_ID else net_mgr.display_name(steam_id)
+
+    def show_kill_feed(killer_id, victim_id, weapon_name, headshot):
+        """A row in the kill feed (see Modules/UI/killfeed.py) - shown to
+        EVERY player for EVERY kill (net_mgr.on_killfeed below fires this the
+        same way on every client - see NetworkManager's own _broadcast_kill/
+        _receive_killfeed), plus the local-only "we got a kill" feedback -
+        Kill.wav, universal=True like the hitmarker's own feedback sound, so
+        only WE hear it, not something other players' games play - for a kill
+        WE scored. Also the path a hit on TEST_DUMMY takes directly (see the
+        shooting code below), bypassing the network entirely since that's a
+        local-only target, not a real match kill."""
+        killer_name = dummy_or_display_name(killer_id)
+        victim_name = dummy_or_display_name(victim_id)
+        kill_feed.add_kill(
+            killer_name, victim_name, weapon_name, headshot,
+            killer_mine=killer_id == net_mgr.local_steam_id,
+            victim_mine=victim_id == net_mgr.local_steam_id,
+        )
+        if killer_id == net_mgr.local_steam_id and current_scene is not None:
+            kill_emitter = current_scene.sound_manager.add_sound(
+                KILL_SOUND, camera.position, volume=KILL_SOUND_VOLUME, loop=False,
+                universal=True, channel=kill_sound_channel[0], gain=KILL_SOUND_GAIN)
+            kill_sound_channel[0] = kill_emitter["channel"]
+
+    def on_killfeed(killer_id, victim_id, weapon_name, headshot):
+        show_kill_feed(killer_id, victim_id, weapon_name, headshot)
+        game_mode.on_kill(killer_id, victim_id, weapon_name)
+    net_mgr.on_killfeed = on_killfeed
+    net_mgr.on_chat = lambda sender_id, text: chatbox.push_message(net_mgr.display_name(sender_id), text)
+    # An admin's /kill <player> targeting a REAL remote player (see
+    # kill_player below) arrives here on THAT player's own client - we only
+    # ever act on it if the sender really is the hardcoded admin (checked
+    # independently on this end, not trusted from the sender - see
+    # NetworkManager.send_admin_kill's own docstring).
+    net_mgr.on_admin_kill = lambda sender_id: kill_self() if commands.is_admin(sender_id) else None
+
+    def kill_dummy(weapon_name="", headshot=False):
+        """Kills the test dummy right now, if one's up and not already down -
+        shared by a real hit on it (see the shooting code below) and the
+        /kill command's own player-target path (kill_player)."""
+        if test_dummy is None:
+            return "No test dummy - use /adddummy first."
+        if test_dummy.dead:
+            return "The test dummy is already down."
+        dummy_state["deaths"] += 1
+        test_dummy.receive_state({
+            "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
+            "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0,
+            "x": dummy_state["deaths"], "a": 0,
+        })
+        dummy_state["respawn_at"] = time.perf_counter() + TEST_DUMMY_RESPAWN_SECONDS
+        show_kill_feed(net_mgr.local_steam_id, TEST_DUMMY_STEAM_ID, weapon_name, headshot)
+        return "Test dummy killed."
+
+    def kill_self():
+        """The /kill command's default (no argument) - suicide, for testing
+        death/respawn without needing something around to shoot you. Also
+        what a REMOTE admin-kill (see net_mgr.on_admin_kill above) runs on
+        the targeted player's own client."""
+        if death["active"] or death["pending"]:
+            return "You're already dead."
+        change_health(-(health["max"] + 1.0))
+        return "You died."
+
+    def kill_targets():
+        """Candidate names for /kill's own argument (see commands.Command's
+        arg_source docstring) - yourself, the test dummy if it's up, and
+        every other connected player."""
+        names = [net_mgr.display_name(net_mgr.local_steam_id)]
+        if test_dummy is not None and not test_dummy.dead:
+            names.append("Test Dummy")
+        names.extend(
+            player.name or net_mgr.display_name(steam_id)
+            for steam_id, player in net_mgr.remote_players.items()
+        )
+        return names
+
+    def kill_player(name):
+        """/kill <name>'s own dispatch: resolves name (case-insensitive) to
+        yourself, the test dummy, or another connected player, and kills
+        whichever it is. A remote player can only ever be told to kill
+        THEMSELVES (see NetworkManager.send_admin_kill) - there's no way to
+        reach into their game and do it directly - so that branch can only
+        ever report the request was sent, not that it actually happened."""
+        target = name.strip().lower()
+        if target in ("", "me", "you", "self", net_mgr.display_name(net_mgr.local_steam_id).lower()):
+            return kill_self()
+        if target in ("dummy", "test dummy"):
+            return kill_dummy("/kill")
+        for steam_id, player in net_mgr.remote_players.items():
+            if (player.name or "").lower() == target:
+                if net_mgr.send_admin_kill(steam_id):
+                    return f"Kill request sent to {player.name}."
+                return f"Couldn't reach {player.name}."
+        return f"No connected player named '{name}'."
+
+    commands_ctx["add_dummy"] = spawn_test_dummy
+    commands_ctx["kill_self"] = kill_self
+    commands_ctx["kill_player"] = kill_player
+    commands_ctx["kill_targets"] = kill_targets
     tracers = Tracers(window.ctx)
     particles = ParticleManager(window.ctx, material_aliases=MATERIAL_ALIASES,
                                 radius_scale=RADIUS_SCALE, frame_filter=keep_frame,
@@ -625,7 +860,7 @@ def main():
             current_scene.gibs.spawn(position, velocity, tint=color)
     net_mgr.on_death = remote_death
     # Another player's shot hit us: the shooter decided that, we apply it.
-    net_mgr.on_damage = lambda amount, attacker_id, weapon_name: change_health(-amount)
+    net_mgr.on_damage = lambda amount, attacker_id, weapon_name, headshot: change_health(-amount)
     from Modules.Scenes import scene_base as _scene_base
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
     menu_scene = get_or_load_scene("mainmenu")
@@ -644,7 +879,7 @@ def main():
         reuse = current_scene is not None and current_scene_key == map_key and player is not None
         if reuse:
             current_scene.sound_manager.resume_all()
-            player.teleport(SPAWN_POSITION)
+            player.teleport(game_mode.choose_spawn_position())
             change_health(health["max"])
             if weapon is not None:
                 weapon.recoil.reset()
@@ -652,6 +887,7 @@ def main():
             setup_game(map_key)
         health_bar.visible = True
         crosshair.visible = True
+        weapon_hud.visible = True
         name_tags.visible = True
         if local_player_model is not None and local_player_model.obj is not None:
             local_player_model.set_hat(net_mgr.local_hat)
@@ -692,6 +928,7 @@ def main():
         current_scene.sound_manager.pause_all()
         health_bar.visible = False
         crosshair.visible = False
+        weapon_hud.visible = False
         name_tags.visible = False
         menu_ui.visible = True
         in_menu = True
@@ -708,18 +945,20 @@ def main():
         net_mgr.notify_death()
         set_local_body_visible(False)
         crosshair.visible = False
+        weapon_hud.visible = False
         player.set_move_direction(glm.vec3(0.0))
         player.set_sprinting(False)
         death_screen.show()
 
     def end_death():
         death["active"] = False
-        player.teleport(SPAWN_POSITION)
+        player.teleport(game_mode.choose_spawn_position())
         change_health(health["max"])
         if weapon is not None:
             weapon.recoil.reset()
         set_local_body_visible(True)
         crosshair.visible = True
+        weapon_hud.visible = True
         death_screen.hide()
         net_mgr.notify_respawn()
 
@@ -771,6 +1010,7 @@ def main():
             sounds.preload(weapon.fire_sound, muffle=True)
         sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN)
         sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN, pitch=HITMARKER_HEADSHOT_PITCH)
+        sounds.preload(KILL_SOUND, gain=KILL_SOUND_GAIN)
         if current_scene.gibs is not None:
             if local_player_model is not None and local_player_model.obj is not None:
                 current_scene.gibs.match_material(local_player_model.obj)
@@ -796,22 +1036,36 @@ def main():
             ui.set_cursor_free(ui_demo.visible)
 
     trigger_clicks = [0]   # left clicks since the last frame's firing check
+    wheel_delta = [0]      # net scroll wheel motion since the last frame's weapon-switch check
 
     def count_click(event):
         """window.handle_events' event filter: counts left clicks (from the
         event queue, so none is lost between frames) and then lets the UI have
         the event as before."""
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and not in_menu:
+            if chatbox.focused:
+                return ui.handle_event(event)   # let TextInput's own Escape close chat instead of pausing
             set_paused(not pause["on"])
             return True
         if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                 and not in_menu and not ui.cursor_free):
             trigger_clicks[0] += 1
+        if event.type == pygame.MOUSEWHEEL and not in_menu and not ui.cursor_free:
+            # Accumulated, not consumed here directly, in case several land in
+            # one frame - the main loop turns the total into at most one
+            # weapon switch (see wheel_delta below).
+            wheel_delta[0] += event.y
+            return True
         return ui.handle_event(event)
 
     def on_key_down(key):
         if in_menu:
             return
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not pause["on"] and not chatbox.focused:
+            chatbox.open()
+            return
+        if chatbox.focused:
+            return   # chat has keyboard focus - ui.handle_event already routed this, see count_click
         if key == pygame.K_F9:
             prof.set_enabled(not prof.enabled)
             profile_label.visible = prof.enabled
@@ -820,6 +1074,8 @@ def main():
             return
         toggle_third_person(key)
         toggle_ui_demo(key)
+        if key == pygame.K_r and weapon is not None and not ui.cursor_free:
+            weapon.start_reload()
         if key == pygame.K_h:
             change_health(-10.0)
         elif key == pygame.K_j:
@@ -890,7 +1146,7 @@ def main():
             move_dir -= camera.get_flat_right()
         if keys[pygame.K_d]:
             move_dir += camera.get_flat_right()
-        if alive and pause["on"]:
+        if alive and (pause["on"] or chatbox.focused):
             player.set_move_direction(glm.vec3(0.0))
             player.set_sprinting(False)
         elif alive:
@@ -936,19 +1192,46 @@ def main():
         if weapon is not None and alive:
             weapon.recoil.apply(camera, dt)
         viewmodel.update(camera, not third_person and alive)
+        if weapon is not None:
+            weapon.update()   # finishes an in-progress reload once its time is up
 
-        # Left mouse fires: one shot per click (every click counts, even two
-        # inside one frame), or - for an automatic weapon - continuously while
-        # held, limited by the weapon's own fire_interval. Clicks are only
-        # counted with the cursor captured (see count_click), so clicking
-        # menus/UI never shoots.
+        # Scroll wheel switches weapons (see switch_weapon) - up goes to the
+        # previous slot, down to the next, wrapping around either way.
+        # Ignored with only one weapon (nothing to switch to) or dead.
+        wheel, wheel_delta[0] = wheel_delta[0], 0
+        if wheel != 0 and alive and len(weapon_slots) > 1:
+            switch_weapon(current_slot + (-1 if wheel > 0 else 1))
+
+        # TEMP DEBUG (RATWAR_AUTOTEST): force Gouda->USP switch a couple
+        # seconds in, without real mouse/keyboard input, then quit once the
+        # repro window has been captured.
+        if os.environ.get("RATWAR_AUTOTEST"):
+            autotest_frame[0] += 1
+            f = autotest_frame[0]
+            if f == 60:
+                print(f"[AUTOTEST] frame {f}: switching to Gouda (slot 1)")
+                switch_weapon(1, force=True)
+            elif f == 120:
+                print(f"[AUTOTEST] frame {f}: switching to USP (slot 0) - debug window starts")
+                os.environ["RATWAR_DEBUG_UNTIL"] = str(time.perf_counter() + 2.0)
+                switch_weapon(0, force=True)
+            elif f == 260:
+                print("[AUTOTEST] done, exiting")
+                window.flip()
+                os._exit(0)
+
+        # Left mouse fires: how many times is up to the weapon's own
+        # fire_mode (see WeaponsBase.shots_this_frame) - one shot per click
+        # for SEMI, continuously while held (paced by fire_interval) for
+        # AUTO. Clicks are only counted with the cursor captured (see
+        # count_click), so clicking menus/UI never shoots.
         clicks, trigger_clicks[0] = trigger_clicks[0], 0
         if weapon is not None:
             crosshair.set_spread(weapon.spread_degrees(), camera.fov)
+            weapon_hud.update(weapon, weapon_slots, current_slot)
         if weapon is not None and not ui.cursor_free and alive:
-            if weapon.automatic:
-                clicks = 1 if pygame.mouse.get_pressed()[0] else 0
-            for _ in range(clicks):
+            shots = weapon.shots_this_frame(clicks, pygame.mouse.get_pressed()[0])
+            for _ in range(shots):
                 # A line trace from the camera along the aim (see PhysicsWorld.
                 # raycast): the first thing it meets - wall, prop or another
                 # player's hitbox - is what the shot hit.
@@ -974,8 +1257,7 @@ def main():
                                         colors=weapon.muzzle_color, size=weapon.muzzle_size,
                                         offset_scale=weapon.muzzle_offset_scale,
                                         follow=lambda: weapon.muzzle_position(current_scene))
-                    if shot.victim in net_mgr.remote_players:
-                        net_mgr.send_damage(shot.victim, shot.damage, weapon.name)
+                    if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
                         hitmarker.trigger(headshot=shot.headshot)
                         # Flat, in both ears, at any distance: it's feedback for us, not a sound in the world.
                         hit_emitter = current_scene.sound_manager.add_sound(
@@ -983,6 +1265,14 @@ def main():
                             universal=True, channel=hit_sound_channel[0], gain=HITMARKER_GAIN,
                             pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
                         hit_sound_channel[0] = hit_emitter["channel"]
+                        if shot.victim == TEST_DUMMY_STEAM_ID:
+                            # Not a real match participant - no network traffic,
+                            # no real health/score, just an instant "kill" (any
+                            # hit, any number of times) via the same kill_dummy
+                            # the /kill command's own dummy-target path uses.
+                            kill_dummy(weapon.name, shot.headshot)
+                        else:
+                            net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot)
 
         prof.mark("camera + weapons")
 
@@ -1030,6 +1320,8 @@ def main():
             move_direction=move_dir,
             just_jumped=just_jumped,
         )
+        if test_dummy is not None:
+            test_dummy.update(dt)
         # The same values driving the local model, sent to other players so
         # their copy of us moves and animates identically (see NetworkManager.
         # set_local_state for why this isn't just the camera position).
@@ -1054,14 +1346,24 @@ def main():
             death_screen.update()
             if death_screen.finished:
                 end_death()
+        kill_feed.update()
+        chatbox.update()
+        if (dummy_state["respawn_at"] is not None and time.perf_counter() >= dummy_state["respawn_at"]
+                and test_dummy is not None):
+            dummy_state["respawn_at"] = None
+            test_dummy.receive_state({
+                "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
+                "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0,
+                "x": dummy_state["deaths"], "a": 1,
+            })
 
         prof.mark("death screen")
         net_mgr.update()
         prof.mark("net_mgr.update")
         name_tags.update(net_mgr.remote_players, camera, window.ctx.screen.size)
-        scoreboard.visible = bool(keys[pygame.K_TAB])
+        scoreboard.visible = bool(keys[pygame.K_TAB]) and not chatbox.focused
         if scoreboard.visible:
-            scoreboard.update(net_mgr)
+            scoreboard.update(net_mgr, game_mode)
         prof.mark("name tags")
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)

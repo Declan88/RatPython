@@ -2,16 +2,34 @@
 WeaponsBase's pistol defaults; the class attributes are spelled out anyway so
 this file is the one place that says exactly which assets make up the USP."""
 
-from .weapons_base import WeaponsBase, _POSE_DIR
+from .weapons_base import WeaponsBase, FireMode, _POSE_DIR
 
 
 class USP(WeaponsBase):
     name = "USP"
     animation_prefix = "pistol"
+    icon = "Assets/Textures/Icons/Pistol/Pistol.png"
 
-    # Gunfire
+    # Gunfire: semi-auto (one shot per click, holding does nothing further -
+    # see WeaponsBase.shots_this_frame), capped at 10 rounds/second.
     fire_sound = "Assets/Audio/Guns/USP/usp_unsil-1.wav"
+    fire_mode = FireMode.SEMI
+    fire_interval = 0.1
     damage = 15.0
+
+    # Ammo: a 15-round magazine. The reload finishes exactly when pistol_
+    # reload.glb's own gun-rig clip ("c_pist_usp.qc_skeleton", skin 0 - see
+    # viewmodel_animations' own "reload" entry below) actually finishes
+    # playing (see WeaponsBase._one_shot_still_playing) - no separate
+    # duration to keep in sync with the asset by hand.
+    magazine_size = 15
+
+    # Draw: pistol_draw.glb's own gun-rig clip, sped up 1.5x - see
+    # WeaponsBase.draw_speed's own docstring for how that bakes right into
+    # the clip's timeline, so the animation itself visibly speeds up and
+    # firing/reloading unblock exactly that much sooner, automatically (same
+    # "bound to the real clip, not a guessed duration" reasoning as reload).
+    draw_speed = 1.5
 
     # Accuracy: a semi-auto pistol. First shot from rest is tight; each shot
     # opens the cone by 0.75 degrees, and it closes again at 6 degrees a second
@@ -40,8 +58,18 @@ class USP(WeaponsBase):
     viewmodel_animations = {
         "idle": f"{_POSE_DIR}/pistol_idle.glb",
         "shoot": f"{_POSE_DIR}/pistol_shoot.glb",
+        # pistol_reload.glb's own gun rig is its skin 0 (confirmed by
+        # inspecting the file directly), NOT skin 1 like every other pistol
+        # animation file here - see viewmodel_animations' own base-class
+        # docstring for this (path, skin_index) override form.
+        "reload": (f"{_POSE_DIR}/pistol_reload.glb", 0),
+        # pistol_draw.glb - same skin-0 gun rig as pistol_reload.glb (also
+        # confirmed by inspecting the file directly, also carrying a pile of
+        # unrelated leftover animations for other rigs). Played whenever this
+        # weapon is switched to - see ViewModel.set_weapon.
+        "draw": (f"{_POSE_DIR}/pistol_draw.glb", 0),
     }
-    viewmodel_one_shot_states = ("shoot",)
+    viewmodel_one_shot_states = ("shoot", "reload", "draw")
 
     # Third-person: the model held in the character's hand (its own baked clip
     # is the idle), and the pose of the character's arms holding it.
