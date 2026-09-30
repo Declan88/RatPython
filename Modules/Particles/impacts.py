@@ -6,6 +6,10 @@ physical_material).
 """
 
 IMPACT_FILE = "Assets/Particles/Impact/impact_fx.pcf"
+# Impact effects (bullet hits, a weapon's impact_particle) count against one cap so a
+# burst of shots can't pile up unlimited particle systems: see ParticleManager.group_limits.
+IMPACT_GROUP = "impact"
+MAX_IMPACT_EFFECTS = 12
 
 DEFAULT_IMPACT = "impact_concrete"
 
@@ -100,4 +104,4 @@ def spawn_impact(particles, hit, size=IMPACT_SIZE):
     name = impact_effect_name(hit.material)
     if name is None:
         return None
-    return particles.spawn_surface(name, hit.position, hit.normal, size=size)
+    return particles.spawn_surface(name, hit.position, hit.normal, size=size, group=IMPACT_GROUP)

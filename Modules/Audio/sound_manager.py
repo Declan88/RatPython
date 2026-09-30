@@ -153,7 +153,9 @@ class SoundManager:
         its place. For a sound that repeats faster than it ends (a gunshot) -
         the old one is killed and the new one always plays, rather than
         needing a free channel from the pool each time, which with the mixer
-        busy could be none."""
+        busy could be none. The channel is only reused while one of this
+        manager's emitters is still playing the same file on it; otherwise a
+        free one is taken as usual."""
         if not pygame.mixer.get_init():
             pygame.mixer.init()
             pygame.mixer.set_num_channels(32)
@@ -163,6 +165,14 @@ class SoundManager:
             cutoff = self._muffle_cutoff(glm.length(glm.vec3(position) - self._listener[0]))
         sound = self._load_sound(sound_path, cutoff, gain, pitch)
         sound.set_volume(volume)
+        # Only take the given channel over if it is STILL playing this same file
+        # (the previous shot of a repeating one). A finished sound's channel goes
+        # back into the pool and gets handed to unrelated sounds, so blindly
+        # reusing it would cut one of THOSE off - e.g. a hitmarker killing a
+        # gunshot that was just given the channel the hitmarker used last time.
+        if channel is not None and not any(
+                e["channel"] is channel and e["path"] == sound_path for e in self.emitters):
+            channel = None
         if channel is not None:
             self.emitters = [e for e in self.emitters if e["channel"] is not channel]
             channel.play(sound, loops=-1 if loop else 0)
@@ -174,6 +184,7 @@ class SoundManager:
 
         emitter = {
             "sound": sound,
+            "path": sound_path,
             "channel": channel,
             "position": glm.vec3(position),
             "volume": float(volume),

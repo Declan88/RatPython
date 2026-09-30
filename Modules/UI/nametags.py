@@ -3,6 +3,13 @@ Floating Steam-name tags over other players' heads. Tags are ordinary UI
 widgets (a small dark pill with a Label) whose position is re-projected from
 the player's world position each frame - so they reuse the UI renderer's text
 cache and batching instead of anything world-space of their own.
+
+Occlusion, though, IS a real 3D-space check: a tag's head point is the anchor
+a physics line trace runs against every frame (see update's own scene
+parameter), same as this project's per-light shadow approximation
+(PhysicsWorld.line_of_sight) - so a wall between the camera and that point
+hides the tag exactly like it hides the player wearing it, not just a flat
+screen-space overlay that shows through geometry.
 """
 
 import glm
@@ -35,9 +42,11 @@ class NameTags:
         label = pill.add(Label("", font_size=22, color=theme.TEXT))
         return pill, label
 
-    def update(self, players, camera, window_size):
+    def update(self, players, camera, window_size, scene=None):
         """players: {steam id: RemotePlayer} (anything with .name and a
-        .model.obj["position"] feet position)."""
+        .model.obj["position"] feet position). scene: used for the wall-
+        occlusion check (see this module's own docstring) - None skips it
+        (a tag then behaves as before, always showing through geometry)."""
         for steam_id in [i for i in self._tags if i not in players]:
             self.container.remove(self._tags.pop(steam_id)[0])
 
@@ -62,6 +71,11 @@ class NameTags:
             sx = (clip.x / clip.w * 0.5 + 0.5) * w
             sy = (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * h
             if not (0 <= sx <= w and 0 <= sy <= h):
+                pill.visible = False
+                continue
+            # Cheapest checks (behind camera, too far, off-screen) first - only a tag that's
+            # already passed all of those is worth a physics trace at all.
+            if scene is not None and not scene.physics.line_of_sight(camera.position, head):
                 pill.visible = False
                 continue
 

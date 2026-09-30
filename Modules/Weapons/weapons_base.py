@@ -30,16 +30,11 @@ import glm
 
 from Modules.Graphics.skeletal_loader import _read_glb_json_and_blob
 from Modules.Physics.physics_world import CollisionGroup
+from Modules.Weapons.damage_classes import Bullet
 from Modules.Weapons.recoil import Recoil
 
 _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
 _SPINE4 = "ValveBiped.Bip01_Spine4"
-
-
-def _debug_active():  # TEMP DEBUG (RATWAR_AUTOTEST)
-    import os
-    until = os.environ.get("RATWAR_DEBUG_UNTIL")
-    return until is not None and time.perf_counter() < float(until)
 
 
 def _first_clip_name(path, skin_index=0):
@@ -133,6 +128,10 @@ class FireMode:
 
 class WeaponsBase:
     name = "weapon"
+    # Its id in the weapon registry (registry.py) and over the network; None = the
+    # class name in snake_case. Set abstract = True on a base class that isn't a
+    # weapon you can carry.
+    weapon_id = None
     # Prefix for clip names this weapon adds to a rig (see module docstring).
     animation_prefix = "pistol"
     # A square icon file - the weapon select HUD (Modules/UI/weapon_hud.py)
@@ -215,9 +214,52 @@ class WeaponsBase:
     recoil_kick_speed = 120.0
     recoil_recovery = 6.0
 
+    # The particle files this weapon's effects (muzzle_particle, impact_particle)
+    # live in, loaded when the game starts: {.pcf path: [system names to load]}
+    # (None loads every system in the file). The names those two attributes
+    # hold are looked up among what's been loaded.
+    particle_files = {}
+
+    # An Explosion (Modules/Weapons/explosion.py) set off where this weapon's
+    # shots land, on top of the direct-hit damage; None = no explosion.
+    explosion = None
+
+    # An effect (a system in a loaded .pcf) played where this weapon's shots land,
+    # instead of the usual bullet impact: its name, an ((r, g, b), (r, g, b)) 0-255
+    # colour range replacing the file's own (None keeps them), and a size scale.
+    impact_particle = None
+    impact_color = None
+    impact_size = 1.0
+
+    # The bullet tracer look (a name in Modules/Graphics/tracers.py's STYLES).
+    tracer_style = "default"
+
+    # What KIND of damage this weapon deals - right now, just how a player it kills dies
+    # (see Modules/Weapons/damage_classes.py's own DamageClass.death_effect). Bullet (gibs)
+    # is every weapon's default; a weapon that should dissolve its victims instead sets this
+    # to Zap.
+    damage_class = Bullet
+
+    # A Modules/Weapons/tracer_spiral.TracerSpiral - a Quake-railgun-style spiral of small
+    # star sprites winding around this weapon's own tracer beam - or None (most weapons) for
+    # no spiral, just the tracer. Every tunable (colour, tightness, density, size, lifetime)
+    # lives on that instance, not here - see spawn_tracer_spiral below and TracerSpiral's own
+    # docstring.
+    tracer_spiral = None
+
+    # ---- gun-handling sounds ---------------------------------------------
+    # {viewmodel state: {frame: sound file}} - played when that state's
+    # animation reaches the frame (source frames at handling_fps; see
+    # _play_handling_sounds). They follow the gun and have a tiny falloff.
+    handling_sounds = {}
+    handling_fps = 30.0
+    handling_volume = 1.0
+    handling_min_distance = 1.0
+    handling_max_distance = 6.0
+
     # ---- damage --------------------------------------------------------
     damage = 10.0             # health taken from a player each shot hits
-    headshot_multiplier = 1.5  # ...times this when the shot hits the head
+    headshot_multiplier = 2.0  # ...times this when the shot hits the head
     max_range = 500.0         # metres a shot's line trace reaches
 
     # ---- models --------------------------------------------------------
@@ -233,6 +275,20 @@ class WeaponsBase:
     viewmodel_model = f"{_POSE_DIR}/pistol.glb"
     viewmodel_arms_skin = 0
     viewmodel_gun_model = None
+    # Mesh node names to load the gun from as SEPARATE objects, one per node -
+    # for a gun with several materials (a skinned object keeps only one).
+    # None loads the whole gun as one object.
+    viewmodel_gun_nodes = None
+    # Per-material overrides for the gun's parts, keyed by the material's name in
+    # the glb (like add_static's alpha_mode_overrides/roughness_overrides):
+    # {name: "OPAQUE" | "MASK" | "BLEND"} and {name: roughness float}.
+    viewmodel_alpha_mode_overrides = {}
+    viewmodel_roughness_overrides = {}
+    # Per-NODE alpha mode, for a node (see viewmodel_gun_nodes) that shares a
+    # material with another but needs its own: {node name: mode}. A node listed
+    # here ignores viewmodel_alpha_mode_overrides; a None value keeps the mode
+    # the glb authored for it.
+    viewmodel_node_alpha_mode_overrides = {}
     viewmodel_gun_skin = 1
     worldmodel = f"{_POSE_DIR}/pistolWM.glb"
     # The character joint the world model is held by, and its placement in
@@ -242,6 +298,17 @@ class WeaponsBase:
     worldmodel_position = (0.07, 0.0, 0.02)
     worldmodel_rotation = (-90.0, 0.0, -90.0)
     worldmodel_scale = 1.0
+    # A world model with several materials (body/cheese/glass...) loads as one skinned object
+    # per mesh node instead of one combined object - same reason and same shape as viewmodel_
+    # gun_nodes (a skinned object keeps only ONE material - see skeletal_loader.py's own
+    # multi-material scope note). None (most weapons - one material) keeps the existing single-
+    # object behavior exactly. Every node needs a skin (this is still add_skeletal underneath,
+    # not the static multi-material loader) - a rigid one-bone skin is enough for a prop that
+    # doesn't deform, but it still has to actually be skinned in the source file.
+    worldmodel_nodes = None
+    worldmodel_alpha_mode_overrides = {}
+    worldmodel_node_alpha_mode_overrides = {}
+    worldmodel_roughness_overrides = {}
     # The bones bullets (tracers) come out of. The world model has a real muzzle
     # bone; the first-person gun doesn't (Source keeps that as an attachment, not
     # a bone), so it uses the bone at the front of the barrel instead.
@@ -258,6 +325,10 @@ class WeaponsBase:
     muzzle_offset_scale = 0.0
     worldmodel_muzzle_bone = "ValveBiped.flash"
     viewmodel_muzzle_bone = "v_weapon.USP_Silencer"
+    # Where the muzzle really is relative to that bone: an (x, y, z) in the bone's
+    # own frame and units (None = at the bone). For a gun whose barrel tip isn't
+    # where the borrowed bone is.
+    viewmodel_muzzle_offset = None
 
     # ---- animations (state -> .glb, or None for the model's own clip) ----
     # One set for both parts: the arms and the gun share an armature (the gun
@@ -298,7 +369,10 @@ class WeaponsBase:
         self._fire_channel = None   # the mixer channel the last shot played on
         self._scene = None
         self._player_model = None
-        self.worldmodel_obj = None
+        self.worldmodel_obj = None     # the FIRST part - see worldmodel_nodes; carries the
+                                        # skeleton, so this is what muzzle-bone lookups and
+                                        # worldmodel_animations play on regardless of part count
+        self.worldmodel_objs = []      # every part (one for a single-material world model too)
         self._viewmodel = None
         self._clips = {}   # (part, state) -> clip name actually loaded
         self._moving = False
@@ -307,6 +381,7 @@ class WeaponsBase:
         # consult it, and start_reload always refuses (nothing to refill).
         self.ammo = self.magazine_size
         self._reloading = False
+        self._handling_last = (None, 0.0)   # (state, animation time) at the last handling-sound check
 
     # ---- firing --------------------------------------------------------
 
@@ -419,8 +494,48 @@ class WeaponsBase:
         self.play("reload")
         return True
 
-    def update(self, now=None):
-        """Call once a frame regardless of input (app.py's main loop does):
+    def play_handling_sound(self, path, position, follow=None):
+        """A gun-handling sound (clip out, slide release...): a one-shot that
+        rides along with the gun via `follow` (a callable returning the gun's
+        current world position), is dropped by the sound manager once it
+        finishes, and has a tiny falloff (handling_*_distance)."""
+        scene = self._scene
+        if scene is None or not path:
+            return None
+        return scene.sound_manager.add_sound(
+            path, glm.vec3(position), volume=self.handling_volume,
+            min_distance=self.handling_min_distance, max_distance=self.handling_max_distance,
+            loop=False, follow=follow, falloff="inverse",
+        )
+
+    def _play_handling_sounds(self, follow):
+        """Plays every handling_sounds entry whose frame the viewmodel's current
+        one-shot animation has just reached since the last call. Frames are
+        source frames (handling_fps); `draw` is sped up by draw_speed at load,
+        so its frames are scaled to match."""
+        vm = self._viewmodel
+        state = vm.one_shot_state if vm is not None else None
+        sounds = self.handling_sounds.get(state) if state is not None else None
+        if not sounds:
+            self._handling_last = (None, 0.0)
+            return
+        now_time = vm.one_shot_time(state)
+        last_state, last_time = self._handling_last
+        if last_state != state or now_time < last_time:
+            last_time = -1.0
+        scale = (1.0 / self.draw_speed) if state == "draw" else 1.0
+        for frame, path in sounds.items():
+            trigger = frame / self.handling_fps * scale
+            if last_time < trigger <= now_time and follow is not None:
+                self.play_handling_sound(path, follow(), follow)
+        self._handling_last = (state, now_time)
+
+    def update(self, now=None, follow=None):
+        """Call once a frame regardless of input (app.py's main loop does).
+        follow (a callable returning the gun's world position) is what
+        handling sounds are attached to.
+
+        Plays any handling sounds whose frame was just reached, then:
         auto-starts a reload the instant the magazine runs dry (so running
         empty mid-fight reloads on its own, same as most games - no need to
         remember the reload key), and finishes an in-progress reload once its
@@ -430,6 +545,7 @@ class WeaponsBase:
         this was a guessed timer), refilling the magazine and dropping back
         to idle. A no-op for a weapon with no ammo tracking at all
         (magazine_size <= 0)."""
+        self._play_handling_sounds(follow)
         if self._reloading:
             if not self._one_shot_still_playing("reload"):
                 self._reloading = False
@@ -439,6 +555,28 @@ class WeaponsBase:
         if self.magazine_size > 0 and self.ammo <= 0:
             self.start_reload(now)
 
+    def spawn_tracer_spiral(self, particles, start, end, camera_pos=None):
+        """Spawns this weapon's own tracer_spiral (see Modules/Weapons/tracer_spiral.py) along
+        this exact shot's beam - a no-op if it doesn't have one (the overwhelming majority of
+        weapons). The actual particle maths (the helix shape, the camera-distance coverage
+        falloff for a beam too long to spiral at full density) is ParticleManager.spawn_beam_
+        spiral's job, in Modules/Particles/particle_system.py - this method's only work is
+        handing it this weapon's own configured TracerSpiral instance plus a group cap shared
+        across every weapon (so a burst of shots from ANY of them can't pile up unlimited
+        spiral effects, the same idea as impacts' own cap). That split is the whole point:
+        "spawn particles, and honour how far away the camera is" is a capability every weapon
+        gets for free from this base class, while each weapon's own LOOK (colour, tightness,
+        density, size, lifetime - see TracerSpiral's own docstring) stays entirely its own
+        business, set on its own tracer_spiral attribute and nowhere else.
+
+        particles: the game's ParticleManager (app.py's own `particles`). camera_pos: this
+        frame's camera position, if the caller has it - see spawn_beam_spiral's own docstring
+        on what it's used for."""
+        if self.tracer_spiral is None:
+            return None
+        return particles.spawn_beam_spiral(start, end, self.tracer_spiral, group="tracer_spiral",
+                                           camera_pos=camera_pos)
+
     def muzzle_position(self, scene):
         """Where this weapon's bullets come out, in the world: the first-person
         gun's muzzle bone while that's what the owner is looking at, otherwise
@@ -446,7 +584,8 @@ class WeaponsBase:
         attached/posed yet."""
         gun = self._viewmodel.gun if self._viewmodel is not None else None
         if gun is not None and gun.get("viewmodel_visible") and self.viewmodel_muzzle_bone:
-            return scene.joint_world_position(gun, self.viewmodel_muzzle_bone)
+            return scene.joint_world_position(
+                gun, self.viewmodel_muzzle_bone, local_offset=self.viewmodel_muzzle_offset)
         if self.worldmodel_obj is not None and self.worldmodel_muzzle_bone:
             return scene.joint_world_position(self.worldmodel_obj, self.worldmodel_muzzle_bone)
         return None
@@ -529,13 +668,11 @@ class WeaponsBase:
         Near-instant either way: no loading, unlike equip_player's own
         first-time path (see its docstring) - this is what a weapon SWITCH
         actually does once both weapons involved are already primed."""
-        if self.worldmodel_obj is not None:
-            self.worldmodel_obj["visible_in_color"] = active
-            self.worldmodel_obj["cast_shadow"] = active
+        for obj in self.worldmodel_objs:
+            obj["visible_in_color"] = active
+            obj["cast_shadow"] = active
         if not active:
             return
-        if _debug_active():
-            print(f"[WB DEBUG] set_active(True) weapon={self.name} -> play('draw')")
         self.play("draw")
         idle = self._clips.get(("player", "idle"))
         if (idle is not None and self._player_model is not None
@@ -567,39 +704,72 @@ class WeaponsBase:
         drawn again - since the viewmodel is camera-relative, that read as
         the gun visibly sliding into place right after the (otherwise
         instant, blend_duration=0.0) draw cut."""
-        if _debug_active():
-            print(f"[WB DEBUG] deactivate() weapon={self.name}")
         if self._reloading:
             self._reloading = False
+        self._handling_last = (None, 0.0)
         self.recoil.reset()
         self.set_active(False)
 
     def _attach_worldmodel(self, scene, player_obj):
         if not self.worldmodel:
             return
-        obj = scene.add_skeletal(self.worldmodel, visible_in_color=True, cast_shadow=True)
-        if obj is None:
+        if self.worldmodel_nodes:
+            # One skinned object per material node - see worldmodel_nodes' own docstring.
+            objs = []
+            for node in self.worldmodel_nodes:
+                node_modes = self.worldmodel_node_alpha_mode_overrides
+                ignore = node in node_modes     # this node opts out of the by-material overrides
+                obj = scene.add_skeletal(
+                    self.worldmodel, visible_in_color=True, cast_shadow=True, node_names=(node,))
+                if obj is None:
+                    continue
+                name = obj.get("material_name")
+                if not ignore and self.worldmodel_alpha_mode_overrides.get(name):
+                    obj["alpha_mode"] = self.worldmodel_alpha_mode_overrides[name]
+                if node_modes.get(node):
+                    obj["alpha_mode"] = node_modes[node]
+                if self.worldmodel_roughness_overrides.get(name) is not None:
+                    obj["roughness"] = float(self.worldmodel_roughness_overrides[name])
+                objs.append(obj)
+        else:
+            obj = scene.add_skeletal(self.worldmodel, visible_in_color=True, cast_shadow=True)
+            objs = [obj] if obj is not None else []
+        if not objs:
             return
-        obj["specular_strength"] = 0
-        obj["frustum_cull"] = (1.4, 0.4, 2.6)      # same as its owner's (its position is the owner's)
-        obj["max_draw_distance"] = 30.0            # a pistol that far away is a couple of pixels
-        obj["max_shadow_distance"] = 8.0
+
         rotation = glm.mat4(glm.quat(glm.radians(glm.vec3(*self.worldmodel_rotation))))
         local = (
             glm.translate(glm.mat4(1.0), glm.vec3(*self.worldmodel_position))
             * rotation * glm.scale(glm.mat4(1.0), glm.vec3(self.worldmodel_scale))
         )
-        if scene.attach_skeletal(obj, player_obj, self.worldmodel_bone, local) is None:
-            scene.remove_skeletal(obj)
+        attached = []
+        for obj in objs:
+            obj["specular_strength"] = 0
+            obj["frustum_cull"] = (1.4, 0.4, 2.6)  # same as its owner's (its position is the owner's)
+            obj["max_draw_distance"] = 30.0        # a pistol that far away is a couple of pixels
+            obj["max_shadow_distance"] = 8.0
+            if scene.attach_skeletal(obj, player_obj, self.worldmodel_bone, local) is None:
+                scene.remove_skeletal(obj)
+                continue
+            attached.append(obj)
+        if not attached:
             return
-        self.worldmodel_obj = obj
+
+        self.worldmodel_objs = attached
+        self.worldmodel_obj = attached[0]      # carries the skeleton muzzle-bone lookups use -
+                                                # animations still load on EVERY part below (each
+                                                # is its own add_skeletal call, so its own skeleton
+                                                # - see _load_state_clip's own docstring)
         for state, path in self.worldmodel_animations.items():
-            clip = _load_state_clip(scene, obj, path, f"{self.player_clip(state)}_wm")
-            if clip is not None:
-                self._clips[("worldmodel", state)] = clip
+            clip_name = f"{self.player_clip(state)}_wm"
+            for obj in attached:
+                clip = _load_state_clip(scene, obj, path, clip_name)
+                if clip is not None:
+                    self._clips[("worldmodel", state)] = clip
         idle = self._clips.get(("worldmodel", "idle"))
         if idle is not None:
-            scene.set_skeletal_animation(obj, idle, blend_duration=0.0)
+            for obj in attached:
+                scene.set_skeletal_animation(obj, idle, blend_duration=0.0)
 
     def _upper_offsets(self):
         offsets = dict(self.player_upper_rotation_degrees)
@@ -635,9 +805,11 @@ class WeaponsBase:
             viewmodel.prime_weapon(self)
 
     def unequip_player(self):
-        if self.worldmodel_obj is not None and self._scene is not None:
-            self._scene.remove_skeletal(self.worldmodel_obj)
+        if self._scene is not None:
+            for obj in self.worldmodel_objs:
+                self._scene.remove_skeletal(obj)
         self.worldmodel_obj = None
+        self.worldmodel_objs = []
         if self._player_model is not None:
             self._player_model.clear_upper_override()
         self._player_model = None

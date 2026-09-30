@@ -401,17 +401,30 @@ impl PySteamClient {
     /// A user's Steam profile picture as 64x64 RGBA bytes (16384 of them), or
     /// None until Steam has it - it asks Steam to fetch it (works for
     /// non-friends in the same lobby too), so callers just ask again later.
+    ///
+    /// medium_avatar() itself (vendor/steamworks-0.11.0/src/friends.rs) reads the
+    /// image via raw Steamworks FFI and asserts its size is exactly 64x64 before
+    /// handing back the buffer - an assert_eq! panics (aborts the whole embedded
+    /// process) rather than returning an error, so if Steam's overlay/client ever
+    /// hands back something else, that panic is what a caller would see, not a
+    /// clean None. This crate doesn't own that vendored function, but it can
+    /// avoid trusting it blindly: re-checking the buffer's own length here means
+    /// anything unexpected degrades to None on the Python side (matching what
+    /// callers already handle for "Steam hasn't fetched it yet") instead of
+    /// ever reaching that panic path.
     pub fn friend_avatar<'py>(&self, py: Python<'py>, steam_id: u64) -> Option<Bound<'py, PyBytes>> {
+        const MEDIUM_AVATAR_BYTES: usize = 64 * 64 * 4;
         let (client, _) = self.client.as_ref()?;
         let friends = client.friends();
         let id = SteamId::from_raw(steam_id);
         if friends.request_user_information(id, false) {
             return None;
         }
-        friends
-            .get_friend(id)
-            .medium_avatar()
-            .map(|rgba| PyBytes::new(py, &rgba))
+        let rgba = friends.get_friend(id).medium_avatar()?;
+        if rgba.len() != MEDIUM_AVATAR_BYTES {
+            return None;
+        }
+        Some(PyBytes::new(py, &rgba))
     }
 
     pub fn own_steam_id(&self) -> u64 {

@@ -66,6 +66,7 @@ manual-sync point, if that's ever worth doing.
 
 import struct
 
+import glm
 import numpy as np
 
 # Fixed texture units used when binding materials.
@@ -174,8 +175,10 @@ FRAGMENT_SHADER_HEADER = f"""
 
 VERTEX_SHADER = """
 #version 330
-uniform mat4 u_mvp;
-uniform mat4 u_model;
+// Everything that varies per object, in ONE uniform array so a draw needs one write instead of three:
+// [0] model-view-projection, [1] model, [2] the normal matrix (inverse-transpose of the model's
+// upper 3x3, computed on the CPU) in the upper-left 3x3 - see pbr_shader._write_object_uniforms.
+uniform mat4 u_object[3];
 
 in vec3 in_position;
 in vec3 in_normal;
@@ -197,9 +200,10 @@ out vec2 v_uv;
 out vec2 v_lightmap_uv;
 out vec4 v_tangent;
 
+invariant gl_Position;   // bit-identical to the depth-only pre-pass shader (scene_base.py)
 void main() {
-    v_position = (u_model * vec4(in_position, 1.0)).xyz;
-    mat3 normal_matrix = mat3(transpose(inverse(u_model)));
+    v_position = (u_object[1] * vec4(in_position, 1.0)).xyz;
+    mat3 normal_matrix = mat3(u_object[2]);
     v_normal = normal_matrix * in_normal;
     v_color = in_color;
     v_uv = in_uv;
@@ -209,7 +213,7 @@ void main() {
     // matrix transform v_normal itself gets (so tangent and normal stay
     // consistent under non-uniform scale/rotation).
     v_tangent = vec4(normal_matrix * in_tangent.xyz, in_tangent.w);
-    gl_Position = u_mvp * vec4(in_position, 1.0);
+    gl_Position = u_object[0] * vec4(in_position, 1.0);
 }
 """
 
@@ -337,6 +341,13 @@ uniform sampler2D u_shadow_maps[NUM_CASCADES];
 uniform mat4 u_light_mvps[NUM_CASCADES];
 uniform float u_cascade_splits[NUM_CASCADES];
 uniform int u_has_shadows;
+
+// Bounding sphere of everything drawn into the shadow cascades this frame (they hold only
+// movers): xyz centre, w radius (with a margin for the soft-shadow filter). A static pixel
+// whose ray toward the sun misses it can't be shadowed by a mover, so it skips the 9-tap
+// lookup. w < 0: nothing was drawn (never shadowed). u_use_caster_sphere == 0: no bound, always look.
+uniform vec4 u_caster_sphere;
+uniform int u_use_caster_sphere;
 
 // calculate_movable_shadow (used by a static/lightmapped surface to
 // receive a moving object's own real-time shadow without double-
@@ -606,6 +617,18 @@ float calculate_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light
 // baked lightmap already includes static-on-static shadowing, so
 // combining the static map in again here would double-shadow it a
 // second time on top of that.
+// False only when the ray from p toward the sun (direction L) provably misses every mover
+// that was drawn into the cascades - see u_caster_sphere.
+bool may_be_shadowed_by_movers(vec3 p, vec3 L) {
+    if (u_use_caster_sphere == 0) return true;
+    float r = u_caster_sphere.w;
+    if (r < 0.0) return false;
+    vec3 pc = u_caster_sphere.xyz - p;
+    float t = dot(pc, L);
+    if (t < -r) return false;
+    return dot(pc, pc) - t * t <= r * r;
+}
+
 float calculate_movable_shadow(vec3 world_pos, float view_depth, vec3 normal, vec3 light_dir) {
     return calculate_cascade_shadow(world_pos, view_depth, normal);
 }
@@ -790,6 +813,11 @@ vec4 ssr_reflect(vec3 N, vec3 world_pos) {
     vec3 view_normal = normalize(mat3(u_view_matrix) * N);
     vec3 view_dir = normalize(view_pos);
     vec3 reflect_dir = normalize(reflect(view_dir, view_normal));
+    // A ray heading back toward the camera can only find the unseen back of things the depth buffer
+    // has no data for, so it's rejected up front (standard SSR practice) instead of marched for nothing.
+    if (reflect_dir.z > 0.0) {
+        return vec4(0.0);
+    }
 
     const int SSR_MAX_STEPS = 32;
     const int SSR_BINARY_STEPS = 6;
@@ -1135,7 +1163,10 @@ void main() {
         // fill fix added a second PCF tap AND a second texture sample
         // to what used to be lightmapped rendering's whole fast-path
         // point.
-        float movable_shadow = calculate_movable_shadow(v_position, view_depth, N, L);
+        float movable_shadow = 0.0;
+        if (may_be_shadowed_by_movers(v_position, L)) {
+            movable_shadow = calculate_movable_shadow(v_position, view_depth, N, L);
+        }
         vec3 removable = vec3(0.0);
         if (movable_shadow > 0.0) {
             float sun_reaches = 1.0 - calculate_static_shadow(v_position, N);
@@ -1294,6 +1325,79 @@ def _write_uniform(prog, name, value):
         prog[name].value = value
 
 
+# Sampler uniforms hold a fixed texture unit for the life of a program (only which TEXTURE is bound
+# to the unit changes per object), so each is written once per program, not on every draw. The
+# has-lightmap flag genuinely toggles between objects, so its last value is remembered and it's
+# only rewritten when it changes.
+_program_state = {}        # id(prog) -> (prog, sampler uniforms already pointed at their unit, flags)
+
+_MATERIAL_TEXTURE_UNITS = (
+    ("texture", "u_texture", TEX_UNIT_ALBEDO),
+    ("metallic_roughness_texture", "u_metallic_roughness_texture", TEX_UNIT_METALLIC_ROUGHNESS),
+    ("normal_texture", "u_normal_texture", TEX_UNIT_NORMAL),
+    ("tint_mask_texture", "u_tint_mask_texture", TEX_UNIT_TINT_MASK),
+)
+
+
+def _state_of(prog):
+    entry = _program_state.get(id(prog))
+    if entry is None or entry[0] is not prog:
+        entry = _program_state[id(prog)] = (prog, set(), {})
+    return entry
+
+
+def invalidate_bind_plan(item_data):
+    """Drops item_data's cached texture-bind plan (see _bind_plan) - call after assigning it a
+    different texture (e.g. the lightmap a bake just produced)."""
+    item_data.pop("_bind_plan", None)
+
+
+def _bind_plan(prog, item_data):
+    """(prog, [(texture, unit), ...], has_lightmap, per-program flags): everything a draw's texture
+    binding needs, worked out ONCE per object per program instead of a dozen dict lookups and
+    uniform-name checks on every draw. The sampler uniforms are pointed at their units here,
+    the first time. Rebuilt if the object is drawn with a different program, or after
+    invalidate_bind_plan."""
+    _, pointed, flags = _state_of(prog)
+    binds = []
+    for key, uniform_name, unit in _MATERIAL_TEXTURE_UNITS:
+        tex = item_data.get(key)
+        if tex and _has_uniform(prog, uniform_name):
+            binds.append((tex, unit))
+            if uniform_name not in pointed:
+                prog[uniform_name].value = unit
+                pointed.add(uniform_name)
+    has_lightmap = 0
+    lightmap = item_data.get("lightmap_texture")
+    if lightmap is not None and _has_uniform(prog, "u_lightmap"):
+        has_lightmap = 1
+        binds.append((lightmap, TEX_UNIT_LIGHTMAP))
+        if "u_lightmap" not in pointed:
+            prog["u_lightmap"].value = TEX_UNIT_LIGHTMAP
+            pointed.add("u_lightmap")
+        sun = item_data.get("sun_lightmap_texture")
+        if sun is not None and _has_uniform(prog, "u_sun_lightmap"):
+            binds.append((sun, TEX_UNIT_SUN_LIGHTMAP))
+            if "u_sun_lightmap" not in pointed:
+                prog["u_sun_lightmap"].value = TEX_UNIT_SUN_LIGHTMAP
+                pointed.add("u_sun_lightmap")
+    plan = (prog, tuple(binds), has_lightmap, flags)
+    item_data["_bind_plan"] = plan
+    return plan
+
+
+def _bind_textures_and_lightmap(prog, item_data):
+    plan = item_data.get("_bind_plan")
+    if plan is None or plan[0] is not prog:
+        plan = _bind_plan(prog, item_data)
+    for tex, unit in plan[1]:
+        tex.use(location=unit)
+    flags = plan[3]
+    if flags.get("has_lightmap") != plan[2]:
+        _write_uniform(prog, "u_has_lightmap", plan[2])
+        flags["has_lightmap"] = plan[2]
+
+
 def _bind_material_textures(prog, item_data):
     # .filter is a property of the texture itself, set once at creation
     # time (model_loader.py's _upload_texture, skeletal_loader.py's
@@ -1303,17 +1407,14 @@ def _bind_material_textures(prog, item_data):
     # was pure redundant GL state traffic. Confirmed via CPU profiling
     # as part of the same per-object-rebind investigation that led to
     # bind_frame_uniforms.
-    for key, unit in (
-        ("texture", TEX_UNIT_ALBEDO),
-        ("metallic_roughness_texture", TEX_UNIT_METALLIC_ROUGHNESS),
-        ("normal_texture", TEX_UNIT_NORMAL),
-        ("tint_mask_texture", TEX_UNIT_TINT_MASK),
-    ):
+    pointed = _state_of(prog)[1]
+    for key, uniform_name, unit in _MATERIAL_TEXTURE_UNITS:
         tex = item_data.get(key)
-        uniform_name = f"u_{key}"
         if tex and _has_uniform(prog, uniform_name):
             tex.use(location=unit)
-            prog[uniform_name].value = unit
+            if uniform_name not in pointed:
+                prog[uniform_name].value = unit
+                pointed.add(uniform_name)
 
 
 def _bind_shadow_uniforms(prog, shadow_manager):
@@ -1345,12 +1446,21 @@ def _bind_shadow_uniforms(prog, shadow_manager):
     )
 
 
+def _set_has_lightmap(prog, flags, value):
+    if flags.get("has_lightmap") != value:
+        _write_uniform(prog, "u_has_lightmap", value)
+        flags["has_lightmap"] = value
+
+
 def _bind_lightmap(prog, item_data):
+    _, pointed, flags = _state_of(prog)
     texture = item_data.get("lightmap_texture")
     if texture is not None and _has_uniform(prog, "u_lightmap"):
         texture.use(location=TEX_UNIT_LIGHTMAP)
-        prog["u_lightmap"].value = TEX_UNIT_LIGHTMAP
-        _write_uniform(prog, "u_has_lightmap", 1)
+        if "u_lightmap" not in pointed:
+            prog["u_lightmap"].value = TEX_UNIT_LIGHTMAP
+            pointed.add("u_lightmap")
+        _set_has_lightmap(prog, flags, 1)
 
         # See TEX_UNIT_SUN_LIGHTMAP's own comment. Always present
         # whenever "lightmap_texture" is (Scene.bake_static_lighting
@@ -1361,9 +1471,11 @@ def _bind_lightmap(prog, item_data):
         sun_texture = item_data.get("sun_lightmap_texture")
         if sun_texture is not None and _has_uniform(prog, "u_sun_lightmap"):
             sun_texture.use(location=TEX_UNIT_SUN_LIGHTMAP)
-            prog["u_sun_lightmap"].value = TEX_UNIT_SUN_LIGHTMAP
+            if "u_sun_lightmap" not in pointed:
+                prog["u_sun_lightmap"].value = TEX_UNIT_SUN_LIGHTMAP
+                pointed.add("u_sun_lightmap")
     else:
-        _write_uniform(prog, "u_has_lightmap", 0)
+        _set_has_lightmap(prog, flags, 0)
 
 
 def _bind_static_shadow_uniforms(prog, texture, light_vp):
@@ -1554,6 +1666,7 @@ def invalidate_material_ubo(item_data):
     """Drops item_data's cached material buffers so the next draw repacks
     them - call after changing a field that's normally fixed at load time
     (e.g. tint_color, see Scene.set_skeletal_tint)."""
+    item_data.pop("_bind_plan", None)
     for key in ("_material_ubo", "_material_ubo_untinted"):
         ubo = item_data.pop(key, None)
         if ubo is not None:
@@ -1564,6 +1677,25 @@ def bind_untinted_material(ctx, item_data):
     """Rebinds item_data's material block with the color tint off - for the
     hat drawn right after a tinted base mesh (see Scene._draw_hat)."""
     _get_material_ubo(ctx, item_data, tinted=False).bind_to_uniform_block(MATERIAL_UBO_BINDING)
+
+
+def _write_object_uniforms(prog, item_data, model_matrix, view_proj):
+    """u_object: this object's mvp, model and normal matrix, written in a single call (they used
+    to be three uniforms and three writes per draw). The normal matrix - the vertex shader used
+    to invert the model matrix for every VERTEX - is per object, so it's computed here once,
+    and cached on the object while its model matrix is the same object (a static one's is)."""
+    if not _has_uniform(prog, "u_object"):
+        return
+    if item_data is not None and item_data.get("_normal_matrix_src") is model_matrix:
+        tail = item_data["_normal_matrix_bytes"]
+    else:
+        tail = model_matrix.to_bytes() + glm.mat4(glm.inverseTranspose(glm.mat3(model_matrix))).to_bytes()
+        if item_data is not None:
+            item_data["_normal_matrix_src"] = model_matrix
+            item_data["_normal_matrix_bytes"] = tail
+    # Only the mvp changes every frame (the camera moves); the model + normal matrix bytes are
+    # cached for as long as the model matrix is the same object (a static one's is).
+    prog["u_object"].write((view_proj * model_matrix).to_bytes() + tail)
 
 
 def bind_material(prog, item_data, model_matrix, view_proj):
@@ -1578,21 +1710,17 @@ def bind_material(prog, item_data, model_matrix, view_proj):
     from item_data's own cached MaterialBlock buffer (see _get_material_
     ubo) - only u_mvp/u_model genuinely change per draw (the camera
     moves every frame; a dynamic object's own transform can too)."""
-    mvp = view_proj * model_matrix
-    _write_uniform(prog, "u_mvp", mvp.to_bytes())
-    _write_uniform(prog, "u_model", model_matrix.to_bytes())
+    _write_object_uniforms(prog, item_data, model_matrix, view_proj)
 
     _get_material_ubo(prog.ctx, item_data).bind_to_uniform_block(MATERIAL_UBO_BINDING)
 
-    _bind_material_textures(prog, item_data)
-    _bind_lightmap(prog, item_data)
+    _bind_textures_and_lightmap(prog, item_data)
 
 
 def bind_transform_only(prog, model_matrix, view_proj):
     """bind_material's per-object part alone (u_mvp / u_model): for an object drawn right after one
     with an identical material (same textures, same material buffer), which is already bound."""
-    _write_uniform(prog, "u_mvp", (view_proj * model_matrix).to_bytes())
-    _write_uniform(prog, "u_model", model_matrix.to_bytes())
+    _write_object_uniforms(prog, None, model_matrix, view_proj)
 
 
 def bind_environment(prog, sky_color, ground_color):
@@ -1662,7 +1790,29 @@ def bind_ssr_textures(prog, color_texture, depth_texture):
     _write_uniform(prog, "u_has_scene_grab", 1)
 
 
-def bind_point_lights(prog, point_lights):
+def pack_point_lights(point_lights):
+    """(count, positions, colors, radii): the point-light uniform data as raw bytes, built once
+    so several programs (or several objects) can bind the same lights without redoing the
+    Python list building each time - see bind_point_lights' packed argument."""
+    lights = point_lights[:MAX_POINT_LIGHTS]
+    positions, colors, radii = [], [], []
+    for light in lights:
+        positions.extend(light["position"])
+        colors.extend(c * light["intensity"] for c in light["color"])
+        radii.append(light["radius"])
+
+    def _padded(values, length):
+        return values + [0.0] * (length - len(values))
+
+    return (
+        len(lights),
+        np.array(_padded(positions, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes(),
+        np.array(_padded(colors, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes(),
+        np.array(_padded(radii, MAX_POINT_LIGHTS), dtype=np.float32).tobytes(),
+    )
+
+
+def bind_point_lights(prog, point_lights, packed=None):
     """
     Binds point-light uniforms for this frame - position, color
     (pre-multiplied by intensity), and falloff radius only. No shadow
@@ -1678,35 +1828,17 @@ def bind_point_lights(prog, point_lights):
 
     point_lights: list of dicts shaped like Scene.add_point_light()
     produces (each needs "position", "color", "intensity", "radius").
+    packed: the result of pack_point_lights(point_lights), if already built (then
+    point_lights isn't read).
     """
-    lights = point_lights[:MAX_POINT_LIGHTS]
-
-    _write_uniform(prog, "u_num_point_lights", len(lights))
-
-    positions = []
-    colors = []
-    radii = []
-
-    for light in lights:
-        positions.extend(light["position"])
-        colors.extend(c * light["intensity"] for c in light["color"])
-        radii.append(light["radius"])
-
-    def _padded(values, length):
-        return values + [0.0] * (length - len(values))
-
+    count, positions, colors, radii = packed if packed is not None else pack_point_lights(point_lights)
+    _write_uniform(prog, "u_num_point_lights", count)
     if _has_uniform(prog, "u_point_light_pos"):
-        prog["u_point_light_pos"].write(
-            np.array(_padded(positions, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes()
-        )
+        prog["u_point_light_pos"].write(positions)
     if _has_uniform(prog, "u_point_light_color"):
-        prog["u_point_light_color"].write(
-            np.array(_padded(colors, MAX_POINT_LIGHTS * 3), dtype=np.float32).tobytes()
-        )
+        prog["u_point_light_color"].write(colors)
     if _has_uniform(prog, "u_point_light_radius"):
-        prog["u_point_light_radius"].write(
-            np.array(_padded(radii, MAX_POINT_LIGHTS), dtype=np.float32).tobytes()
-        )
+        prog["u_point_light_radius"].write(radii)
 
 
 def pack_lighting(point_lights, irradiance):

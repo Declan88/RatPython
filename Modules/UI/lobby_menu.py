@@ -69,16 +69,83 @@ class LobbyMenu:
         column = sidebar.add(Panel(anchor=Anchor.TOP_LEFT, offset=(80, 50), layout="vertical",
                                    spacing=14, fit_content=True))
         column.add(Label("RATWAR", font_size=132, color=theme.ACCENT, font=theme.title_font_path()))
+        self._build_profile(column)
         column.add(Panel(size=(1, 18)))  # spacer
-        buttons = column.add(Panel(layout="horizontal", spacing=16, fit_content=True))
-        buttons.add(_button("HOST", self.toggle_host, size=((_W + 36 - 16) // 2, 84), font_size=40))
-        buttons.add(_button("JOIN", self.toggle_join, size=((_W + 36 - 16) // 2, 84), font_size=40))
+        # Multiplayer needs Steam; without it there's nothing HOST/JOIN could actually do
+        # (see _steam_ready) - a single "Start singleplayer" button stands in for both,
+        # straight into the main map with no lobby at all. Both live in the same slot,
+        # toggled by _update_play_buttons rather than one replacing the other, so this
+        # doesn't have to rebuild anything if Reconnect later succeeds mid-session.
+        self.mp_buttons = column.add(Panel(layout="horizontal", spacing=16, fit_content=True))
+        self.mp_buttons.add(_button("HOST", self.toggle_host, size=((_W + 36 - 16) // 2, 84), font_size=40))
+        self.mp_buttons.add(_button("JOIN", self.toggle_join, size=((_W + 36 - 16) // 2, 84), font_size=40))
+        self.sp_button = column.add(_button(
+            "START SINGLEPLAYER", self._start_singleplayer, size=(_W + 36, 84), font_size=36))
         self.status = column.add(Label("", font_size=26, color=_WARN))
         self.host_panel = column.add(self._build_host_panel())
         self.join_panel = column.add(self._build_join_panel())
+        self._update_play_buttons()
 
         self._build_wardrobe(root)
         return root
+
+    def _build_profile(self, column):
+        """Steam identity: avatar + persona name once connected, or a warning plus a
+        Reconnect button when the game started (or Steam closed) without it - see
+        _rebuild_profile for why this is rebuilt outright on any state change rather than
+        just toggling visibility (the two states share no widgets)."""
+        self.profile_panel = column.add(Panel(layout="horizontal", spacing=12, fit_content=True))
+        self._avatar_image = None
+        self._avatar_loaded = False
+        self._name_label = None
+        self._rebuild_profile()
+
+    def _rebuild_profile(self):
+        self.profile_panel.clear_children()
+        self._avatar_image = None
+        self._avatar_loaded = False
+        self._name_label = None
+        if self.net.available:
+            self._avatar_image = self.profile_panel.add(Image(size=(48, 48), anchor=Anchor.MIDDLE_LEFT))
+            self._name_label = self.profile_panel.add(Label(
+                self.net.local_name or "...", font_size=24, color=theme.TEXT, anchor=Anchor.MIDDLE_LEFT))
+            self._apply_avatar()
+        else:
+            warn = self.profile_panel.add(Panel(layout="vertical", spacing=8, fit_content=True))
+            warn.add(Label("Steam uninitialized! Open Steam and press reconnect",
+                          font_size=20, color=_WARN))
+            warn.add(_button("Reconnect", self._reconnect, size=(220, 44), font_size=22))
+
+    def _apply_avatar(self):
+        if self._avatar_image is None or self._avatar_loaded:
+            return
+        data = self.net.avatar_rgba(self.net.local_steam_id)
+        if data is not None:
+            self._avatar_image.set_rgba((64, 64), data)
+            self._avatar_loaded = True
+
+    def _reconnect(self):
+        """The profile panel's Reconnect button: retries Steam from scratch (see
+        NetworkManager.reconnect's own docstring) and, on success, swaps the whole menu
+        over to the multiplayer-available state - the profile (now showing the avatar/
+        name instead of the warning) and HOST/JOIN in place of Start Singleplayer."""
+        if self.net.reconnect():
+            self._rebuild_profile()
+            self._update_play_buttons()
+
+    def _update_play_buttons(self):
+        available = self.net.available
+        self.mp_buttons.visible = available
+        self.sp_button.visible = not available
+        if not available:
+            self.host_panel.visible = False
+            self.join_panel.visible = False
+
+    def _start_singleplayer(self):
+        """Straight into the main map, no lobby, no Steam needed at all - see maps' own
+        order (main_menu_scene.py builds this from app.py's MAPS, "Main Map" first)."""
+        default_map = next((key for name, key in self.maps if key == "mainmap"), self.maps[0][1])
+        self.on_start(default_map)
 
     def _build_wardrobe(self, root):
         """A card under the 3D rat with the hat dropdown. The choice lives on
@@ -405,7 +472,13 @@ class LobbyMenu:
 
     def update(self, dt):
         """Auto-refreshes the lobby list while the Join panel is open (not
-        mid-click, or a rebuilt row would swallow the press)."""
+        mid-click, or a rebuilt row would swallow the press), and keeps the
+        profile panel's name/avatar current - both load from Steam lazily
+        (see NetworkManager._refresh_names/avatar_rgba's own docstrings), so
+        neither is necessarily there yet the first time _rebuild_profile ran."""
+        if self._name_label is not None:
+            self._name_label.text = self.net.local_name or "..."
+            self._apply_avatar()
         if not self.root.visible or not self.join_panel.visible or self._busy \
                 or self._searching or self.ui._pressed is not None:
             return

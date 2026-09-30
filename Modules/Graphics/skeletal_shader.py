@@ -47,8 +47,8 @@ SKELETAL_VERTEX_HEADER = f"""
 """
 
 SKELETAL_VERTEX_BODY = """
-uniform mat4 u_mvp;
-uniform mat4 u_model;
+// [0] mvp, [1] model, [2] normal matrix (upper-left 3x3), one write per draw - see pbr_shader._write_object_uniforms
+uniform mat4 u_object[3];
 layout(std140) uniform BoneBlock { mat4 u_bone_matrices[MAX_BONES]; };
 
 in vec3 in_position;
@@ -94,22 +94,83 @@ void main() {
     vec4 skinned_position = skin_matrix * vec4(in_position, 1.0);
     vec3 skinned_normal = mat3(skin_matrix) * in_normal;
 
-    v_position = (u_model * skinned_position).xyz;
-    v_normal = mat3(transpose(inverse(u_model))) * skinned_normal;
+    v_position = (u_object[1] * skinned_position).xyz;
+    v_normal = mat3(u_object[2]) * skinned_normal;
     v_color = in_color;
     v_uv = in_uv;
     v_lightmap_uv = in_lightmap_uv;
     // See this file's own v_tangent declaration comment above - a fixed
     // placeholder, never actually sampled against for a skeletal object.
     v_tangent = vec4(1.0, 0.0, 0.0, 1.0);
-    gl_Position = u_mvp * skinned_position;
+    gl_Position = u_object[0] * skinned_position;
 }
 """
 
 SKELETAL_VERTEX_SHADER = SKELETAL_VERTEX_HEADER + SKELETAL_VERTEX_BODY
 
-# Reused verbatim from pbr_shader.py - see module docstring for why.
-SKELETAL_FRAGMENT_SHADER = FRAGMENT_SHADER_HEADER + FRAGMENT_SHADER_BODY
+# The Source-engine "dissolve" death effect (Modules/Weapons/damage_classes.py's own Zap) -
+# skeletal-only (a static wall never dissolves), so this is spliced into a COPY of
+# FRAGMENT_SHADER_BODY, not the shared constant itself (see this file's own module
+# docstring on why that constant stays one source of truth for the LIGHTING it computes -
+# this doesn't touch any of that, it only ever discards or tints the fragment AFTER
+# lighting already ran, so there's nothing here that could drift from the static/dynamic
+# pipeline's own copy of the same shared body). u_dissolve_amount defaults to 0.0 (moderngl
+# zero-initializes every uniform), which skips this block entirely - so every OTHER
+# skeletal object drawn with this same program (everyone not currently dissolving) is
+# completely unaffected; only the object whose OWN per-draw uniform write (see
+# bind_dissolve) sets it above 0 ever tints or discards at all.
+#
+# This is a real port of what Source actually does, read from the engine's own client code
+# (source-sdk-2013's game/client/c_entitydissolve.cpp - ValveSoftware/source-sdk-2013 on
+# GitHub), not a guess: C_EntityDissolve::ClientThink sets the whole model's render colour
+# to (1 - fadeInPercentage) * effectColor, i.e. the model tints from its normal lit colour
+# DOWN TO FLAT BLACK as the effect ramps in (kRenderTransColor fully replaces the model's
+# shading with that flat colour - there is no per-pixel cutout pattern in Source's own
+# implementation at all). Every crackling spark/glow/tesla-arc the player actually sees is
+# a completely separate particle effect spawned around the character's hitboxes each frame
+# from C_EntityDissolve::DrawModel/DoSparks (see Modules/Particles/dissolve_sparks.py and
+# RemotePlayer's own periodic spawning while self._dissolving - nothing to do with this
+# shader), and only once GetModelFadeOutPercentage() drops does the model's ALPHA fade out
+# to make it disappear.
+#
+# Source achieves that alpha fade with a real blend-mode switch this engine's skeletal
+# pipeline doesn't have (every skeletal object always draws fully opaque - see _render_
+# scene's own comment on why). A dithered/stippled discard - a fixed per-screen-pixel
+# threshold pattern, the fragment discarded once u_dissolve_amount's "vanish" phase passes
+# that pixel's threshold - reaches the same "gradually disappears" result without needing a
+# real alpha blend, at the cost of a visible dither pattern up close instead of a smooth
+# blend (the standard trick for fading an opaque-pipeline object out; not something Source's
+# own code does, since it doesn't need to).
+_DISSOLVE_UNIFORMS = """
+uniform float u_dissolve_amount;   // 0 = untouched, 1 = fully gone
+
+float dissolve_hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+"""
+# Fractions of u_dissolve_amount's own 0-1 range (see RemotePlayer.DISSOLVE_SECONDS) spent
+# turning black vs. then vanishing - tuned so the body reads as fully black for a beat before
+# it starts disappearing, same shape as Source's own separate fade-in/fade-out windows.
+_DISSOLVE_BLACKEN_END = 0.35
+_DISSOLVE_VANISH_START = 0.55
+_DISSOLVE_TARGET = "    fragColor = vec4(color, u_alpha_mode == 2 ? alpha : 1.0);\n}"
+_DISSOLVE_SNIPPET = f"""
+    if (u_dissolve_amount > 0.0) {{
+        // Colour ramps to flat black - see this block's own comment above for exactly where
+        // this comes from in Source's own client code.
+        float blacken = clamp(u_dissolve_amount / {_DISSOLVE_BLACKEN_END}, 0.0, 1.0);
+        color *= (1.0 - blacken);
+        // Then dissolves away via a per-pixel dither threshold (see this block's own comment
+        // on why a discard stipple stands in for Source's real alpha blend here).
+        float vanish = clamp((u_dissolve_amount - {_DISSOLVE_VANISH_START}) / (1.0 - {_DISSOLVE_VANISH_START}), 0.0, 1.0);
+        if (vanish > 0.0 && dissolve_hash(gl_FragCoord.xy) < vanish) discard;
+    }}
+    fragColor = vec4(color, u_alpha_mode == 2 ? alpha : 1.0);
+}}"""
+assert _DISSOLVE_TARGET in FRAGMENT_SHADER_BODY, "pbr_shader.FRAGMENT_SHADER_BODY's ending changed shape"
+_SKELETAL_FRAGMENT_BODY = FRAGMENT_SHADER_BODY.replace(_DISSOLVE_TARGET, _DISSOLVE_SNIPPET, 1)
+
+SKELETAL_FRAGMENT_SHADER = FRAGMENT_SHADER_HEADER + _DISSOLVE_UNIFORMS + _SKELETAL_FRAGMENT_BODY
 
 
 SKELETAL_SHADOW_VERTEX_HEADER = f"""
@@ -204,3 +265,16 @@ def bind_bone_matrices(obj):
     subsequent draws - a cheap bind, no data upload (see
     upload_bone_matrices)."""
     obj["bone_ubo"].bind_to_uniform_block(BONE_UBO_BINDING)
+
+
+def bind_dissolve(prog, obj):
+    """Writes u_dissolve_amount for obj's draw - 0 (untouched) for the overwhelming majority
+    of skeletal objects, every frame, which never have obj["dissolve_amount"] set at all (see
+    RemotePlayer's own dissolve state machine, the only thing that ever sets it) - this still
+    has to be written per-draw regardless, since the shader program is SHARED across every
+    skeletal object: without explicitly zeroing it for everyone else, whichever object last
+    left it non-zero would leak its black tint/vanish onto the next object drawn with this
+    program."""
+    if "u_dissolve_amount" not in prog:
+        return
+    prog["u_dissolve_amount"].value = float(obj.get("dissolve_amount") or 0.0)

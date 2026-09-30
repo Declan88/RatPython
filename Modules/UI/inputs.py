@@ -46,16 +46,69 @@ class TextInput(Widget):
         self.color = color
         self.focus_color = focus_color
         self.border_color = border_color
-        self.text = text[:max_length]
-        self.cursor = len(self.text)
-        self.sel_anchor = self.cursor  # other end of the selection (== cursor: none)
-        self.focused = False
+        # text/cursor/sel_anchor/focused are tracked properties (below) - every one of them
+        # feeds _arrange_children (the visible label text, the caret's x, the selection
+        # highlight), which only runs on a real arrange() pass, so a change to any of them
+        # needs to mark the UI dirty the same way Widget.visible/offset and Label.text already
+        # do (see UIManager.mark_dirty's own docstring) - without this, typing, moving the
+        # caret or selecting text only visibly caught up whenever some UNRELATED widget
+        # elsewhere happened to change and force a fresh layout. Bypassed here (plain
+        # assignment to the backing field) for the same reason as everywhere else this
+        # pattern's used: nothing to mark dirty about yet during construction.
+        self._text = text[:max_length]
+        self._cursor = len(self._text)
+        self._sel_anchor = self._cursor  # other end of the selection (== cursor: none)
+        self._focused = False
         self._blink_start = 0.0
         self._scroll = 0.0
         self._caret_x = 0.0
         self._sel_x = None  # (x0, x1) of the selection, relative to the text origin
         self.label = self.add(Label("", font_size=font_size, anchor=Anchor.MIDDLE_LEFT,
                                     offset=(self.PAD, 0), shadow=False))
+
+    def _mark_dirty(self):
+        if self.manager is not None:
+            self.manager.mark_dirty()
+
+    @property
+    def text(self):
+        return self._text
+
+    @text.setter
+    def text(self, value):
+        if value != self._text:
+            self._text = value
+            self._mark_dirty()
+
+    @property
+    def cursor(self):
+        return self._cursor
+
+    @cursor.setter
+    def cursor(self, value):
+        if value != self._cursor:
+            self._cursor = value
+            self._mark_dirty()
+
+    @property
+    def sel_anchor(self):
+        return self._sel_anchor
+
+    @sel_anchor.setter
+    def sel_anchor(self, value):
+        if value != self._sel_anchor:
+            self._sel_anchor = value
+            self._mark_dirty()
+
+    @property
+    def focused(self):
+        return self._focused
+
+    @focused.setter
+    def focused(self, value):
+        if value != self._focused:
+            self._focused = value
+            self._mark_dirty()
 
     # ---- text ---------------------------------------------------------
 

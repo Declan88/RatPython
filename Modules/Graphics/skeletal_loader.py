@@ -969,8 +969,12 @@ def _extract_material(ctx, gltf, blob, material_index, glb_dir):
         if raw_bytes is None:
             return None
 
-        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-        tex = ctx.texture(img.size, 3, img.tobytes())
+        img = Image.open(io.BytesIO(raw_bytes))
+        # Keep the alpha channel when the image has one - MASK/BLEND materials
+        # (a gun's glass) read their transparency from it.
+        has_alpha = img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
+        img = img.convert("RGBA" if has_alpha else "RGB")
+        tex = ctx.texture(img.size, 4 if has_alpha else 3, img.tobytes())
         tex.build_mipmaps()
         # Set once here, not per-frame in pbr_shader.py's
         # _bind_material_textures (see that function's own comment on
@@ -1222,7 +1226,7 @@ def load_hat(hat_source, name, ctx):
     return data
 
 
-def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
+def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=None):
     """Returns a dict:
         {
             "positions": (N, 3) float32,
@@ -1255,7 +1259,12 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
     viewmodel export holding an arms rig AND a gun rig, say). Only the mesh
     nodes bound to THAT skin are loaded, so another rig's meshes never get
     merged in against the wrong joints. Ignored for the usual single-skin
-    file."""
+    file.
+
+    node_names: if given, only mesh nodes with these names load. One
+    skinned object only keeps ONE material (the first primitive's), so a
+    model with several materials (body/cheese/glass) is loaded as one
+    object per node, each with its own material and alphaMode."""
     result = _read_glb_json_and_blob(path)
     if result is None:
         return None
@@ -1289,6 +1298,8 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
         if len(skins) > 1 and node.get("skin") != skin_index:
             continue
         node_name = node.get("name", f"mesh_{mesh_index}")
+        if node_names is not None and node_name not in node_names:
+            continue
         if _is_hidden_by_default(node_name):
             hidden_node_names.append(node_name)
             if node_name.lower().startswith(_HAT_PREFIX):
@@ -1419,6 +1430,13 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
         ctx, gltf, blob, material_index, Path(path).parent
     )
 
+    alpha_mode = "OPAQUE"
+    material_name = None
+    if material_index is not None:
+        material = gltf["materials"][material_index]
+        alpha_mode = material.get("alphaMode", "OPAQUE")
+        material_name = material.get("name")
+
     return {
         "positions": positions,
         "normals": normals,
@@ -1427,6 +1445,8 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0):
         "joints_0": joints_0,
         "weights_0": weights_0,
         "skeleton": skeleton,
+        "alpha_mode": alpha_mode,
+        "material_name": material_name,
         "base_color": base_color,
         "metallic": metallic,
         "roughness": roughness,

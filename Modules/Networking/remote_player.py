@@ -15,6 +15,7 @@ snapshots that straddle that moment. That costs a fixed ~100ms of visual
 latency in exchange for smooth movement instead of a step per packet.
 """
 
+import random
 import time
 
 import glm
@@ -22,7 +23,8 @@ import glm
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.Player.player_model import PlayerModel
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH, decode_color
-from Modules.Weapons import USP
+from Modules.Weapons import create_weapon
+from Modules.Weapons.damage_classes import DISSOLVE, get_damage_class
 
 # How far behind real time remote players are drawn - see module docstring.
 # Comfortably more than one packet interval (1/30s) so there are almost
@@ -104,6 +106,38 @@ _HEAD_CENTER = (0.0, 1.42, 0.09)
 
 
 class RemotePlayer:
+    # How long a dissolve (Modules/Weapons/damage_classes.py's own Zap) takes to fully clear
+    # the body, seconds - see _set_dead/update's own draining of self._dissolving.
+    DISSOLVE_SECONDS = 1.2
+    # Ambient dust (spark/glow) fires on this fixed interval - Source's own equivalent
+    # (C_EntityDissolve::DrawModel) actually runs every single rendered frame, rolling per
+    # hitbox (roughly a dozen on a human ragdoll) whether to spawn one - a fixed, fairly quick
+    # interval from a single point is this engine's simpler stand-in for that same "constant
+    # fine crackle" density without per-hitbox machinery.
+    DISSOLVE_SPARK_INTERVAL = 0.025
+    # Fired from this many different random points on the body each interval (same "several
+    # points at once, not one" reasoning DISSOLVE_ARC_BURST_COUNT below already uses) - a
+    # single point every 0.025s reads as sparse, isolated pinpricks; several at once, that
+    # often, is what actually reads as a dense drip of motes coming off the whole body.
+    DISSOLVE_SPARK_BURST_COUNT = 4
+    # The tesla-arc bursts (DISSOLVE_ARC_BURST_COUNT lgtning streaks at once, see update()'s
+    # own _dissolve_arc_interval) are the actual "electricity jumping off them" read (see
+    # dissolve_sparks.py's own docstring) - Source's own DoSparks fires 3 beams per call, on an
+    # interval that itself SPEEDS UP over the effect's life: SimpleSplineRemapVal(dt, 0,
+    # m_flFadeOutStart, 2*TICK_INTERVAL, 0.4) - slow (~0.4s) right after the effect starts,
+    # ramping down to rapid (~0.03s) as it approaches the point the model finishes fading. The
+    # two ends of that same ramp, reused below.
+    DISSOLVE_ARC_INTERVAL_START = 0.4
+    DISSOLVE_ARC_INTERVAL_END = 0.03
+    DISSOLVE_ARC_BURST_COUNT = 3
+    # How fast the body drifts upward while dissolving, m/s - stands in for Source's own
+    # C_EntityDissolve::Simulate, which attaches a zero-gravity IPhysicsMotionController to a
+    # dissolving ragdoll (linear.z -= -1.02 * GetCurrentGravity() cancels gravity outright),
+    # so any residual death velocity just carries the body slowly upward instead of settling -
+    # the familiar "corpse gently rises and drifts" look. This project's remote bodies aren't
+    # real physics ragdolls, so a fixed gentle rise is a simpler stand-in for the same read.
+    DISSOLVE_RISE_SPEED = 0.4
+
     def __init__(self, scene, steam_id, model_path=_DEFAULT_MODEL_PATH,
                  animation_states=_DEFAULT_ANIMATION_STATES,
                  forward_offset_degrees=0.0, scale=None,
@@ -141,12 +175,15 @@ class RemotePlayer:
                     self.model.obj, path, rename=rename, time_scale=time_scale,
                 )
 
-        # Every player carries the USP for now (the packets don't say which
-        # weapon yet). The world model goes in the hand; the arm pose only
-        # applies to a model with an upper-body split, which this one doesn't
-        # have - see WeaponsBase.equip_player.
-        self.weapon = USP()
-        self.weapon.equip_player(scene, self.model)
+        # The weapon in their hand is whichever their packets name (see _apply_weapon);
+        # each one they've shown is kept (loaded once) so switching back is instant.
+        # The world model goes in the hand; the arm pose only applies to a model with
+        # an upper-body split, which this one doesn't have - see WeaponsBase.equip_player.
+        self._weapons = {}
+        self._weapon_wanted = None   # weapon id from the latest packet
+        self._weapon_id = None       # id of the weapon in their hand now
+        self.weapon = None
+        self._apply_weapon(self.DEFAULT_WEAPON)
 
         self._hitbox = scene.physics.add_hitbox(hitbox_half_extents, owner=steam_id)
         # Same owner, own group: see CollisionGroup.HEAD and WeaponsBase.fire.
@@ -165,6 +202,11 @@ class RemotePlayer:
         self._pending_shots = 0
         self._pending_tracers = []  # end points of shots to draw a tracer for
         self.on_tracer = None       # callback(start, end), set by NetworkManager
+        self._footstep_seen = None   # last footstep counter value seen
+        self._pending_footsteps = 0
+        self._footstep_material = None
+        self._footstep_volume = 1.0
+        self.on_footstep = None     # callback(material, position, volume), set by NetworkManager
         self._voice_position = glm.vec3(0.0)  # where this player's shots sound from
         self._color_wanted = None  # fur color from the latest packet (None = the rat's own)
         self._color_applied = None
@@ -176,13 +218,20 @@ class RemotePlayer:
         self._model_debt = 0.0
         self._model_never_run = True
         self._hitbox_key = None
-        self.on_death = None        # callback(feet_position, velocity, fur colour), set by NetworkManager
+        self.on_death = None        # callback(feet_position, velocity, fur colour, damage_class), set by NetworkManager
         self._death_seen = None
         self._kill_seen = None
         self.kills = 0    # kills this player has been credited for (see NetworkManager.local_kills)
         self.deaths = 0   # times this player has died
         self._pending_death = False
         self._alive_wanted = True
+        self._dissolving = False    # currently animating a Zap death's dissolve - see _set_dead/update
+        self._dissolve_t = 0.0
+        self._dissolve_spark_t = 0.0
+        self._dissolve_arc_t = 0.0
+        self._dissolve_rise = 0.0   # accumulated upward drift so far - see update()'s own DISSOLVE_RISE_SPEED
+        self.on_dissolve_spark = None   # callback(position), set by NetworkManager - see update()
+        self.on_dissolve_arc = None     # callback(position), set by NetworkManager - see update()
 
     def receive_state(self, state):
         """state: the decoded packet dict from NetworkManager._broadcast_
@@ -203,6 +252,7 @@ class RemotePlayer:
             self._pending_jump = True
         self._jump_seen = jumps
         self._hat_wanted = state.get("h") or None
+        self._weapon_wanted = state.get("wp") or self._weapon_wanted
         self._color_wanted = decode_color(state.get("k"))
         # Shots travel as a counter like jumps: any increase is that many shots
         # (capped so a long stall can't replay a burst of gunfire at once).
@@ -217,6 +267,14 @@ class RemotePlayer:
                 self._pending_tracers.extend(ends[-fresh:])
                 del self._pending_tracers[:-3]
         self._shot_seen = shots
+        # Footsteps travel as a counter like jumps/shots (see NetworkManager.notify_footstep's
+        # own docstring on why) - just the newest one's (material, volume), no history needed.
+        footsteps = int(state.get("fs", 0))
+        if self._footstep_seen is not None and footsteps > self._footstep_seen:
+            self._pending_footsteps = min(self._pending_footsteps + footsteps - self._footstep_seen, 3)
+            self._footstep_material = state.get("fm") or None
+            self._footstep_volume = float(state.get("fv", 1.0))
+        self._footstep_seen = footsteps
         deaths = int(state.get("x", 0))
         if self._death_seen is not None and deaths > self._death_seen:
             self._pending_death = True
@@ -228,6 +286,11 @@ class RemotePlayer:
         self._alive_wanted = bool(state.get("a", 1))
         if state.get("n"):
             self.name = str(state["n"])[:32]
+
+    @property
+    def body_center(self):
+        """Roughly the middle of the body, in world space."""
+        return glm.vec3(self._voice_position)
 
     def _sample(self, render_time):
         """(feet_pos, yaw) at render_time, interpolated between the two
@@ -274,16 +337,83 @@ class RemotePlayer:
             self.model.move_to(feet_pos)
         if self._pending_death:
             self._pending_death = False
-            self._set_dead(True)
+            damage_class = str(s.get("dc", "bullet"))   # what killed them - see NetworkManager.notify_death
+            self._set_dead(True, damage_class)
             if self.on_death is not None:
                 move = s.get("d", (0.0, 0.0))
                 speed = float(s.get("v", 0.0))
-                self.on_death(feet_pos, glm.vec3(move[0] * speed, 0.0, move[1] * speed), self._color_wanted)
+                velocity = glm.vec3(move[0] * speed, 0.0, move[1] * speed)
+                push = s.get("b")   # an explosion's shove, sent with the death (see NetworkManager.notify_death)
+                if push is not None and len(push) == 3:
+                    # gibs.spawn carries 0.6 of a body's velocity, so scale up to give the push its full strength.
+                    velocity += glm.vec3(*push) / 0.6
+                self.on_death(feet_pos, velocity, self._color_wanted, damage_class)
         elif self.dead and self._alive_wanted:
             self._set_dead(False)
+        if self._dissolving:
+            self._dissolve_t += dt
+            obj = self.model.obj
+            if obj is not None:
+                if self._dissolve_t >= self.DISSOLVE_SECONDS:
+                    self._dissolving = False
+                    obj["dissolve_amount"] = 0.0
+                    obj["visible_in_color"] = False
+                    obj["cast_shadow"] = False
+                else:
+                    obj["dissolve_amount"] = self._dissolve_t / self.DISSOLVE_SECONDS
+                    # Gentle upward drift (see DISSOLVE_RISE_SPEED's own docstring on why) -
+                    # obj["position"] was just re-pinned to the network feet position above
+                    # (model.update/move_to), so the accumulated rise has to be re-added every
+                    # frame rather than nudged once, or it'd be overwritten right back to 0.
+                    self._dissolve_rise += self.DISSOLVE_RISE_SPEED * dt
+                    obj["position"] = glm.vec3(
+                        obj["position"].x, obj["position"].y + self._dissolve_rise, obj["position"].z)
+                    # Ambient dust crackling around the body (Source's own C_EntityDissolve::
+                    # DrawModel spawns these every frame it's active, scattered across the
+                    # character's hitboxes - see dissolve_sparks.py's own docstring) - the
+                    # shader itself only ever tints/discards (see skeletal_shader.py's own
+                    # dissolve comment), all the crackle is this callback's doing.
+                    pos = obj["position"]
+                    def _random_body_point():
+                        return glm.vec3(
+                            pos.x + random.uniform(-0.3, 0.3),
+                            pos.y + random.uniform(0.1, _BODY_HEIGHT - 0.1),
+                            pos.z + random.uniform(-0.3, 0.3),
+                        )
+                    self._dissolve_spark_t -= dt
+                    if self._dissolve_spark_t <= 0.0 and self.on_dissolve_spark is not None:
+                        self._dissolve_spark_t = self.DISSOLVE_SPARK_INTERVAL
+                        for _ in range(self.DISSOLVE_SPARK_BURST_COUNT):
+                            self.on_dissolve_spark(_random_body_point())
+                    # The tesla-arc bursts - the actual "electricity" read (see
+                    # DISSOLVE_ARC_INTERVAL_START's own docstring on the interval ramp this
+                    # mirrors) - DISSOLVE_ARC_BURST_COUNT arcs fired from DIFFERENT points at
+                    # once each time, same as Source's own 3-beams-per-DoSparks-call, instead
+                    # of one arc from a single point - a single point at a time reads as one
+                    # faint crackle instead of the body being wreathed in electricity.
+                    self._dissolve_arc_t -= dt
+                    if self._dissolve_arc_t <= 0.0 and self.on_dissolve_arc is not None:
+                        progress = self._dissolve_t / self.DISSOLVE_SECONDS
+                        # SimpleSplineRemapVal's own smoothstep shape (3t^2 - 2t^3), not a
+                        # straight lerp - matches how gently Source's own ramp starts and ends.
+                        eased = progress * progress * (3.0 - 2.0 * progress)
+                        self._dissolve_arc_t = (
+                            self.DISSOLVE_ARC_INTERVAL_START
+                            + (self.DISSOLVE_ARC_INTERVAL_END - self.DISSOLVE_ARC_INTERVAL_START) * eased)
+                        for _ in range(self.DISSOLVE_ARC_BURST_COUNT):
+                            self.on_dissolve_arc(_random_body_point())
         if self.dead:
             self._pending_shots = 0
             self._pending_tracers.clear()
+            self._pending_footsteps = 0
+        while self._pending_footsteps > 0:
+            self._pending_footsteps -= 1
+            if self.on_footstep is not None:
+                # Feet-level (see PlayerModel.update's own position contract), not
+                # _voice_position (roughly chest height, used for gunfire/tracers) -
+                # a footstep should sound like it's coming from the ground.
+                feet = self.model.obj["position"] if self.model.obj is not None else self._voice_position
+                self.on_footstep(self._footstep_material, glm.vec3(feet), self._footstep_volume)
         while self._pending_shots > 0:
             self._pending_shots -= 1
             # From about chest height at where they're standing now.
@@ -300,8 +430,11 @@ class RemotePlayer:
                     if muzzle is None:
                         muzzle = self._voice_position + glm.normalize(aim) * 0.6
                     # (the flash stays on the gun's muzzle as it moves)
-                    self.on_tracer(muzzle, end, lambda: self.weapon.muzzle_position(self.scene))
+                    self.on_tracer(muzzle, end, lambda: self.weapon.muzzle_position(self.scene),
+                                   self.weapon)
         self._pending_tracers.clear()
+        if self._weapon_wanted is not None and self._weapon_wanted != self._weapon_id:
+            self._apply_weapon(self._weapon_wanted)
         if self._hat_wanted != self._hat_applied:
             self._hat_applied = self._hat_wanted   # even if unknown - don't retry every frame
             self.model.set_hat(self._hat_wanted)
@@ -335,13 +468,61 @@ class RemotePlayer:
         center = feet_pos + glm.vec3(0.0, _HEAD_CENTER[1], 0.0) + forward * _HEAD_CENTER[2]
         self.scene.physics.update_hitbox(self._head_hitbox, center, glm.vec3(0.0, turn, 0.0))
 
-    def _set_dead(self, dead):
-        """Hides (or shows again) their body and the gun in their hand."""
+    DEFAULT_WEAPON = "usp"      # until their packets say otherwise
+
+    def _apply_weapon(self, weapon_id):
+        """Puts the weapon with that id in their hand (loading it the first time it's
+        shown), putting the previous one away. An unknown id is ignored."""
+        weapon = self._weapons.get(weapon_id)
+        if weapon is None:
+            weapon = create_weapon(weapon_id)
+            if weapon is None:
+                self._weapon_wanted = self._weapon_id if self.weapon is not None else None
+                return
+            self._weapons[weapon_id] = weapon
+        if self.weapon is not None:
+            self.weapon.deactivate()
+        self.weapon = weapon
+        self._weapon_id = weapon_id
+        weapon.equip_player(self.scene, self.model)
+        # A dead player's new weapon stays hidden too - just the weapon, NOT the full
+        # _set_dead (which would also touch the body/dissolve state - wrong here: this isn't
+        # a death transition, it's an already-dead player's weapon simply changing, and
+        # calling the full thing would incorrectly interrupt an in-progress dissolve).
+        dead = getattr(self, "dead", False)
+        for obj in weapon.worldmodel_objs:
+            obj["visible_in_color"] = not dead
+            obj["cast_shadow"] = not dead
+
+    def _set_dead(self, dead, damage_class="bullet"):
+        """Hides (or shows again) their gun, always instantly - and their BODY too, unless
+        this death's damage_class dissolves instead of gibbing (see Modules/Weapons/
+        damage_classes.py's own death_effect): a dissolve needs the body to stay visible and
+        animate for DISSOLVE_SECONDS first (see update()'s own draining of self._dissolving),
+        so hiding it here immediately would just make it vanish outright instead."""
         self.dead = dead
-        for obj in (self.model.obj, getattr(self.weapon, "worldmodel_obj", None)):
+        for obj in getattr(self.weapon, "worldmodel_objs", ()):
             if obj is not None:
                 obj["visible_in_color"] = not dead
                 obj["cast_shadow"] = not dead
+        obj = self.model.obj
+        if obj is None:
+            return
+        dc = get_damage_class(damage_class) if dead else None
+        if dead and dc.death_effect == DISSOLVE:
+            self._dissolving = True
+            self._dissolve_t = 0.0
+            self._dissolve_spark_t = 0.0
+            self._dissolve_arc_t = 0.0
+            self._dissolve_rise = 0.0
+            obj["dissolve_color"] = dc.dissolve_color
+            # visible_in_color/cast_shadow left exactly as they were (alive) - update() ramps
+            # dissolve_amount up over DISSOLVE_SECONDS, THEN hides the body, once it's fully gone.
+        else:
+            self._dissolving = False
+            obj["dissolve_amount"] = 0.0
+            obj["visible_in_color"] = not dead
+            obj["cast_shadow"] = not dead
 
     def destroy(self):
         """Not called anywhere yet - network_manager.py has no lobby-
@@ -349,7 +530,8 @@ class RemotePlayer:
         feature doesn't add to), so a disconnected peer's model/hitbox
         currently just stays put. Exposed now so wiring that up later is
         a one-line call, not another rewrite."""
-        self.weapon.unequip()
+        for weapon in self._weapons.values():
+            weapon.unequip()
         self.model.destroy()
         if self._hitbox is not None:
             self.scene.physics.remove_hitbox(self._hitbox)

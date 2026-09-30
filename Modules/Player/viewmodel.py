@@ -18,18 +18,11 @@ re-loading a weapon's whole viewmodel every time the player switches back to
 it).
 """
 
-import os
-import time
-
 import glm
 
+from Modules.Graphics import pose_batch
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 from Modules.Weapons.weapons_base import _load_state_clip
-
-
-def _debug_active():  # TEMP DEBUG (RATWAR_AUTOTEST)
-    until = os.environ.get("RATWAR_DEBUG_UNTIL")
-    return until is not None and time.perf_counter() < float(until)
 
 
 # The rigs are authored around a reference camera at the model origin (0, 0, 0)
@@ -38,6 +31,15 @@ def _debug_active():  # TEMP DEBUG (RATWAR_AUTOTEST)
 # camera-space nudge (metres; +Y up) for tuning only.
 _OFFSET = glm.vec3(0.0, 0.0, 0.0)
 _SCALE = 1.0
+
+
+def _unique_parts(parts):
+    """A weapon's arms and gun objects without repeats (arms and gun can be the same object)."""
+    seen = []
+    for obj in [parts["arms"]] + parts["gun_parts"]:
+        if obj is not None and not any(obj is other for other in seen):
+            seen.append(obj)
+    return seen
 
 
 class ViewModel:
@@ -58,7 +60,8 @@ class ViewModel:
         self._one_shot = None     # part whose one-shot animation is playing
         self._one_shot_state = None  # which STATE that is (see is_one_shot_active)
         self.arms = None          # always the ACTIVE weapon's parts - None if none is active
-        self.gun = None
+        self.gun = None           # the gun's first (main) part - see gun_parts
+        self.gun_parts = []       # every gun object (one per material for a multi-material gun)
 
     def set_weapon(self, weapon):
         """Shows `weapon`, priming it first (loading its arms/gun and
@@ -76,9 +79,7 @@ class ViewModel:
             self._prime(weapon)
         self._weapon = weapon
         parts = self._primed[weapon]
-        self.arms, self.gun = parts["arms"], parts["gun"]
-        if _debug_active():
-            print(f"[VM DEBUG] set_weapon({weapon.name}) arms={id(self.arms)} gun={id(self.gun)} same_obj={self.arms is self.gun}")
+        self.arms, self.gun, self.gun_parts = parts["arms"], parts["gun"], parts["gun_parts"]
         self._set_visible(weapon, True)
         # Just "idle" here - WeaponsBase.set_active (called right after this
         # by equip_player, same weapon switch) is what actually triggers
@@ -113,8 +114,29 @@ class ViewModel:
             # per-STATE, not per-part, so the second _load_state_clip call
             # below no-ops - see its own "already merged" early-return).
             gun = arms
+            gun_parts = [gun]
+        elif weapon.viewmodel_gun_nodes:
+            # One skinned object keeps only ONE material, so a gun with
+            # several (body/cheese/glass) loads as one object per mesh node.
+            gun_parts = []
+            for node in weapon.viewmodel_gun_nodes:
+                node_modes = weapon.viewmodel_node_alpha_mode_overrides
+                ignore = node in node_modes     # this node opts out of the by-material overrides
+                obj = self._scene.add_viewmodel(
+                    gun_path, skin_index=weapon.viewmodel_gun_skin, node_names=(node,),
+                    alpha_mode_overrides=None if ignore else weapon.viewmodel_alpha_mode_overrides,
+                    roughness_overrides=weapon.viewmodel_roughness_overrides)
+                if obj is not None:
+                    if node_modes.get(node):
+                        obj["alpha_mode"] = node_modes[node]
+                    gun_parts.append(obj)
+            gun = gun_parts[0] if gun_parts else None
         else:
-            gun = self._scene.add_viewmodel(gun_path, skin_index=weapon.viewmodel_gun_skin)
+            gun = self._scene.add_viewmodel(
+                gun_path, skin_index=weapon.viewmodel_gun_skin,
+                alpha_mode_overrides=weapon.viewmodel_alpha_mode_overrides,
+                roughness_overrides=weapon.viewmodel_roughness_overrides)
+            gun_parts = [gun]
         if arms is not None:
             self._scene.set_skeletal_tint(arms, self._tint)
         clips = {}
@@ -134,22 +156,36 @@ class ViewModel:
             # so the animation actually plays faster, not just gameplay
             # unlocking early while the full-length clip keeps going.
             time_scale = (1.0 / weapon.draw_speed) if state == "draw" else 1.0
-            for part, obj in (("arms", arms), ("gun", gun)):
+            for part, obj in [("arms", arms)] + [("gun", g) for g in gun_parts]:
                 clip = _load_state_clip(
                     self._scene, obj, clip_path, f"{weapon.player_clip(state)}_viewmodel",
                     skin_index=skin_index, time_scale=time_scale)
                 if clip is not None:
                     clips[(part, state)] = clip
-        self._primed[weapon] = {"arms": arms, "gun": gun, "clips": clips}
-        for obj in (arms, gun):
+        self._primed[weapon] = {"arms": arms, "gun": gun, "gun_parts": gun_parts, "clips": clips}
+        for obj in [arms] + gun_parts:
             if obj is not None:
                 obj["viewmodel_visible"] = False
+
+    def warm_animations(self):
+        """Bakes every primed weapon's clips for the fast pose path (see
+        pose_batch.baked_clip) now, so the first time each one plays - a draw,
+        a reload, the other slot's idle - it doesn't stall on the bake. Returns
+        how many clips were baked."""
+        baked = 0
+        for parts in self._primed.values():
+            names = {name for name in parts["clips"].values() if name}
+            for obj in _unique_parts(parts):
+                for name in names:
+                    if pose_batch.baked_clip(obj["skeleton"], name) is not None:
+                        baked += 1
+        return baked
 
     def _set_visible(self, weapon, visible):
         parts = self._primed.get(weapon)
         if parts is None:
             return
-        for obj in (parts["arms"], parts["gun"]):
+        for obj in [parts["arms"]] + parts["gun_parts"]:
             if obj is not None:
                 obj["viewmodel_visible"] = visible
 
@@ -159,11 +195,12 @@ class ViewModel:
         unequip). An ordinary weapon switch never calls this - see
         set_weapon's own docstring."""
         for parts in self._primed.values():
-            for obj in (parts["arms"], parts["gun"]):
+            for obj in _unique_parts(parts):
                 if obj is not None:
                     self._scene.remove_viewmodel(obj)
         self._primed.clear()
         self.arms = self.gun = None
+        self.gun_parts = []
         self._one_shot = None
         self._one_shot_state = None
         self._weapon = None
@@ -180,16 +217,10 @@ class ViewModel:
         one_shot = state in self._weapon.viewmodel_one_shot_states
         self._one_shot = None
         self._one_shot_state = None
-        if _debug_active():
-            print(f"[VM DEBUG] play({state!r}) weapon={self._weapon.name} one_shot={one_shot}")
-        for part, obj in (("arms", self.arms), ("gun", self.gun)):
+        for part, obj in [("arms", self.arms)] + [("gun", g) for g in self.gun_parts]:
             clip = clips.get((part, state))
             if obj is None or clip is None:
-                if _debug_active():
-                    print(f"  [VM DEBUG] part={part} SKIPPED (obj is None: {obj is None}, clip is None: {clip is None})")
                 continue
-            if _debug_active():
-                print(f"  [VM DEBUG] part={part} obj={id(obj)} clip={clip!r} prev_animation={obj['animation']!r} prev_anim_time={obj['anim_time']:.4f} anim_blend_duration={obj['anim_blend_duration']:.4f} anim_blend_elapsed={obj['anim_blend_elapsed']:.4f} pose_snap_is_none={obj.get('pose_snap') is None}")
             if one_shot:
                 self._scene.set_skeletal_animation(obj, clip, blend_duration=0.0, loop=False)
                 # set_skeletal_animation ignores a clip that's already
@@ -199,8 +230,6 @@ class ViewModel:
                 self._one_shot_state = state
             else:
                 self._scene.set_skeletal_animation(obj, clip)
-            if _debug_active():
-                print(f"  [VM DEBUG] part={part} AFTER: animation={obj['animation']!r} anim_time={obj['anim_time']:.4f} anim_blend_duration={obj['anim_blend_duration']:.4f} pose_snap_is_none={obj.get('pose_snap') is None}")
 
     def is_one_shot_active(self, state):
         """True while STATE's one-shot animation is the current one AND
@@ -211,6 +240,19 @@ class ViewModel:
         see their own docstrings for why (a fixed-timer version of this kept
         drifting out of sync with the real clip's actual length)."""
         return self._one_shot_state == state and not self._one_shot_finished()
+
+    @property
+    def one_shot_state(self):
+        """The one-shot state currently playing, or None."""
+        return self._one_shot_state
+
+    def one_shot_time(self, state):
+        """Seconds into STATE's one-shot animation (in the clip's own timeline,
+        i.e. after any time_scale baked in at load), or None if STATE isn't the
+        one-shot currently playing."""
+        if self._one_shot_state != state or self._one_shot is None:
+            return None
+        return self._one_shot["anim_time"]
 
     def _one_shot_finished(self):
         obj = self._one_shot
@@ -234,7 +276,10 @@ class ViewModel:
         False (third person, dead, menu...) hides the ACTIVE weapon (any
         other primed weapon is already hidden regardless - see
         _set_visible)."""
-        parts = [o for o in (self.arms, self.gun) if o is not None]
+        parts = []
+        for o in [self.arms] + self.gun_parts:
+            if o is not None and o not in parts:
+                parts.append(o)
         for obj in parts:
             obj["viewmodel_visible"] = bool(visible)
         if not visible or not parts:

@@ -81,6 +81,23 @@ class UIManager:
         self._mouse = None
         self.popup = None  # open Dropdown, if any (see controls.Dropdown)
         self.focus = None  # focused TextInput, if any
+        # layout() reuses last frame's arrange() output whenever nothing that could change it
+        # has - see mark_dirty's own docstring for exactly what "changed" means here. True
+        # until the first real layout() runs (nothing to reuse yet).
+        self._dirty = True
+        self._last_layout_key = None
+
+    def mark_dirty(self):
+        """Called by a tracked widget property (Widget.visible, Label.text, ...) when its
+        value actually changed, and by Widget.add/remove/clear_children (a structural change) -
+        makes the NEXT layout() call do a real arrange() instead of reusing every widget's
+        already-computed self.rect from last time. A widget mutated during arrange() itself
+        (TextInput repositioning its own label mid-layout, say) marking dirty here is harmless:
+        layout() clears the flag again right after that same arrange() call finishes, so it
+        only ever causes an extra layout on a LATER frame if the change came from outside one.
+        Not called for anything that doesn't feed measure()/arrange() (Label.color, an alpha
+        fade, ...) - see those setters' own comments for why they're left untracked."""
+        self._dirty = True
 
     # ---- resources --------------------------------------------------
 
@@ -102,8 +119,14 @@ class UIManager:
 
     def layout(self):
         w, h = self.window.width, self.window.height
+        key = (w, h)
+        if not self._dirty and key == self._last_layout_key:
+            return      # nothing that could move/resize a widget changed since last time -
+                         # every widget's self.rect from that pass is still exactly right
         self.scale = h / self.reference_height if self.scale_mode == "height" else 1.0
         self.root.arrange(0.0, 0.0, w / self.scale, h / self.scale)
+        self._dirty = False
+        self._last_layout_key = key
 
     def render(self):
         if not any(c.visible for c in self.root.children):

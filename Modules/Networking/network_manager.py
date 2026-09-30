@@ -62,9 +62,14 @@ class NetworkManager:
         self.current_lobby_id = None
         self._local_state = None
         self.local_hat = None   # short hat name from the main menu, or None
+        self.local_weapon = None   # id (Modules/Weapons/registry.py) of the weapon in our hands, sent so others draw it
         self.local_color = None  # (r, g, b) 0-1 fur color from the main menu, or None
         self._shot_count = 0    # shots the local player has fired (sent as a counter, like jumps)
+        self._footstep_count = 0   # local footsteps (a counter too, like shots/jumps)
+        self._last_footstep = ("", 1.0)   # (material, volume) of the latest one
         self._death_count = 0   # times the local player has died (a counter too)
+        self._death_push = None   # explosion shove for our death gibs (see notify_death)
+        self._death_damage_class = "bullet"   # see notify_death - what killed us last, by name
         self._kill_count = 0    # kills WE'VE been credited for - see notify_death/_send_kill_credit
         # Who last damaged us, and when (perf_counter seconds) - notify_death
         # credits a kill to whoever this points at, if they're still "recent"
@@ -77,9 +82,12 @@ class NetworkManager:
         self.local_alive = True
         self.profiler = None    # Modules/Debug FrameProfiler, when the game wants network timings
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
-        self.on_death = None    # callback(feet_position, velocity, fur colour) when another player dies (bursts into gibs)
-        self.on_tracer = None   # callback(start, end, follow) to draw another player's tracer and muzzle flash
-        self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name) when someone shoots us
+        self.on_death = None    # callback(feet_position, velocity, fur colour, damage_class) when another player dies (gibs, or dissolves for Zap)
+        self.on_tracer = None   # callback(start, end, follow, shooter_weapon) to draw another player's tracer, flash and impact
+        self.on_footstep = None  # callback(material, position, volume) to play another player's footstep
+        self.on_dissolve_spark = None  # callback(position) - a Zap-dissolving remote player's periodic spark/glow burst
+        self.on_dissolve_arc = None    # callback(position) - a Zap-dissolving remote player's periodic tesla-arc burst
+        self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name, headshot, push, damage_class) when someone shoots us
         # callback(killer_steam_id, victim_steam_id, weapon_name, headshot) for
         # EVERY kill in the match this client learns about (see
         # _broadcast_kill/_receive_killfeed) - not just our own, so a kill
@@ -110,6 +118,14 @@ class NetworkManager:
         self._pending_host = None
         self._pending_join = None
 
+        self._init_steam()
+
+    def _init_steam(self):
+        """(Re)connects to Steam - the constructor's own first attempt, and reconnect()'s retry
+        (see its own docstring) both go through this so the two can't drift apart. Leaves
+        self.client as None (available stays False) on any failure, exactly like the
+        constructor always has - callers check that, not this method's return value, except
+        reconnect() itself, which does want to know whether THIS attempt worked."""
         try:
             self.client = py_steam_net.PySteamClient()
             self.client.init(480)
@@ -123,9 +139,19 @@ class NetworkManager:
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
             self.client.set_connection_failed_callback(self.on_session_failed)
+            return True
         except Exception as e:
             print(f"Steam initialization failed: {e}. Make sure Steam client is running.")
             self.client = None
+            return False
+
+    def reconnect(self):
+        """Retries Steam initialization from scratch - for a "Reconnect" button in the menu
+        when the game started before Steam had (or Steam was closed and reopened since): the
+        constructor only ever gets ONE attempt, at launch, so without this there was no way
+        back into a Steam-having-players state short of restarting the whole game. Returns
+        whether THIS attempt succeeded (self.available reflects it either way)."""
+        return self._init_steam()
 
     @property
     def available(self):
@@ -432,22 +458,39 @@ class NetworkManager:
             self._recent_shot_ends.append([round(end_point.x, 1), round(end_point.y, 1), round(end_point.z, 1)])
             del self._recent_shot_ends[:-3]
 
+    def notify_footstep(self, material, volume):
+        """Call when the local player's own footstep sounds (see app.py's own
+        CharacterController.pop_footstep call) - sent as a counter, like jumps/shots, so a
+        lost packet can't drop one; the (material, volume) of the LATEST footstep travels
+        alongside it, since unlike a shot's end points a footstep has no further-back history
+        worth keeping (RemotePlayer.receive_state only ever needs to play the newest one)."""
+        self._footstep_count += 1
+        self._last_footstep = (material or "", round(float(volume), 2))
+
     # How long after their last hit on us a shot still counts as the killing
     # blow, seconds - long enough that a death from bleed-out/fall/a laggy
     # last packet still credits the right person, short enough that an old,
     # unrelated hit from minutes ago can't retroactively "steal" a kill.
     KILL_CREDIT_WINDOW = 8.0
 
-    def notify_death(self):
+    def notify_death(self, push=None, damage_class="bullet"):
         """Call when the local player dies (their state packets then carry it: the
         counter other players play the gibs from, and the alive flag they hide the body by).
         Also broadcasts the kill (who did it, with what, whether it was a
         headshot) to the WHOLE lobby - see _broadcast_kill - if whoever hit us
         most recently did so recently enough (see KILL_CREDIT_WINDOW). A
         self-inflicted or environmental death (no recent attacker) broadcasts
-        nothing - there's no kill to credit or show."""
+        nothing - there's no kill to credit or show.
+
+        damage_class: what killed us, by name (see Modules/Weapons/damage_classes.py's own
+        DamageClass.name) - decides gibs vs. a dissolve on every client watching us die.
+        Carried the same way push already is (see _death_push), read by RemotePlayer at the
+        exact moment it sees this death, not before or after."""
         self._death_count += 1
         self.local_alive = False
+        self._death_damage_class = str(damage_class or "bullet")
+        # Which way an explosion threw us, so everyone's copy of our gibs flies the same way.
+        self._death_push = [round(float(c), 2) for c in push] if push is not None else None
         attacker_id, attacker_time = self._last_attacker_id, self._last_attacker_time
         self._last_attacker_id = None
         if attacker_id is not None and time.perf_counter() - attacker_time <= self.KILL_CREDIT_WINDOW:
@@ -476,8 +519,9 @@ class NetworkManager:
 
     def notify_respawn(self):
         self.local_alive = True
+        self._death_push = None
 
-    def send_damage(self, victim_id, amount, weapon_name="", headshot=False):
+    def send_damage(self, victim_id, amount, weapon_name="", headshot=False, push=None, damage_class="bullet"):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
         a hit (against the victim's hitbox as the shooter sees it) and the
         victim applies it to their own health - see on_damage. RELIABLE, unlike
@@ -486,12 +530,21 @@ class NetworkManager:
         broadcast if this turns out to be the killing blow (see notify_death) -
         it has no effect on the damage itself (weapon.fire already folded any
         headshot multiplier into `amount` before this was even called).
+
+        damage_class: the WEAPON's own damage_class.name (see Modules/Weapons/
+        damage_classes.py) - sent explicitly rather than derived from weapon_name on the
+        receiving end, since that's a cosmetic display name ("Gouda Gun"), not a registry id
+        the weapon class could be looked back up from.
+
         Returns whether it was sent."""
         if victim_id == self.local_steam_id or not self.current_lobby_id:
             return False
+        payload_dict = {"dmg": round(float(amount), 2), "w": str(weapon_name), "hs": int(bool(headshot)),
+                        "dc": str(damage_class)}
+        if push is not None:
+            payload_dict["p"] = [round(float(c), 2) for c in push]   # an explosion's shove, for the victim's gibs
         payload = json.dumps(
-            {"dmg": round(float(amount), 2), "w": str(weapon_name), "hs": int(bool(headshot))},
-            separators=(",", ":"),
+            payload_dict, separators=(",", ":"),
         ).encode("utf-8")
         try:
             self.client.send_message_to(victim_id, self.HELLO_FLAGS, 0, payload)
@@ -510,8 +563,17 @@ class NetworkManager:
             self._last_attacker_time = time.perf_counter()
             self._last_attacker_weapon = str(message.get("w", ""))
             self._last_attacker_headshot = bool(message.get("hs", False))
+            push = message.get("p")
+            try:
+                push = [max(-50.0, min(50.0, float(c))) for c in push][:3] if push is not None else None
+            except (TypeError, ValueError):
+                push = None
+            if push is not None and len(push) != 3:
+                push = None
+            damage_class = str(message.get("dc", "bullet"))
             if self.on_damage is not None:
-                self.on_damage(amount, sender_id, self._last_attacker_weapon, self._last_attacker_headshot)
+                self.on_damage(amount, sender_id, self._last_attacker_weapon, self._last_attacker_headshot,
+                               push, damage_class)
 
     def _receive_killfeed(self, sender_id, message):
         """sender_id is the VICTIM (see _broadcast_kill's own docstring -
@@ -544,27 +606,32 @@ class NetworkManager:
         except Exception:
             pass
 
-    def send_admin_kill(self, victim_id):
-        """The /kill command's remote-target path (see Modules/Chat/
-        commands.py and app.py's own kill_player): tells victim_id an admin
+    def send_admin_kill(self, victim_id, damage_class="bullet"):
+        """The /kill (and /smite) command's remote-target path (see Modules/Chat/
+        commands.py and app.py's own kill_player/smite_player): tells victim_id an admin
         wants them dead. RELIABLE. The RECEIVING client is what actually
         decides to die (same self-authority principle send_damage's own
         docstring already documents) - and specifically only if the sender
         really is commands.ADMIN_STEAM_ID (see _receive_admin_kill), which
         every client can check for itself against that same hardcoded
-        constant, so a non-admin spoofing this message accomplishes nothing."""
+        constant, so a non-admin spoofing this message accomplishes nothing.
+
+        damage_class: whether to die smite-self's way (Zap - the lightning effect and a
+        dissolve instead of gibs, see app.py's own smite_self) or a plain kill (Bullet,
+        the default) - carried in the same message rather than a separate one, since it's
+        still exactly one "you should die right now, this way" request either way."""
         if victim_id == self.local_steam_id or not self.current_lobby_id:
             return False
-        payload = json.dumps({"ak": 1}, separators=(",", ":")).encode("utf-8")
+        payload = json.dumps({"ak": 1, "dc": str(damage_class)}, separators=(",", ":")).encode("utf-8")
         try:
             self.client.send_message_to(victim_id, self.HELLO_FLAGS, 0, payload)
             return True
         except Exception:
             return False
 
-    def _receive_admin_kill(self, sender_id):
+    def _receive_admin_kill(self, sender_id, damage_class="bullet"):
         if self.on_admin_kill is not None:
-            self.on_admin_kill(sender_id)
+            self.on_admin_kill(sender_id, damage_class)
 
     def _receive_chat(self, sender_id, message):
         text = str(message.get("m", ""))[:240]
@@ -617,14 +684,21 @@ class NetworkManager:
             "d": [round(move_direction.x, 2), round(move_direction.z, 2)],
             "j": self._jump_count,
             "h": self.local_hat or "",
+            "wp": self.local_weapon or "",
             "k": encode_color(self.local_color),
             "f": self._shot_count,
             "e": self._recent_shot_ends,
+            "fs": self._footstep_count,
+            "fm": self._last_footstep[0],
+            "fv": self._last_footstep[1],
             "x": self._death_count,
+            "dc": self._death_damage_class,
             "ki": self._kill_count,
             "a": int(self.local_alive),
             "n": self.local_name,
         }
+        if self._death_push is not None:
+            self._local_state["b"] = self._death_push
 
     HELLO_INTERVAL = 0.5
     HELLO_FLAGS = 8 | 32  # Reliable | AutoRestartBrokenSession
@@ -833,7 +907,7 @@ class NetworkManager:
                 self._receive_chat(sender_id, state)
                 return
             if "ak" in state:
-                self._receive_admin_kill(sender_id)
+                self._receive_admin_kill(sender_id, str(state.get("dc", "bullet")))
                 return
             if "p" not in state or "y" not in state:
                 return  # not this version's movement packet
@@ -845,6 +919,12 @@ class NetworkManager:
                     lambda *args: self.on_death(*args) if self.on_death else None)
                 self.remote_players[sender_id].on_tracer = (
                     lambda *args: self.on_tracer(*args) if self.on_tracer else None)
+                self.remote_players[sender_id].on_footstep = (
+                    lambda *args: self.on_footstep(*args) if self.on_footstep else None)
+                self.remote_players[sender_id].on_dissolve_spark = (
+                    lambda *args: self.on_dissolve_spark(*args) if self.on_dissolve_spark else None)
+                self.remote_players[sender_id].on_dissolve_arc = (
+                    lambda *args: self.on_dissolve_arc(*args) if self.on_dissolve_arc else None)
             self.remote_players[sender_id].receive_state(state)
         except Exception as e:
             print(f"Error parsing incoming packet from {sender_id}: {e}")

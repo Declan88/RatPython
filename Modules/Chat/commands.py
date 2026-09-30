@@ -107,6 +107,14 @@ def _cmd_adddummy(args, ctx):
     return ctx["add_dummy"]()
 
 
+@register("Adds a weapon to your inventory by id (tab-complete lists them).",
+          "<weapon>", arg_source="weapon_ids")
+def _cmd_give(args, ctx):
+    if not args:
+        return "Usage: /give <weapon> - " + ", ".join(ctx["weapon_ids"]())
+    return ctx["give_weapon"](args[0].lower())
+
+
 @register("Kills you, or a named connected player/the test dummy if given "
           "(tab-complete their name) - defaults to yourself.",
           "[player]", arg_source="kill_targets")
@@ -114,3 +122,12 @@ def _cmd_kill(args, ctx):
     if not args:
         return ctx["kill_self"]()
     return ctx["kill_player"](" ".join(args))
+
+
+@register("Same as /kill, but with a lightning strike (particle, explosion + thunder) on "
+          "whoever it hits - you, a named connected player, or the test dummy - defaults "
+          "to yourself.", "[player]", arg_source="kill_targets")
+def _cmd_smite(args, ctx):
+    if not args:
+        return ctx["smite_self"]()
+    return ctx["smite_player"](" ".join(args))

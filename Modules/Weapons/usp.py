@@ -7,6 +7,7 @@ from .weapons_base import WeaponsBase, FireMode, _POSE_DIR
 
 class USP(WeaponsBase):
     name = "USP"
+    weapon_id = "usp"
     animation_prefix = "pistol"
     icon = "Assets/Textures/Icons/Pistol/Pistol.png"
 
@@ -24,12 +25,21 @@ class USP(WeaponsBase):
     # duration to keep in sync with the asset by hand.
     magazine_size = 15
 
+    # Reload handling sounds, by frame of pistol_reload.glb (30 fps).
+    handling_sounds = {
+        "reload": {
+            20: "Assets/Audio/Guns/USP/usp_clipout.wav",
+            55: "Assets/Audio/Guns/USP/usp_clipin.wav",
+            87: "Assets/Audio/Guns/USP/usp_sliderelease.wav",
+        },
+    }
+
     # Draw: pistol_draw.glb's own gun-rig clip, sped up 1.5x - see
     # WeaponsBase.draw_speed's own docstring for how that bakes right into
     # the clip's timeline, so the animation itself visibly speeds up and
     # firing/reloading unblock exactly that much sooner, automatically (same
     # "bound to the real clip, not a guessed duration" reasoning as reload).
-    draw_speed = 1.5
+    draw_speed = 3
 
     # Accuracy: a semi-auto pistol. First shot from rest is tight; each shot
     # opens the cone by 0.75 degrees, and it closes again at 6 degrees a second

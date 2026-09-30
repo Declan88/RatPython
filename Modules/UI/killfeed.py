@@ -19,12 +19,17 @@ NAME_FONT_SIZE = 26
 MAX_ROWS = 5   # older rows past this are dropped immediately, not just faded
 PANEL_WIDTH = 460
 
-# weapon_name (WeaponsBase.name, e.g. "USP") -> icon file. Falls back to no
-# icon (just the names) for a weapon with none listed here.
-WEAPON_ICONS = {
-    "USP": "Assets/Textures/Icons/Pistol/Pistol.png",
-    "Gouda Gun": "Assets/Textures/Icons/Gouda/Gouda.png",
-}
+def weapon_icon(weapon_name):
+    """The icon file of the registered weapon called `weapon_name` (WeaponsBase.name, e.g.
+    "USP"), or None (just the names are shown) for an unknown weapon or one with no icon."""
+    from Modules.Weapons.registry import get_weapon_class, weapon_ids
+    for weapon_id in weapon_ids():
+        cls = get_weapon_class(weapon_id)
+        if cls.name == weapon_name:
+            return cls.icon
+    return None
+
+
 HEADSHOT_ICON = "Assets/Textures/Icons/Headshot/headshot.png"
 
 
@@ -98,8 +103,9 @@ class KillFeed(Panel):
             return lbl
 
         name_label(killer_name, killer_mine)
-        if weapon_name in WEAPON_ICONS:
-            row.add(Image(WEAPON_ICONS[weapon_name], size=(ICON_SIZE, ICON_SIZE)))
+        icon = weapon_icon(weapon_name)
+        if icon:
+            row.add(Image(icon, size=(ICON_SIZE, ICON_SIZE)))
         if headshot:
             row.add(Image(HEADSHOT_ICON, size=(ICON_SIZE, ICON_SIZE)))
         name_label(victim_name, victim_mine)

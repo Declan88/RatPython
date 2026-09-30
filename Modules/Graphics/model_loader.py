@@ -567,15 +567,20 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         # Computed AFTER the lightmap-UV remap above (not before) so it
         # always matches whatever the FINAL vertices/faces/uvs/normals
         # arrays actually are.
-        if _has_attribute(prog, "in_tangent"):
+        # Skipped for a material with no normal map (the shader only reads tangents when it
+        # has one): 16 of a vertex's 68 bytes, and a per-triangle numpy pass at load. A VAO
+        # without the attribute just leaves the constant default in place.
+        if _has_attribute(prog, "in_tangent") and normal_tex_obj is not None:
             attr_data["in_tangent"] = (_compute_tangents(vertices, normals, uvs, faces), "4f")
         vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items() if _has_attribute(prog, name)}
-        ibo = ctx.buffer(faces.tobytes())
+        # 16-bit indices whenever the mesh is small enough (most are): half the index bandwidth.
+        small = len(vertices) <= 65536
+        ibo = ctx.buffer(faces.astype("u2" if small else "u4").tobytes())
         buffers = list(vbos.values()) + [ibo]
 
         vao_content = [(vbos[name], attr_data[name][1], name) for name in vbos]
         if not vao_content: raise RuntimeError("No recognized vertex attributes.")
-        vao = ctx.vertex_array(prog, vao_content, ibo)
+        vao = ctx.vertex_array(prog, vao_content, ibo, index_element_size=2 if small else 4)
 
         return {
             "vao": vao, "vbo": vbos.get("in_position"), "normal_vbo": vbos.get("in_normal"),

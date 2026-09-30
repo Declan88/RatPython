@@ -43,6 +43,7 @@ Supported functions are listed in _EMITTERS/_INITIALIZERS/_OPERATORS below; any
 other function in a file is skipped (with one warning) rather than failing.
 """
 
+import json
 import os
 import re
 
@@ -52,7 +53,7 @@ import numpy as np
 import pygame
 
 from .pcf import read_pcf
-from .vtf_sheet import read_vtf_sheet
+from .vtf_sheet import Sheet, read_vtf_sheet
 
 # Source units -> metres, and Source (x, y, z-up) -> this engine (x, y-up, -z).
 UNIT_SCALE = 0.0254
@@ -159,6 +160,45 @@ def _rand(rng, low, high, count, exponent=1.0):
 # ---------------------------------------------------------------- effects
 
 
+def _basis(forward, up):
+    """The 3x3 frame (columns: forward, left, up) for a facing direction, as spawn() builds it."""
+    f = glm.normalize(glm.vec3(forward))
+    u = glm.vec3(up)
+    left = glm.cross(u, f)
+    if glm.length(left) < 1e-4:
+        left = glm.cross(glm.vec3(0.0, 0.0, 1.0), f)
+    left = glm.normalize(left)
+    u = glm.cross(f, left)
+    return np.array([[f.x, left.x, u.x], [f.y, left.y, u.y], [f.z, left.z, u.z]], "f4")
+
+
+def _spiral_coverage(length, start, end, camera_pos, particles_per_metre, max_particles):
+    """(t0, t1, n): spawn_beam_spiral should place n particles, evenly spaced (at exactly
+    `particles_per_metre` density - CONSTANT, never diluted) across the fractional beam range
+    [t0, t1], 0 = start, 1 = end. particles_per_metre/max_particles come from the caller's own
+    Modules/Weapons/tracer_spiral.TracerSpiral - see its own docstring for what they mean.
+
+    A beam short enough for its full length to fit the particle budget at that density gets
+    t0=0, t1=1 - the whole thing. A longer one does NOT get the same particle count stretched
+    thinner across its full length (that would silently drop density the longer a shot is,
+    exactly the bug this replaced) - instead the covered RANGE shrinks, anchored at whichever
+    end is nearer camera_pos (or `start`, if camera_pos isn't known - typically the muzzle,
+    the more usual thing to be looking near), so every particle that DOES exist is always at
+    the one true density, and a very long shot simply has its spiral end partway along the
+    beam (plain tracer, no spiral, beyond that) instead of a uniformly sparse mess."""
+    max_particles_length = max_particles / particles_per_metre
+    covered = min(length, max_particles_length)
+    n = int(min(max_particles, max(6, round(covered * particles_per_metre))))
+    if covered >= length:
+        return 0.0, 1.0, n
+    fraction = covered / length
+    near_is_start = True
+    if camera_pos is not None:
+        camera_pos = np.asarray((camera_pos[0], camera_pos[1], camera_pos[2]), dtype="f4")
+        near_is_start = np.dot(start - camera_pos, start - camera_pos) <= np.dot(end - camera_pos, end - camera_pos)
+    return (0.0, fraction, n) if near_is_start else (1.0 - fraction, 1.0, n)
+
+
 class Effect:
     """One running instance of a particle system definition (plus its
     delayed children). Made by ParticleManager.spawn."""
@@ -183,6 +223,9 @@ class Effect:
         # anchor's current velocity.
         self.options = options
         self.follow_particles = options.get("follow_particles", True)
+        # follow_frame=callable -> (forward, up): the effect also TURNS to that facing
+        # as it changes (a muzzle flash staying pointed along a gun that's being aimed).
+        self.follow_frame = options.get("follow_frame")
         self.inherit_velocity = float(options.get("inherit_velocity", 0.0))
         self.anchor_velocity = np.zeros(3, "f4")
         # anchors=callable -> (N, 3) positions of several things the effect emits from at once
@@ -298,6 +341,16 @@ class Effect:
             self.anchor_velocity = delta / dt
         if self.count and self.follow_particles:
             self.pos[:self.count] += delta
+        if self.follow_frame is not None:
+            forward, up = self.follow_frame()
+            new_basis = _basis(forward, up)
+            # Rotation taking the old frame to the new one, applied about the anchor.
+            rotation = new_basis @ self.basis.T
+            if self.count and self.follow_particles:
+                relative = self.pos[:self.count] - anchor
+                self.pos[:self.count] = anchor + relative @ rotation.T
+                self.vel[:self.count] = self.vel[:self.count] @ rotation.T
+            self.basis = new_basis
 
     def stop(self):
         """Stops emitting; particles already alive finish."""
@@ -887,6 +940,8 @@ class ParticleManager:
         self.frame_filter = frame_filter
         self.lifetime_scale = {_material_key(k): v for k, v in (lifetime_scale or {}).items()}
         self.rng = np.random.default_rng()
+        self.group_limits = {}     # {group name: most live effects it may have} - see spawn's group
+        self._group_serial = 0
         self.emitters = dict(_EMITTERS)
         self.initializers = dict(_INITIALIZERS)
         self.operators = dict(_OPERATORS)
@@ -894,6 +949,7 @@ class ParticleManager:
         self.effects = []
         self._materials = {}
         self._warned = set()
+        self._spiral_defs = {}    # (material, max_particles) -> ParticleSystemDef, see _spiral_definition
 
         self.program = ctx.program(vertex_shader=_VERT, fragment_shader=_FRAG)
         corners = np.array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1], dtype="f4")
@@ -925,9 +981,13 @@ class ParticleManager:
             self._warned.add(name)
             print(f"[Particles] '{name}' isn't supported yet - skipped")
 
-    def load(self, path):
-        """Reads a .pcf and registers its systems; returns their names."""
+    def load(self, path, only=None):
+        """Reads a .pcf and registers its systems; returns their names. only: a
+        list of system names to register - the rest of the file is left out
+        (a system's child systems come along with it either way)."""
         systems = read_pcf(path)
+        if only is not None:
+            systems = {name: d for name, d in systems.items() if name in only}
         self.definitions.update(systems)
         # Textures next to the file are searched first.
         folder = os.path.dirname(path)
@@ -1000,8 +1060,19 @@ class ParticleManager:
         texture = None
         if image is not None:
             # A .vtf's sheet table, else a grid from a .sheet file or the .vmt.
-            vtf = self._find_file(self._texture_names(name, vmt) + [os.path.splitext(image)[0]], (".vtf",))
+            names = self._texture_names(name, vmt) + [os.path.splitext(image)[0]]
+            vtf = self._find_file(names, (".vtf",))
             sheet = read_vtf_sheet(vtf) if vtf else None
+            if sheet is None:
+                # The same table extracted from the .vtf into a small JSON file, so the (large) .vtf
+                # itself needn't ship: [[[seconds, [left, top, right, bottom]], ...], ...] per sequence.
+                table = self._find_file(names, (".sheet.json",))
+                if table:
+                    try:
+                        with open(table) as f:
+                            sheet = Sheet([[(seconds, tuple(rect)) for seconds, rect in seq] for seq in json.load(f)])
+                    except (ValueError, OSError):
+                        print(f"[Particles] couldn't read {table}")
             if sheet is not None:
                 layout = _sheet_layout(sheet)
             else:
@@ -1070,7 +1141,7 @@ class ParticleManager:
     # ---- spawning ----
 
     def spawn(self, name, position, forward=(0.0, 0.0, -1.0), up=(0.0, 1.0, 0.0), overlay=False,
-              colors=None, size=1.0, follow=None, offset_scale=1.0, **options):
+              colors=None, size=1.0, follow=None, offset_scale=1.0, group=None, **options):
         """Starts effect `name` at `position` (world) with control point 0
         facing `forward`/`up`. Returns the Effect (call .stop() to end a
         continuous one), or None if the name isn't loaded. overlay: draw it over
@@ -1080,20 +1151,34 @@ class ParticleManager:
         follow: callable returning the world position it stays attached to
         (moving the live particles along); offset_scale: scales the file's
         Position Modify Offset (0 = particles start on the spawn point). Other
-        keyword options: follow_particles, inherit_velocity (see Effect)."""
+        keyword options: follow_particles, inherit_velocity, follow_frame (see Effect).
+        group: a name (say "impact") whose live effects are capped at
+        group_limits[group]; spawning past the cap removes the oldest one."""
         definition = self.definitions.get(name)
         if definition is None:
             return None
-        f = glm.normalize(glm.vec3(forward))
-        u = glm.vec3(up)
-        left = glm.cross(u, f)
-        if glm.length(left) < 1e-4:
-            left = glm.cross(glm.vec3(0.0, 0.0, 1.0), f)
-        left = glm.normalize(left)
-        u = glm.cross(f, left)
-        basis = np.array([[f.x, left.x, u.x], [f.y, left.y, u.y], [f.z, left.z, u.z]], "f4")
+        if group is not None:
+            options["group"] = self._join_group(group)
+        basis = _basis(forward, up)
         return self.spawn_definition(definition, (position[0], position[1], position[2]), basis, overlay=overlay, colors=colors,
                                      size=size, follow=follow, offset_scale=offset_scale, **options)
+
+    def _join_group(self, group):
+        """Registers a new effect in `group`, first removing the oldest ones (with their
+        child systems) while the group is at its cap. Returns the (group, id) tag the
+        effect and its children carry."""
+        self._group_serial += 1
+        limit = self.group_limits.get(group)
+        if limit:
+            tags = []
+            for effect in self.effects:
+                tag = effect.options.get("group")
+                if tag is not None and tag[0] == group and tag not in tags:
+                    tags.append(tag)
+            drop = set(tags[:max(0, len(tags) - limit + 1)])
+            if drop:
+                self.effects[:] = [e for e in self.effects if e.options.get("group") not in drop]
+        return (group, self._group_serial)
 
     def spawn_surface(self, name, position, normal, **kwargs):
         """Starts effect `name` on a surface: control point 0's up (Source's
@@ -1102,6 +1187,87 @@ class ParticleManager:
         n = glm.normalize(glm.vec3(normal))
         helper = glm.vec3(0.0, 1.0, 0.0) if abs(n.y) < 0.99 else glm.vec3(1.0, 0.0, 0.0)
         return self.spawn(name, position, forward=glm.cross(helper, n), up=n, **kwargs)
+
+    def _spiral_definition(self, material, max_particles):
+        """The synthetic (not loaded from a .pcf) system spawn_beam_spiral's burst uses - built
+        once per (material, max_particles) pair and cached (a weapon's own TracerSpiral, see
+        Modules/Weapons/tracer_spiral.py, can set either), since the actual particle POSITIONS
+        (the spiral shape itself, which no Source initializer can express - it needs the
+        beam's start and end, not a single origin point) are written directly by
+        spawn_beam_spiral instead of coming from an initializer/emitter here. Only the
+        fade-out is a real operator, reused as-is."""
+        key = (material, max_particles)
+        definition = self._spiral_defs.get(key)
+        if definition is None:
+            from .pcf import Function, ParticleSystemDef
+            definition = self._spiral_defs[key] = ParticleSystemDef(
+                name=f"_tracer_spiral[{material}, {max_particles}]",
+                params={"material": material, "max_particles": max_particles},
+                operators=[Function("Alpha Fade and Decay", {
+                    "start_alpha": 1.0, "end_alpha": 0.0,
+                    "start_fade_in_time": 0.0, "end_fade_in_time": 0.0,
+                    "start_fade_out_time": 0.1, "end_fade_out_time": 1.0,
+                })],
+            )
+        return definition
+
+    def spawn_beam_spiral(self, start, end, spiral, group=None, camera_pos=None):
+        """A one-shot burst of small star sprites winding around the straight line from
+        `start` to `end` (a Quake railgun's own look) - every particle's position is computed
+        directly as one vectorized numpy array (a helix parameterized by distance along the
+        beam), not through the usual per-tick emitter/initializer machinery: that vocabulary
+        has no notion of "the line from A to B", only a single origin point + facing, so
+        there's no Source initializer this shape could be expressed with anyway - reusing
+        Effect for the fade-out/rendering/batching it already does well, while writing the one
+        thing that's actually bespoke here (the shape) straight into its arrays in a single
+        call, is both the simplest and the fastest way to get it: O(1) Python-level work
+        regardless of the beam's length or particle count, same as this project's other
+        particle math (see _op_movement_basic's own docstring on why per-particle Python loops
+        are avoided here).
+
+        spiral: a Modules/Weapons/tracer_spiral.TracerSpiral - every tunable (colour,
+        material, tightness, density, radius, star size, lifetime) comes from IT, not from
+        this function - see its own docstring; normally reached via WeaponsBase.
+        spawn_tracer_spiral, not called directly. group: see spawn's own group cap - a burst
+        of shots shouldn't be able to pile up unlimited spiral effects any more than impacts
+        can. camera_pos: this frame's camera position, if the caller has it - a beam too long
+        for the particle budget to cover at full density (see _spiral_coverage) has its
+        spiral stop partway along the beam instead of covering the whole thing at a lower
+        density; that cutoff is anchored at whichever end is nearer camera_pos (falls back to
+        `start` - typically the muzzle - if this isn't given)."""
+        start = np.asarray((start[0], start[1], start[2]), dtype="f4")
+        end = np.asarray((end[0], end[1], end[2]), dtype="f4")
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length < 1e-4:
+            return None
+
+        t0, t1, n = _spiral_coverage(length, start, end, camera_pos,
+                                     spiral.particles_per_metre, spiral.max_particles)
+        basis = _basis(delta / length, (0.0, 1.0, 0.0))
+        right, up = -basis[:, 1], basis[:, 2]      # the two axes perpendicular to the beam
+
+        options = {"group": self._join_group(group)} if group is not None else {}
+        definition = self._spiral_definition(spiral.material, spiral.max_particles)
+        effect = self.spawn_definition(definition, tuple(start), np.eye(3, dtype="f4"), **options)
+        effect.stopped = True       # one-shot: every particle below is already "emitted"
+
+        t = np.linspace(t0, t1, n, dtype="f4")
+        angle = t * (length * spiral.turns_per_metre * 2.0 * np.pi)
+        ring = (np.cos(angle)[:, None] * right[None, :] + np.sin(angle)[:, None] * up[None, :]) * spiral.radius
+        effect.pos[:n] = start[None, :] + t[:, None] * delta[None, :] + ring
+        effect.radius[:n] = spiral.star_size
+        effect.radius0[:n] = spiral.star_size
+        effect.life[:n] = spiral.lifetime
+        effect.age[:n] = 0.0
+        effect.alpha[:n] = 1.0
+        effect.alpha0[:n] = 1.0
+        effect.rotation[:n] = self.rng.uniform(0.0, 360.0, n)
+        effect.rotation_speed[:n] = self.rng.uniform(-240.0, 240.0, n)
+        if spiral.color is not None:
+            effect.color[:n] = np.asarray(spiral.color, dtype="f4") / 255.0
+        effect.count = n
+        return effect
 
     def spawn_definition(self, definition, origin, basis, delay=0.0, overlay=False, colors=None,
                          size=1.0, follow=None, offset_scale=1.0, **options):
@@ -1185,7 +1351,7 @@ class ParticleManager:
         ctx.depth_func = "<"
         ctx.disable(moderngl.CULL_FACE)
         ctx.enable(moderngl.BLEND)
-        ctx.screen.depth_mask = False
+        ctx.fbo.depth_mask = False
         for material, overlay_batch, additive, vao, count in draws:
             program["u_near_fade"].value = 0.0 if overlay_batch else NEAR_FADE      # (the muzzle flash stays)
             if overlay_batch or not self.depth_test:
@@ -1199,7 +1365,7 @@ class ParticleManager:
             material.rects_texture.use(1)
             material.texture.use(0)
             vao.render(moderngl.TRIANGLES, vertices=6, instances=count)
-        ctx.screen.depth_mask = True
+        ctx.fbo.depth_mask = True
         ctx.disable(moderngl.BLEND)
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.enable(moderngl.CULL_FACE)

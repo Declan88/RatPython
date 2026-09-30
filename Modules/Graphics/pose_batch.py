@@ -23,6 +23,7 @@ give every joint translation, rotation and scale. Anything else (upper-body spli
 snapshot, a partial clip) returns None from make_request and the caller uses the reference path.
 """
 
+import hashlib
 import math
 
 import glm
@@ -44,9 +45,17 @@ class _Baked:
 
 
 def _fingerprint(clip, joint_count):
-    first = clip.channels[0] if clip.channels else None
-    probe = first.values[len(first.values) // 2] if first is not None and first.values else ()
-    return (clip.name, joint_count, len(clip.channels), round(clip.duration, 6), tuple(round(v, 5) for v in probe))
+    # Hashes every channel's actual keyframes (once per clip, cached on it): a cheaper key (name,
+    # joint count, one sample) let two DIFFERENT clips that share a name and rig size - e.g. USP's and
+    # the Gouda gun's "pistol_draw_viewmodel"/"pistol_idle_viewmodel" - collide, so one weapon got
+    # the other's baked poses (wrong joints -> exploded mesh).
+    fp = getattr(clip, "_pose_fp", None)
+    if fp is None:
+        digest = hashlib.md5()
+        for ch in clip.channels:
+            digest.update(repr((ch.joint_index, ch.path, ch.interpolation, ch.times, ch.values)).encode())
+        fp = clip._pose_fp = digest.hexdigest()
+    return (joint_count, round(clip.duration, 6), fp)
 
 
 def baked_clip(skeleton, name):
@@ -58,10 +67,6 @@ def baked_clip(skeleton, name):
     joint_count = len(skeleton.joints)
     key = _fingerprint(clip, joint_count)
     cached = _baked.get(key)
-    import os, time as _t
-    _until = os.environ.get("RATWAR_DEBUG_UNTIL")
-    if _until is not None and _t.perf_counter() < float(_until):
-        print(f"[BAKE DEBUG] skeleton={id(skeleton)} clip={name!r} joint_count={joint_count} key={key} cache_hit={cached is not None}")
     if cached is None:
         cached = _baked[key] = _bake(clip, joint_count) or False
     return cached or None

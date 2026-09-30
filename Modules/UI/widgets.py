@@ -56,15 +56,53 @@ class Widget:
                  size=(0, 0), size_frac=(0, 0), visible=True, name=None):
         self.anchor = tuple(anchor)
         self.pivot = tuple(pivot) if pivot is not None else self.anchor
-        self.offset = tuple(offset)
+        self.manager = None
+        self._offset = tuple(offset)   # see the offset property below - bypassed here, same
+        self._visible = visible        # reason as _offset/_visible everywhere else in this
+                                        # file: nothing to mark dirty about yet - this widget
+                                        # isn't in a tree, or drawn, until something add()s it
         self.size = tuple(size)
         self.size_frac = tuple(size_frac)
-        self.visible = visible
         self.name = name
         self.parent = None
         self.children = []
-        self.manager = None
         self.rect = (0.0, 0.0, 0.0, 0.0)  # logical px: x, y, w, h - set by arrange()
+
+    @property
+    def visible(self):
+        return self._visible
+
+    @visible.setter
+    def visible(self, value):
+        # A widget going from hidden to shown (or back) is exactly the case UIManager.layout's
+        # own cache can't see on its own: an invisible widget is skipped by _arrange_children
+        # below (never positioned), so its self.rect would otherwise still be whatever it was
+        # the last time it WAS visible - see UIManager.mark_dirty's own docstring.
+        if value != self._visible:
+            self._visible = value
+            if self.manager is not None:
+                self.manager.mark_dirty()
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @offset.setter
+    def offset(self, value):
+        # A widget repositioned by something OUTSIDE its own layout pass - a name tag
+        # following a moving player's screen position every frame is exactly this (see
+        # nametags.py's own update) - needs the same treatment as visible/text: without it,
+        # UIManager.layout's cache has no way to know the widget moved, so it keeps reusing
+        # the OLD self.rect from whenever something else last forced a real arrange() (draw()
+        # still runs every frame regardless of the cache, so this read as the tag visually
+        # sticking in place, only catching up whenever some unrelated widget's text/visibility
+        # happened to change). A widget that sets its OWN offset mid-arrange (TextInput's own
+        # label, scrolling) marking dirty here is harmless - see mark_dirty's own docstring.
+        value = tuple(value)
+        if value != self._offset:
+            self._offset = value
+            if self.manager is not None:
+                self.manager.mark_dirty()
 
     # ---- tree -------------------------------------------------------
 
@@ -72,6 +110,8 @@ class Widget:
         child.parent = self
         self.children.append(child)
         child._attach(self.manager)
+        if self.manager is not None:
+            self.manager.mark_dirty()
         return child
 
     def remove(self, child):
@@ -79,6 +119,8 @@ class Widget:
         child.parent = None
         child._release_resources()
         child._attach(None)
+        if self.manager is not None:
+            self.manager.mark_dirty()
 
     def clear_children(self):
         for c in list(self.children):
@@ -236,7 +278,8 @@ class Label(Widget):
     def __init__(self, text="", font_size=24, color=(255, 255, 255, 255),
                  align="left", shadow=True, font=None, **kw):
         super().__init__(**kw)
-        self.text = text
+        self._text = text          # see the text property below - bypassed here, same reason
+                                    # as Widget.visible's own __init__ assignment
         self.font_size = font_size
         self.color = color
         self.align = align
@@ -247,6 +290,25 @@ class Label(Widget):
         self._tex_size = (0, 0)
         self._measure_key = None
         self._measured = (0.0, 0.0)
+
+    @property
+    def text(self):
+        return self._text
+
+    @text.setter
+    def text(self, value):
+        # A label with size == (0, 0) sizes itself to fit the text (see measure() below), so a
+        # text change can change how big THIS widget is, and therefore how everything after it
+        # in its parent gets positioned - exactly what UIManager.layout's cache can't see on
+        # its own (measure()'s own (text, px, font) memoization below already makes RE-
+        # measuring the same text free; this is about not re-arranging at all when nothing's
+        # text changed anywhere in the tree, not about measuring cheaply once for an actual
+        # change - see UIManager.mark_dirty's own docstring for why a change made mid-arrange,
+        # e.g. TextInput's own label, is still safe to mark here).
+        if value != self._text:
+            self._text = value
+            if self.manager is not None:
+                self.manager.mark_dirty()
 
     def _font_px(self):
         return max(1, round(self.font_size * self.manager.scale))
