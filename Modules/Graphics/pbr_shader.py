@@ -147,6 +147,15 @@ TEX_UNIT_TINT_MASK = TEX_UNIT_STATIC_SHADOW + 1  # = 14 - player-color mask, see
 # point-light portion too.
 TEX_UNIT_SUN_LIGHTMAP = TEX_UNIT_STATIC_SHADOW + 1  # = 14
 
+# glTF emissiveTexture - a per-texel emission map, multiplied by
+# u_emissive_packed.xyz (the flat emissiveFactor) rather than replacing
+# it, per spec. Next free unit after TEX_UNIT_SUN_LIGHTMAP/TEX_UNIT_
+# TINT_MASK (14) - both of those are only ever bound in mutually
+# exclusive contexts (a static lightmapped object vs. a tinted
+# skeletal one), so this is the first unit that could actually collide
+# with something live in the same draw.
+TEX_UNIT_EMISSIVE = TEX_UNIT_SUN_LIGHTMAP + 1  # = 15
+
 # Uniform-buffer binding point for MaterialBlock (see bind_material's
 # own docstring for why this replaced 9 individual per-object uniform
 # writes) - distinct from skeletal_shader.py's BONE_UBO_BINDING (0) so
@@ -310,12 +319,30 @@ layout(std140) uniform MaterialBlock {
     // behavior before this control existed - the mesh's own authored
     // UV density, unmodified.
     float u_normal_uv_scale;
+    // glTF emissiveTexture gate - see u_emissive_texture/TEX_UNIT_
+    // EMISSIVE. Repurposes what used to be the first of 3 unused pad
+    // floats (ints and floats are both 4 bytes in std140, so this
+    // doesn't change the block's layout/size at all).
+    int u_has_emissive_texture;
+    // Source $selfillum equivalent: when set, the base color texture's
+    // OWN alpha channel (u_texture's .a - not u_base_alpha, and not
+    // emissiveTexture's) is reinterpreted as a self-illumination mask
+    // instead of transparency, and the surface's own full-bright albedo
+    // (not the flat emissiveFactor) is added as emissive wherever that
+    // mask is nonzero - see main()'s own self_illum block. Only
+    // meaningful on an OPAQUE material (see add_static's own self_
+    // illum_overrides docstring): the alpha channel is otherwise
+    // completely unused by an OPAQUE fragment (always outputs full
+    // alpha regardless - see this shader's own alpha_mode==0 handling),
+    // which is exactly what makes it safe to repurpose here, same as
+    // Source's own VTF alpha channel being free for $selfillum on a
+    // material with no other use for alpha.
+    int u_has_self_illum;
     // Unused - keeps this block's total size a multiple of 16 bytes
     // (std140 - see the ORIGINAL _pad_material's own comment for the
-    // full reasoning, now satisfied by these 3 floats instead since
-    // u_normal_uv_scale used up that original slot).
-    float _pad_material2a;
-    float _pad_material2b;
+    // full reasoning, now satisfied by this float plus u_has_emissive_
+    // texture/u_has_self_illum above instead since u_normal_uv_scale
+    // used up that original slot).
     float _pad_material2c;
     // Player-color tint (see Scene.set_skeletal_tint): u_tint_color is the
     // chosen sRGB color, u_has_tint gates the whole effect. The mask
@@ -329,6 +356,7 @@ uniform sampler2D u_texture;
 uniform sampler2D u_metallic_roughness_texture;
 uniform sampler2D u_normal_texture;
 uniform sampler2D u_tint_mask_texture;
+uniform sampler2D u_emissive_texture;
 
 // Dynamic/skeletal casters ONLY, tightly re-fit to the camera's own
 // view frustum every frame - see Scene._render_shadows' own comment on
@@ -1208,7 +1236,27 @@ void main() {
     // "renders fully rough" symptom this block fixes. Gated the same
     // way the lightmapped-specular branch above is (low roughness only)
     // so ordinary matte/semi-glossy materials are completely unaffected.
-    vec3 color = direct_light + point_light_sum + ambient + u_emissive_packed.xyz;
+    // glTF spec: emissiveFactor * emissiveTexture.rgb when a texture is
+    // present (texture modulates the flat factor rather than replacing
+    // it - a factor of (1,1,1), the default for a textured-emissive
+    // material, then just passes the texture through unchanged).
+    vec3 emissive = u_emissive_packed.xyz;
+    if (u_has_emissive_texture != 0) {
+        emissive *= texture(u_emissive_texture, v_uv).rgb;
+    }
+    // Source $selfillum: the base texture's own alpha (tex_sample.a,
+    // from way back near where albedo was computed - still in scope,
+    // same main()) masks in the surface's own full-bright albedo as
+    // emissive, on top of whatever flat/textured emissive this material
+    // already has. A hard 0/1 mask (the common case - most $selfillum
+    // textures paint a binary "glows or doesn't" alpha, same as a sign
+    // or screen in Source) reads as that region ignoring lighting
+    // entirely and just showing its own texture color; a soft mask
+    // blends partway, same as this would with any other additive term.
+    if (u_has_self_illum != 0) {
+        emissive += albedo * tex_sample.a;
+    }
+    vec3 color = direct_light + point_light_sum + ambient + emissive;
     if (rough < 0.15) {
         // Cheap Schlick Fresnel using the same dielectric/metal F0 this
         // shader's direct specular already uses (specular_color) - not
@@ -1336,6 +1384,7 @@ _MATERIAL_TEXTURE_UNITS = (
     ("metallic_roughness_texture", "u_metallic_roughness_texture", TEX_UNIT_METALLIC_ROUGHNESS),
     ("normal_texture", "u_normal_texture", TEX_UNIT_NORMAL),
     ("tint_mask_texture", "u_tint_mask_texture", TEX_UNIT_TINT_MASK),
+    ("emissive_texture", "u_emissive_texture", TEX_UNIT_EMISSIVE),
 )
 
 
@@ -1601,7 +1650,7 @@ def bind_frame_uniforms(
 
 _REFLECTION_MODE_TO_INT = {"cheap": 0, "ssr": 1}
 
-_MATERIAL_UBO_STRUCT = struct.Struct("<4f4f2i1i1f1i1f2f2f1f1i1f3f3f1i")  # must match MaterialBlock's std140 layout exactly
+_MATERIAL_UBO_STRUCT = struct.Struct("<4f4f2i1i1f1i1f2f2f1f1i1f2i1f3f1i")  # must match MaterialBlock's std140 layout exactly
 
 
 def _pack_material_ubo(item_data, tinted=True):
@@ -1629,7 +1678,9 @@ def _pack_material_ubo(item_data, tinted=True):
         float(item_data.get("normal_uv2_scale", 1.0)),
         _REFLECTION_MODE_TO_INT.get(item_data.get("reflection_mode", "cheap"), 0),
         float(item_data.get("normal_uv_scale", 1.0)),
-        0.0, 0.0, 0.0,  # _pad_material2a/b/c - unused, see MaterialBlock's own comment
+        int(item_data.get("has_emissive_texture", 0)),
+        int(item_data.get("self_illum", 0)),
+        0.0,  # _pad_material2c - unused, see MaterialBlock's own comment
         float(tint_rgb[0]), float(tint_rgb[1]), float(tint_rgb[2]),
         1 if tint is not None else 0,
     )

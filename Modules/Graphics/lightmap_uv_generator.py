@@ -83,8 +83,23 @@ def _build_charts(vertices, faces, angle_threshold_deg):
 
     Returns a list of int arrays, each the triangle indices belonging
     to one chart."""
-    face_normals, _ = _face_normals_and_areas(vertices, faces)
+    face_normals, areas = _face_normals_and_areas(vertices, faces)
     cos_threshold = np.cos(np.radians(angle_threshold_deg))
+    # Near-zero-area triangles (duplicate/collapsed vertices baked into the source mesh -
+    # confirmed as a real defect, not a hypothetical: mainmap.glb's own CurvedWay has 12 of
+    # these out of 60 faces) get a zero-vector "normal" from _face_normals_and_areas' own
+    # divide-by-zero guard - a zero vector's dot product with anything is 0, which fails the
+    # angle test against every possible neighbor. Left as-is, this doesn't just isolate the
+    # degenerate triangle into a wasted 1-face chart (harmless on its own, it has no visible
+    # area anyway) - it flows into _flatten_chart/_orthonormal_basis with no real normal to
+    # build a UV frame from, producing NaN for that WHOLE chart's UVs, which then poisons
+    # every OTHER chart's placement too via _pack_charts' shared atlas-extent computation.
+    # Confirmed exactly this: generate_lightmap_uvs on CurvedWay came back with NaN in 148 of
+    # 264 output UV values, not just the 12 bad triangles' own. Merging a degenerate triangle
+    # into whichever real neighbor it shares an edge with - unconditionally, skipping the
+    # angle test - sidesteps this: which chart cosmetically "owns" a triangle with no visible
+    # area doesn't matter, but leaving it permanently unmergeable was actively harmful.
+    degenerate = areas < 1e-9
 
     edge_to_faces = {}
     for face_idx, (a, b, c) in enumerate(faces):
@@ -100,7 +115,7 @@ def _build_charts(vertices, faces, angle_threshold_deg):
             # merge across either way, leave both sides as-is.
             continue
         i, j = shared
-        if np.dot(face_normals[i], face_normals[j]) >= cos_threshold:
+        if degenerate[i] or degenerate[j] or np.dot(face_normals[i], face_normals[j]) >= cos_threshold:
             uf.union(i, j)
 
     charts = {}
@@ -116,7 +131,16 @@ def _orthonormal_basis(normal):
     consistent for every vertex flattened into the same chart."""
     helper = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     tangent = np.cross(normal, helper)
-    tangent /= np.linalg.norm(tangent)
+    tangent_len = np.linalg.norm(tangent)
+    if tangent_len < 1e-12:
+        # `normal` itself is zero-length (or, vanishingly rarely, exactly parallel to the
+        # chosen helper) - nothing real to orient to. _build_charts' own degenerate-triangle
+        # handling means a chart normally never reaches here anymore, but a fully-degenerate
+        # isolated triangle with no valid edge-sharing neighbor at all still could - an
+        # arbitrary fixed basis is harmless (this chart has no visible area either way),
+        # dividing by zero into NaN is not.
+        return np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+    tangent /= tangent_len
     bitangent = np.cross(normal, tangent)
     return tangent, bitangent
 
@@ -145,10 +169,16 @@ def _flatten_chart(vertices, faces, chart_tris):
     chart_normal = (face_normals * areas[:, None]).sum(axis=0)
     norm_len = np.linalg.norm(chart_normal)
     if norm_len < 1e-12:
-        # Every triangle in this chart has ~zero area (a degenerate
-        # sliver) - fall back to the first triangle's own normal
-        # rather than dividing by zero building the weighted average.
-        chart_normal = face_normals[0]
+        # Every triangle in this chart has ~zero area (a degenerate sliver, or - now that
+        # _build_charts merges a degenerate triangle into any real neighbor it can reach -
+        # only ever a fully-isolated one with no valid neighbor at all) - fall back to
+        # whichever face in the chart has a real (non-zero) normal, since face_normals[0]
+        # alone could itself be one of the degenerate ones. An arbitrary fixed direction if
+        # truly every face here is degenerate is harmless (no visible area either way) -
+        # dividing by zero building the weighted average, or blindly trusting an unchecked
+        # face_normals[0], is not.
+        real = np.flatnonzero(np.linalg.norm(face_normals, axis=1) > 1e-12)
+        chart_normal = face_normals[real[0]] if len(real) else np.array([0.0, 0.0, 1.0])
     else:
         chart_normal = chart_normal / norm_len
 

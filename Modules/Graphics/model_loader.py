@@ -25,6 +25,22 @@ COLLISION_ONLY_PREFIX = "collision_"
 def _is_collision_only_node(node_name):
     return node_name.lower().startswith(COLLISION_ONLY_PREFIX)
 
+
+# The opposite of COLLISION_ONLY_PREFIX above: a node named/prefixed this way renders
+# completely normally (no special-casing needed on this render side at all - unlike
+# collision_, which THIS module has to actively hide) but should contribute no physics
+# geometry - a decorative piece (foliage, a light fixture mesh) a player shouldn't snag on
+# or a prop that shouldn't block bullets/footsteps. Lives here, not physics_world.py,
+# because load_mesh_groups_by_material/_by_object below (both physics-only, despite living
+# in this render-focused module - see their own docstrings) need it alongside
+# _is_collision_only_node; physics_world.py's own _load_mesh imports it from here too,
+# rather than keeping a second copy of the same string/check.
+NO_COLLISION_PREFIX = "nocollision_"
+
+
+def _is_no_collision_node(node_name):
+    return node_name.lower().startswith(NO_COLLISION_PREFIX)
+
 def _has_attribute(prog, name):
     try: return prog[name] is not None
     except Exception: return False
@@ -356,10 +372,10 @@ def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
     mat = getattr(mesh.visual, "material", None)
     if mat is None:
         return (base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
-                double_sided, normal_scale, None, None, None)
+                double_sided, normal_scale, None, None, None, None)
     if not load_textures:
         return (base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff,
-                double_sided, normal_scale, None, None, None)
+                double_sided, normal_scale, None, None, None, None)
 
     for attr in ("main_color", "baseColorFactor", "diffuse"):
         val = getattr(mat, attr, None)
@@ -426,11 +442,17 @@ def _extract_material(mesh, scene, ctx, raw_factors=None, load_textures=True):
     # long as the shader does NOT apply that same pow(2.2) to it (it
     # doesn't - see FRAGMENT_SHADER_BODY's normal-map sampling).
     normal_tex_obj = _upload_texture(ctx, getattr(mat, "normalTexture", None))
+    # emissiveTexture - a per-texel emission map, modulated by (not
+    # replacing) the flat emissiveFactor above - see pbr_shader.py's
+    # u_has_emissive_texture/apply_normal_map-adjacent emissive block in
+    # main(). trimesh's PBRMaterial exposes it as a plain attribute,
+    # identically to normalTexture/metallicRoughnessTexture above.
+    emissive_tex_obj = _upload_texture(ctx, getattr(mat, "emissiveTexture", None))
 
     return (
         base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, double_sided,
         normal_scale, _upload_texture(ctx, img), _upload_texture(ctx, getattr(mat, "metallicRoughnessTexture", None)),
-        normal_tex_obj,
+        normal_tex_obj, emissive_tex_obj,
     )
 
 def _extract_vertex_colors(mesh, base_color, vertex_count):
@@ -500,7 +522,7 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
     file), returns the same dict shape load_glb always has, or None on
     failure (after releasing whatever GL resources this call already
     created, exactly as load_glb's own try/except used to do inline)."""
-    buffers, vao, tex_obj, mr_tex_obj, normal_tex_obj = [], None, None, None, None
+    buffers, vao, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj = [], None, None, None, None, None
     try:
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0: raise RuntimeError("Invalid or empty mesh.")
 
@@ -532,7 +554,7 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         needs_textures = ("u_texture" in prog) if load_textures is None else load_textures
         (
             base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, double_sided,
-            normal_scale, tex_obj, mr_tex_obj, normal_tex_obj,
+            normal_scale, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj,
         ) = _extract_material(
             mesh, scene, ctx, raw_factors, load_textures=needs_textures
         )
@@ -588,10 +610,12 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             "lightmap_uv_vbo": vbos.get("in_lightmap_uv"), "has_lightmap_uv": has_lightmap_uv, "ibo": ibo,
             "tangent_vbo": vbos.get("in_tangent"),
             "texture": tex_obj, "metallic_roughness_texture": mr_tex_obj, "normal_texture": normal_tex_obj,
+            "emissive_texture": emissive_tex_obj,
             "metallic": metallic, "roughness": roughness, "emissive": emissive.tolist(),
             "normal_scale": normal_scale,
             "has_texture": 1 if tex_obj else 0, "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
             "has_normal_texture": 1 if normal_tex_obj else 0,
+            "has_emissive_texture": 1 if emissive_tex_obj else 0,
             # "OPAQUE" | "MASK" | "BLEND" (glTF alphaMode - see
             # _extract_material's own docstring) plus the cutoff MASK
             # uses and the material's own base alpha factor (multiplied
@@ -614,7 +638,7 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         }
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
-        for res in [vao, *buffers, tex_obj, mr_tex_obj, normal_tex_obj]:
+        for res in [vao, *buffers, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj]:
             if res: res.release()
         return None
 
@@ -645,7 +669,7 @@ def _material_key(geom):
     name = getattr(mat, "name", None)
     return name if name else id(mat)
 
-def _flatten_scene_by_material(scene):
+def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only=True):
     """Like _flatten_scene, but groups nodes by MATERIAL instead of
     merging every node in the file into one mesh - _flatten_scene keeps
     only the FIRST node's material for the whole combined result
@@ -657,9 +681,23 @@ def _flatten_scene_by_material(scene):
     ONE material happened to belong to the first node in the file,
     including cases where that material has no texture at all.
 
+    extra_exclude: optional extra node_name -> bool predicate. Used by
+    load_mesh_groups_by_material (the PHYSICS-only caller of this function - see its own
+    docstring) to pass _is_no_collision_node, so a nocollision_-prefixed node is left out of
+    the collision mesh without also being hidden from the render caller
+    (load_glb_by_material), which always leaves this None - a nocollision_ node needs to
+    keep rendering completely normally.
+
+    exclude_collision_only: the render caller (load_glb_by_material) needs this True (the
+    default) to hide a collision_-prefixed node, same as _flatten_scene. The PHYSICS caller
+    (load_mesh_groups_by_material) needs the OPPOSITE - collision_ nodes are exactly the
+    ones that should end up as collision, so it passes False here - confirmed as a real bug
+    otherwise: this function used to exclude collision_ nodes unconditionally, silently
+    giving a clip-brush node no collider at all on any level using add_static_mesh_by_
+    material, the exact opposite of what naming it collision_ is meant to do.
+
     Returns a list of (combined_mesh, node_order) pairs, one per
-    distinct material actually present (collision-only nodes excluded,
-    same as _flatten_scene), in first-encountered order - each pair is
+    distinct material actually present, in first-encountered order - each pair is
     exactly what _flatten_scene would have returned if the file had
     ONLY that material's nodes in it. A non-Scene input (a bare Trimesh/
     PointCloud with no per-node material split possible) falls back to
@@ -671,7 +709,8 @@ def _flatten_scene_by_material(scene):
     groups = {}
     order = []
     for node_name in scene.graph.nodes_geometry:
-        if _is_collision_only_node(node_name): continue
+        if exclude_collision_only and _is_collision_only_node(node_name): continue
+        if extra_exclude is not None and extra_exclude(node_name): continue
         transform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)
         if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0: continue
@@ -728,8 +767,10 @@ def load_mesh_groups_by_material(model_path, scale=None):
     position, matching _load_mesh's own convention.
 
     Returns a list of (material_name, vertices, faces) tuples, one per
-    distinct material actually present (collision-only nodes excluded,
-    matching every other loader in this file) - material_name is
+    distinct material actually present (collision-only AND nocollision_-prefixed nodes
+    both excluded, matching every other loader in this file - the latter via
+    _flatten_scene_by_material's own extra_exclude, since that function is shared with the
+    RENDER side, which must NOT exclude nocollision_ nodes) - material_name is
     whatever _material_key resolves to (the glTF material's own
     authored name, an opaque id() for an unnamed one, or None for
     geometry with no material at all). Empty list if model_path doesn't
@@ -746,7 +787,8 @@ def load_mesh_groups_by_material(model_path, scale=None):
 
     scale_arr = np.asarray(scale, dtype="f8") if scale is not None else None
     results = []
-    for mesh, _node_names in _flatten_scene_by_material(scene):
+    for mesh, _node_names in _flatten_scene_by_material(
+            scene, extra_exclude=_is_no_collision_node, exclude_collision_only=False):
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
             continue
         vertices = np.asarray(mesh.vertices, dtype="f8")
@@ -776,16 +818,34 @@ def load_mesh_groups_by_object(model_path, scale=None):
     Never merges across nodes - a node here is already the smallest
     addressable unit this can name at all, so unlike load_mesh_groups_
     by_material's per-material merging, there's nothing TO merge.
-    Collision-only nodes are excluded, matching every other loader in
-    this file. scale: same convention as load_mesh_groups_by_material's
+    PHYSICS-only (this whole function, not just this exclusion - see below), so a
+    collision_-prefixed node is deliberately INCLUDED here (the opposite of every render-
+    facing loader in this file, which hides it) - that's the entire point of naming a node
+    collision_, and this used to get it backwards, silently giving such a node no collider
+    at all on any level using add_static_mesh_by_object. A nocollision_-prefixed node IS
+    excluded (mainmap.glb's own "Water"/"CenterFloor" collision_object_overrides use this
+    same function via PhysicsWorld.add_static_mesh_by_object - a nocollision_ node here
+    never even reaches that far, since it's dropped at this stage rather than needing its
+    own explicit override entry). scale: same convention as load_mesh_groups_by_material's
     own (any np.asarray-compatible array-like).
 
-    Returns a list of (node_name, vertices, faces) tuples, one per mesh
-    node actually present. A file with no per-node structure at all (a
-    bare Trimesh/PointCloud, not a trimesh.Scene) falls back to a single
-    (None, vertices, faces) entry, matching _flatten_scene_by_material's
-    own fallback for that case. Empty list if model_path doesn't exist
-    or fails to parse."""
+    Returns a list of (node_name, material_name, vertices, faces)
+    tuples, one per mesh node actually present - material_name is the
+    SAME _material_key load_mesh_groups_by_material/_flatten_scene_by_
+    material use (the glTF material's own authored name, an opaque
+    id() for an unnamed one, or None for geometry with no material at
+    all), included here so PhysicsWorld.add_static_mesh_by_object can
+    guess a physical_material from it (see footstep_materials.py's own
+    guess_physical_material) for any object NOT named in its own
+    object_overrides - a node's name alone (the whole point of this
+    function existing separately from load_mesh_groups_by_material) is
+    often not descriptive of what it's actually built from ("Windows"
+    turning out to be sheet metal roofing on mainmap.glb, say), while
+    the material it's rendered with usually is. A file with no per-node
+    structure at all (a bare Trimesh/PointCloud, not a trimesh.Scene)
+    falls back to a single (None, None, vertices, faces) entry, matching
+    _flatten_scene_by_material's own fallback for that case. Empty list
+    if model_path doesn't exist or fails to parse."""
     path = Path(model_path)
     if not path.exists():
         print(f"[Warning] Model file not found: {path.resolve()}")
@@ -804,11 +864,11 @@ def load_mesh_groups_by_object(model_path, scale=None):
         vertices = np.asarray(scene.vertices, dtype="f8")
         if scale_arr is not None:
             vertices = vertices * scale_arr
-        return [(None, vertices, np.asarray(scene.faces, dtype="i4"))]
+        return [(None, None, vertices, np.asarray(scene.faces, dtype="i4"))]
 
     results = []
     for node_name in scene.graph.nodes_geometry:
-        if _is_collision_only_node(node_name):
+        if _is_no_collision_node(node_name):
             continue
         transform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)
@@ -819,7 +879,7 @@ def load_mesh_groups_by_object(model_path, scale=None):
         vertices = np.asarray(geom.vertices, dtype="f8") @ rot.T + trans
         if scale_arr is not None:
             vertices = vertices * scale_arr
-        results.append((node_name, vertices, np.asarray(geom.faces, dtype="i4")))
+        results.append((node_name, _material_key(geom), vertices, np.asarray(geom.faces, dtype="i4")))
     return results
 
 def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,

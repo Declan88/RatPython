@@ -176,6 +176,17 @@ class ChatBox(Panel):
             self._close()
         if self._open:
             self._update_suggestions()
+        # Bound swallow_next_text to the SAME frame it was set in (see ChatInput's own
+        # docstring on why it exists at all). Tab/Up/Down never produce a TEXTINPUT event
+        # in the first place, and "/" reopening chat's own synthetic one isn't reliably
+        # delivered every time either (see ChatBox.open's own comment) - window.
+        # handle_events has already drained every event for this frame by the time
+        # update() runs (app.py calls it right after), so if nothing consumed the flag by
+        # now, nothing ever will for THIS keypress. Left set, it would instead silently
+        # eat the very next character the player actually types - whatever key that is
+        # appearing to need pressing twice before it "registers", since the first press
+        # is the one this swallows.
+        self.input.swallow_next_text = False
         if not self._log:
             return
         now = time.perf_counter()

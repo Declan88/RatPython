@@ -32,7 +32,8 @@ import glm
 import trimesh
 import numpy as np
 from panda3d.core import NodePath, PandaNode, Point3, Vec3, BitMask32
-from Modules.Graphics.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object
+from Modules.Graphics.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object, _is_no_collision_node
+from Modules.Audio.footstep_materials import guess_physical_material
 from panda3d.core import Quat as PandaQuat
 from panda3d.bullet import (
     BulletWorld, BulletRigidBodyNode, BulletBoxShape, BulletSphereShape,
@@ -159,12 +160,38 @@ class CollisionGroup:
 def _load_mesh(model_path, scale):
     """Loads model_path independently through trimesh (cheap - no GPU
     upload, separate from model_loader.py's render-focused load) and
-    returns (vertices, faces), vertices pre-scaled by `scale` if given."""
-    mesh = trimesh.load(str(model_path), force="mesh", process=False)
-    vertices = np.asarray(mesh.vertices, dtype="f8")
+    returns (vertices, faces), vertices pre-scaled by `scale` if given.
+
+    Loaded as a Scene (not force="mesh") specifically so a nocollision_-prefixed node (model_
+    loader.py's own NO_COLLISION_PREFIX, the mirror of its COLLISION_ONLY_PREFIX - see that
+    module's own comment) can be left out of the merge - everything else, INCLUDING a
+    collision_-prefixed node (that IS exactly the pass meant to pick those up), is merged in
+    unfiltered, same as before this could exclude anything at all. A single-mesh file (no
+    scene graph, so no per-node names to match against either prefix) falls back to using it
+    directly, same as model_loader.py's own _flatten_scene does for that case."""
+    loaded = trimesh.load(str(model_path), process=False)
+    if isinstance(loaded, trimesh.Scene):
+        all_vertices, all_faces, vertex_offset = [], [], 0
+        for node_name in loaded.graph.nodes_geometry:
+            if _is_no_collision_node(node_name):
+                continue
+            transform, geom_name = loaded.graph[node_name]
+            geom = loaded.geometry.get(geom_name)
+            if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0:
+                continue
+            rot, trans = transform[:3, :3], transform[:3, 3]
+            all_vertices.append(np.asarray(geom.vertices) @ rot.T + trans)
+            all_faces.append(np.asarray(geom.faces) + vertex_offset)
+            vertex_offset += len(geom.vertices)
+        vertices = np.concatenate(all_vertices, axis=0) if all_vertices else np.zeros((0, 3), dtype="f8")
+        faces = np.concatenate(all_faces, axis=0) if all_faces else np.zeros((0, 3), dtype="i4")
+    else:
+        vertices = np.asarray(loaded.vertices, dtype="f8")
+        faces = np.asarray(loaded.faces, dtype="i4")
+    vertices = np.asarray(vertices, dtype="f8")
     if scale is not None:
         vertices = vertices * np.asarray(glm.vec3(scale), dtype="f8")
-    return vertices, np.asarray(mesh.faces, dtype="i4")
+    return vertices, np.asarray(faces, dtype="i4")
 
 
 def _build_triangle_mesh_shape(vertices, faces):
@@ -394,12 +421,15 @@ class PhysicsWorld:
         name, or an opaque id() for an unnamed one).
 
         default_material: physical_material for every material NOT
-        named in material_overrides at all - None (footstep_materials.
-        DEFAULT_FOOTSTEP_MATERIAL, same fallback every other add_static_
-        * method here already uses) if not given. NOT the same thing as
-        explicitly overriding a material to None in material_overrides,
-        which skips collision for it entirely rather than just picking a
-        default sound.
+        named in material_overrides at all, AND whose own name doesn't
+        match anything in footstep_materials.guess_physical_material
+        either (see that function's own docstring - checked first, for
+        every material not explicitly named, before falling back to
+        this) - None (footstep_materials.DEFAULT_FOOTSTEP_MATERIAL, same
+        fallback every other add_static_* method here already uses) if
+        not given. NOT the same thing as explicitly overriding a
+        material to None in material_overrides, which skips collision
+        for it entirely rather than just picking a default sound.
 
         No exclude_local_bounds support (unlike add_static_mesh) - carve
         the unwanted region out at the material/export level instead
@@ -418,7 +448,7 @@ class PhysicsWorld:
                 if physical_material is None:
                     continue
             else:
-                physical_material = default_material
+                physical_material = guess_physical_material(material_name) or default_material
 
             shape = _build_triangle_mesh_shape(vertices, faces)
             node_paths.append(
@@ -447,21 +477,27 @@ class PhysicsWorld:
         physical_material, or explicitly None to build no collider at
         all for that object - same shape/semantics as add_static_mesh_
         by_material's own material_overrides, just matched by node name
-        instead of material name. default_material: same as add_static_
-        mesh_by_material's own.
+        instead of material name. An object NOT named here at all still
+        gets a guess from its own underlying glTF MATERIAL's name first
+        (see load_mesh_groups_by_object/footstep_materials.guess_
+        physical_material) before falling back to default_material - a
+        node's own name is often not descriptive (mainmap.glb's "Windows"
+        turning out to be sheet metal roofing, say), but what it's
+        actually rendered with usually is. default_material: same as
+        add_static_mesh_by_material's own.
 
         Returns the list of node paths actually created - one per object
         that got a real collider; an object overridden to None
         contributes none at all."""
         groups = load_mesh_groups_by_object(model_path, scale=scale)
         node_paths = []
-        for node_name, vertices, faces in groups:
+        for node_name, material_name, vertices, faces in groups:
             if object_overrides and node_name in object_overrides:
                 physical_material = object_overrides[node_name]
                 if physical_material is None:
                     continue
             else:
-                physical_material = default_material
+                physical_material = guess_physical_material(material_name) or default_material
 
             shape = _build_triangle_mesh_shape(vertices, faces)
             node_paths.append(

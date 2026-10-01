@@ -32,6 +32,40 @@ from Modules.Weapons.weapons_base import _load_state_clip
 _OFFSET = glm.vec3(0.0, 0.0, 0.0)
 _SCALE = 1.0
 
+# Mouse-look sway: the viewmodel lags a little behind a fast camera turn, like the gun's own
+# inertia, then settles back to dead-center - the classic FPS "weapon sway" feel. Driven by
+# camera.yaw/pitch's own frame-to-frame DELTA (already tracked for other reasons - see
+# NetworkManager.set_local_state's own yaw/pitch args - not a second mouse-delta source of
+# truth), not raw mouse input, so it stays correct through anything else that can move yaw/
+# pitch (recoil, a cutscene-style camera snap) exactly the same as an actual mouse turn would.
+# An initial 0.05/8.0 pass was reported "too fast" - settling in a few frames read as a snap,
+# not a drift - so DECAY stays slow (3.0, unchanged since that fix). GAIN (how MUCH lag a
+# given turn produces, independent of how fast it then settles) was then raised back up from
+# that same pass's shared 0.012 to a 0.03 shared value after a request for more intensity,
+# and now split into separate yaw/pitch gains (and clamps) at a further request for pitch
+# (looking up/down) to read more intense than yaw (side to side) - pitch at 1.8x yaw's own
+# values, both still well under the original "too fast" pass's numbers.
+_SWAY_GAIN_YAW = 0.03     # degrees of lag added per degree of YAW turned this frame
+_SWAY_GAIN_PITCH = 0.054  # same, for PITCH - 1.8x yaw's own gain, the actual "more intense" ask
+_SWAY_DECAY = 3.0         # how fast lag settles back toward zero, per second (shared - this
+                          # governs SPEED, not amount, no reason for the two axes to differ)
+_SWAY_MAX_YAW_DEG = 4.0   # clamp - keeps a fast flick-turn from swinging the gun too far
+_SWAY_MAX_PITCH_DEG = 7.0  # same, for pitch - raised to match its own bigger gain above
+# Below this (degrees), skip building/multiplying the sway rotation matrices at all this
+# frame - the overwhelmingly common case (mouse not moving, or lag already fully settled)
+# costs nothing beyond the two-float decay update below, not two glm.rotate calls + two 4x4
+# multiplies on top of the transform this function was already building regardless.
+_SWAY_EPSILON_DEG = 1e-3
+# The rotation's own pivot, in camera space (same convention as _OFFSET - +Y up, -Z forward).
+# Literally rotating around camera-space (0,0,0) - the eye itself, since the rig is authored
+# with the camera AT the model origin (see _OFFSET's own comment) - swings the WHOLE gun
+# through a wide arc from a point well behind/above where it actually sits, which read as
+# pivoting from the wrong place entirely. Real weapon sway pivots from roughly where the gun
+# itself is held, not the eye socket - this nudges the rotation's own pivot forward and
+# slightly down to approximate that, via a translate/rotate/translate-back sandwich (see
+# update()) instead of rotating around the raw origin.
+_SWAY_PIVOT = glm.vec3(0.0, -0.08, -0.35)
+
 
 def _unique_parts(parts):
     """A weapon's arms and gun objects without repeats (arms and gun can be the same object)."""
@@ -62,6 +96,13 @@ class ViewModel:
         self.arms = None          # always the ACTIVE weapon's parts - None if none is active
         self.gun = None           # the gun's first (main) part - see gun_parts
         self.gun_parts = []       # every gun object (one per material for a multi-material gun)
+        # Mouse-look sway state (see _SWAY_GAIN's own comment) - _last_yaw/_pitch is None
+        # until the first real update() call, so the very first frame never sees a huge
+        # bogus "delta" from whatever camera.yaw/pitch happened to already be.
+        self._sway_yaw = 0.0
+        self._sway_pitch = 0.0
+        self._last_yaw = None
+        self._last_pitch = None
 
     def set_weapon(self, weapon):
         """Shows `weapon`, priming it first (loading its arms/gun and
@@ -271,11 +312,36 @@ class ViewModel:
             if parts["arms"] is not None:
                 self._scene.set_skeletal_tint(parts["arms"], self._tint)
 
-    def update(self, camera, visible):
+    def _update_sway(self, camera, dt):
+        """Advances the lag-then-settle sway state by one frame (see _SWAY_GAIN_YAW's own
+        comment) - a handful of scalar float ops regardless of how many viewmodel parts
+        exist, since the resulting angles get applied to one shared transform below, not
+        recomputed per part."""
+        if self._last_yaw is None:
+            self._last_yaw, self._last_pitch = camera.yaw, camera.pitch
+            return
+        dyaw = camera.yaw - self._last_yaw
+        dpitch = camera.pitch - self._last_pitch
+        self._last_yaw, self._last_pitch = camera.yaw, camera.pitch
+        # +dyaw, not -dyaw (pitch below is still -dpitch) - reported swinging the wrong way
+        # (right turn swayed the gun right instead of lagging left behind it) at the original
+        # sign; flipped once confirmed, rather than re-deriving the whole pivot/rotation
+        # chain for what was really just this one axis's convention being backwards.
+        self._sway_yaw = max(-_SWAY_MAX_YAW_DEG, min(_SWAY_MAX_YAW_DEG, self._sway_yaw + dyaw * _SWAY_GAIN_YAW))
+        self._sway_pitch = max(-_SWAY_MAX_PITCH_DEG, min(_SWAY_MAX_PITCH_DEG, self._sway_pitch - dpitch * _SWAY_GAIN_PITCH))
+        # A plain per-frame multiplicative decay (not a real exp()) - cheap, and at any
+        # sane frame rate indistinguishable from one: settles from full clamp to
+        # imperceptible in well under half a second at the default _SWAY_DECAY.
+        decay = max(0.0, 1.0 - _SWAY_DECAY * dt)
+        self._sway_yaw *= decay
+        self._sway_pitch *= decay
+
+    def update(self, camera, visible, dt):
         """Call once per frame with the camera as it will render; visible
         False (third person, dead, menu...) hides the ACTIVE weapon (any
         other primed weapon is already hidden regardless - see
-        _set_visible)."""
+        _set_visible). dt drives the mouse-look sway's own settle speed
+        (_SWAY_DECAY) - see _update_sway."""
         parts = []
         for o in [self.arms] + self.gun_parts:
             if o is not None and o not in parts:
@@ -283,10 +349,29 @@ class ViewModel:
         for obj in parts:
             obj["viewmodel_visible"] = bool(visible)
         if not visible or not parts:
+            # Still track yaw/pitch while hidden, so re-showing the viewmodel later doesn't
+            # see one huge accumulated "delta" from however far the camera moved in the
+            # meantime and yank the sway to its clamp on the very next visible frame.
+            self._last_yaw, self._last_pitch = camera.yaw, camera.pitch
             return
         if self._one_shot_finished():
             self.play("idle")
-        transform = glm.inverse(camera.get_view_matrix()) * self._local
+        self._update_sway(camera, dt)
+        local = self._local
+        if abs(self._sway_yaw) > _SWAY_EPSILON_DEG or abs(self._sway_pitch) > _SWAY_EPSILON_DEG:
+            # translate(+pivot) * rotate * translate(-pivot): the standard "rotate around an
+            # arbitrary point" sandwich - shifts _SWAY_PIVOT to the origin, applies the sway
+            # rotation THERE instead of at camera-space (0,0,0), then shifts back. Without
+            # this, rotating around the raw origin swings the whole gun through a wide arc
+            # from the eye - see _SWAY_PIVOT's own comment.
+            local = (
+                glm.translate(glm.mat4(1.0), _SWAY_PIVOT)
+                * glm.rotate(glm.mat4(1.0), glm.radians(self._sway_pitch), glm.vec3(1.0, 0.0, 0.0))
+                * glm.rotate(glm.mat4(1.0), glm.radians(self._sway_yaw), glm.vec3(0.0, 1.0, 0.0))
+                * glm.translate(glm.mat4(1.0), -_SWAY_PIVOT)
+                * local
+            )
+        transform = glm.inverse(camera.get_view_matrix()) * local
         for obj in parts:
             obj["transform"] = transform
             obj["position"] = camera.position

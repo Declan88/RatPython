@@ -49,7 +49,14 @@ class DrawList:
     def __init__(self, scale, white_tex):
         self.scale = scale
         self.white = white_tex
-        self.quads = []  # (texture, x0, y0, x1, y1, (r, g, b, a), clip)
+        # (texture, corners, (r, g, b, a), clip) - corners is ((x0,y0), (x1,y0), (x1,y1),
+        # (x0,y1)) in pixel space for every axis-aligned call below (rect/texture/
+        # texture_logical), matching draw()'s own (0,1)/(1,1)/(1,0)/(0,0) UV assignment -
+        # kept as 4 explicit points rather than a plain (x0,y0,x1,y1) rect so texture_
+        # logical_oriented (the damage indicator's rotating arrow - see its own docstring)
+        # can hand back a rotated quad through the exact same draw()/batching path with no
+        # special-casing, instead of needing a second, parallel kind of quad.
+        self.quads = []
         self.clip = None  # current clip as pixel (x0, y0, x1, y1), or None
         self._clip_stack = []
         self.overlays = []
@@ -75,22 +82,61 @@ class DrawList:
     def pop_clip(self):
         self.clip = self._clip_stack.pop()
 
+    @staticmethod
+    def _axis_aligned_corners(x0, y0, x1, y1):
+        return ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+
     def rect(self, logical_rect, color):
         x, y, w, h = logical_rect
         s = self.scale
         x0, y0 = round(x * s), round(y * s)
         x1, y1 = round((x + w) * s), round((y + h) * s)
-        self.quads.append((self.white, x0, y0, x1, y1, color, self.clip))
+        self.quads.append((self.white, self._axis_aligned_corners(x0, y0, x1, y1), color, self.clip))
 
     def texture(self, tex, px, py, pw, ph, color):
         x0, y0 = round(px), round(py)
-        self.quads.append((tex, x0, y0, x0 + pw, y0 + ph, color, self.clip))
+        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x0 + pw, y0 + ph), color, self.clip))
 
     def texture_logical(self, tex, logical_rect, color):
         x, y, w, h = logical_rect
         s = self.scale
-        self.quads.append((tex, round(x * s), round(y * s),
-                           round((x + w) * s), round((y + h) * s), color, self.clip))
+        x0, y0 = round(x * s), round(y * s)
+        x1, y1 = round((x + w) * s), round((y + h) * s)
+        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x1, y1), color, self.clip))
+
+    def texture_logical_oriented(self, tex, center_logical, forward, logical_size, color):
+        """Like texture_logical, but the quad is built from an explicit 2D unit `forward`
+        vector (+x right, +y down, same as everything else in this screen-space UI) instead
+        of always coming out axis-aligned - for a widget that needs to rotate freely to
+        point in an arbitrary on-screen direction (the damage indicator's arrow - see
+        damage_indicator.py), which no other caller here needs (see DrawList's own
+        docstring on why every other quad stays a plain rect).
+
+        center_logical: the quad's own centre, in logical units (not a corner, unlike
+        every other *_logical call here - a rotating quad has no stable "top-left").
+        forward: (fx, fy) - the direction the TEXTURE's own top edge (where its content
+        should read "up") points on screen; the caller normalizes it, not this function
+        (so (0, 0) - all the directional calcs below would divide-by-zero-adjacent
+        degenerate into a zero-size quad - never gets handed to a live draw this way in
+        practice, since damage_indicator.py always has a real direction to show by the
+        time it draws). logical_size: (w, h), same convention as every other *_logical
+        call's own size."""
+        cx, cy = center_logical
+        w, h = logical_size
+        s = self.scale
+        fx, fy = forward
+        rx, ry = -fy, fx   # `forward` rotated 90 degrees clockwise on screen - the quad's own local +X (right)
+        ccx, ccy = cx * s, cy * s
+        hw, hh = (w * s) / 2.0, (h * s) / 2.0
+        top = (ccx + fx * hh, ccy + fy * hh)
+        bottom = (ccx - fx * hh, ccy - fy * hh)
+        corners = (
+            (top[0] - rx * hw, top[1] - ry * hw),
+            (top[0] + rx * hw, top[1] + ry * hw),
+            (bottom[0] + rx * hw, bottom[1] + ry * hw),
+            (bottom[0] - rx * hw, bottom[1] - ry * hw),
+        )
+        self.quads.append((tex, corners, color, self.clip))
 
 
 class UIRenderer:
@@ -131,12 +177,15 @@ class UIRenderer:
         self._ensure_capacity(len(quads))
 
         verts = []
-        for _, x0, y0, x1, y1, c, _clip in quads:
-            # y is down in UI space, so the quad's top edge (y0) samples the
-            # top of the texture (v=1 - textures were uploaded flipped).
+        for _, corners, c, _clip in quads:
+            # y is down in UI space, so the quad's top edge (corners[0]/[1]) samples the
+            # top of the texture (v=1 - textures were uploaded flipped). corners is already
+            # in this exact (top-left, top-right, bottom-right, bottom-left) winding for
+            # every quad, axis-aligned or not - see DrawList's own docstring.
+            (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
             verts.extend((
-                x0, y0, 0.0, 1.0, *c,  x1, y0, 1.0, 1.0, *c,  x1, y1, 1.0, 0.0, *c,
-                x0, y0, 0.0, 1.0, *c,  x1, y1, 1.0, 0.0, *c,  x0, y1, 0.0, 0.0, *c,
+                x0, y0, 0.0, 1.0, *c,  x1, y1, 1.0, 1.0, *c,  x2, y2, 1.0, 0.0, *c,
+                x0, y0, 0.0, 1.0, *c,  x2, y2, 1.0, 0.0, *c,  x3, y3, 0.0, 0.0, *c,
             ))
         self.vbo.orphan()     # a fresh buffer: writing the one the GPU may still be reading would stall
         self.vbo.write(np.asarray(verts, dtype="f4").tobytes())
@@ -156,8 +205,8 @@ class UIRenderer:
         start = 0
         for i in range(1, len(quads) + 1):
             if (i == len(quads) or quads[i][0] is not quads[start][0]
-                    or quads[i][6] != quads[start][6]):
-                clip = quads[start][6]
+                    or quads[i][3] != quads[start][3]):
+                clip = quads[start][3]
                 if clip is None:
                     ctx.scissor = None
                 else:

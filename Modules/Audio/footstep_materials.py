@@ -86,6 +86,68 @@ _MATERIAL_VOLUME = {
 _DEFAULT_VOLUME = (0.2, 0.5)
 
 
+# Ordered (keyword, physical_material) pairs - checked in order, first
+# substring match (case-insensitive) against a glTF material's own name
+# wins, so a more specific keyword ("metalgrate" before "metal") has to
+# come first. Used to GUESS a physical_material for a static object that
+# wasn't given one explicitly (see Scene.add_static's own physical_
+# material/collision_overrides/collision_object_overrides) instead of
+# blanket-defaulting every untagged object in a level to DEFAULT_
+# FOOTSTEP_MATERIAL regardless of what it's actually made of - a real
+# multi-material level (mainmap.glb) authors material names like
+# "brick/brickwall008a", "tile/tilefloor010c", "HandrailMetal001a" that
+# already say what they are, this just reads that back instead of
+# discarding it. Deliberately best-effort: a material named something
+# opaque ("Treemat", "ravendoor_sheet") won't match anything here and
+# falls through to the caller's own default, same as always - this is a
+# fallback for the common case, not a replacement for an explicit
+# collision_overrides/collision_object_overrides entry on the handful of
+# objects that actually need one (see mainmap_scene.py's own).
+_MATERIAL_NAME_GUESSES = (
+    ("chainlink", "chainlink"),
+    ("chain_link", "chainlink"),
+    ("metalgrate", "metalgrate"),
+    ("grate", "metalgrate"),
+    ("duct", "duct"),
+    ("vent", "duct"),
+    ("ladder", "ladder"),
+    ("metal", "metal"),
+    ("woodpanel", "woodpanel"),
+    ("wood_panel", "woodpanel"),
+    ("plywood", "woodpanel"),
+    ("wood", "wood"),
+    ("gravel", "gravel"),
+    ("grass", "grass"),
+    ("snow", "snow"),
+    ("mud", "mud"),
+    ("sand", "sand"),
+    ("dirt", "dirt"),
+    ("tile", "tile"),
+    ("concrete", "concrete"),
+    ("cement", "concrete"),
+    ("brick", "concrete"),
+    ("stone", "concrete"),
+    ("slosh", "slosh"),
+    ("wade", "wade"),
+    ("water", "wade"),
+)
+
+
+def guess_physical_material(name):
+    """Best-effort physical_material guess from a glTF material's (or,
+    failing that, an object's) own name - see _MATERIAL_NAME_GUESSES'
+    own docstring for the full reasoning. None if `name` is None/empty
+    or doesn't match any keyword, so callers can fall through to their
+    own explicit default instead of a wrong guess."""
+    if not name or not isinstance(name, str):
+        return None
+    lowered = name.lower()
+    for keyword, material in _MATERIAL_NAME_GUESSES:
+        if keyword in lowered:
+            return material
+    return None
+
+
 def get_footstep_volume(material, walking):
     """Returns Source's own fvol for `material` (see UpdateStepSound) -
     walking=True selects the slower/quieter of the pair, walking=False

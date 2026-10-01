@@ -95,7 +95,7 @@ from Modules.Particles.dissolve_sparks import register_dissolve_sparks
 from Modules.Gore import GibManager
 from Modules.Debug import FrameProfiler
 from Modules.Particles.impacts import (IMPACT_FILE, IMPACT_GROUP, MATERIAL_ALIASES, LIFETIME_SCALE, MAX_IMPACT_EFFECTS,
-                                       RADIUS_SCALE, keep_frame, spawn_impact)
+                                       RADIUS_SCALE, keep_frame, spawn_impact, play_impact_sound)
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
@@ -138,6 +138,7 @@ KILL_SOUND_VOLUME = 1.0
 KILL_SOUND_GAIN = 4.0
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.UI.killfeed import KillFeed
+from Modules.UI.damage_indicator import DamageIndicator
 from Modules.UI.chatbox import ChatBox
 from Modules.Chat import commands
 from Modules.Camera.camera import Camera
@@ -694,6 +695,10 @@ def main():
     weapon_hud = ui.root.add(WeaponHUD())
     # Diagonal ticks over the crosshair when one of our shots hits another player.
     hitmarker = ui.root.add(Hitmarker())
+    # Arrow on a ring around the crosshair pointing at whoever just shot US (see
+    # Modules/UI/damage_indicator.py) - updated every frame from the camera below,
+    # triggered from on_damaged.
+    damage_indicator = ui.root.add(DamageIndicator())
     # F9: a live breakdown of where each frame's time goes (see Modules/Debug/frame_profiler.py).
     prof = FrameProfiler()
     profile_label = ui.root.add(Label("", font_size=17, color=(255, 255, 170, 255), visible=False, offset=(14, 14)))
@@ -894,6 +899,15 @@ def main():
             if blast.is_invoker:
                 death["damage_class"] = source_weapon.damage_class.name
                 change_health(-blast.damage)
+                # Self-damage from our OWN explosion never goes through net_mgr.on_damage at
+                # all (nothing to send - we already know about it) - that's the only other
+                # place a hit normally triggers the damage indicator, so it needs triggering
+                # directly here instead, pointed at the blast itself (origin), not some
+                # notion of "attacker" (that's also us, standing wherever we fired FROM, not
+                # where the blast actually was - origin is the only reading that makes sense
+                # for your own splash catching you).
+                to_blast = origin - camera.position
+                damage_indicator.trigger((to_blast.x, to_blast.z))
             elif blast.target_id == TEST_DUMMY_STEAM_ID:
                 hurt_someone = True
                 damage_dummy(blast.damage, source_weapon.name, False, push=blast.push,
@@ -901,7 +915,7 @@ def main():
             else:
                 hurt_someone = True
                 net_mgr.send_damage(blast.target_id, blast.damage, source_weapon.name, push=blast.push,
-                                    damage_class=source_weapon.damage_class.name)
+                                    damage_class=source_weapon.damage_class.name, origin=tuple(origin))
         if hurt_someone:
             hitmarker.trigger(headshot=False)
 
@@ -1025,8 +1039,9 @@ def main():
                     particles.spawn_surface(
                         shooter_weapon.impact_particle, hit.position, hit.normal,
                         colors=shooter_weapon.impact_color, size=shooter_weapon.impact_size, group=IMPACT_GROUP)
+                    play_impact_sound(current_scene.sound_manager, hit)
                 else:
-                    spawn_impact(particles, hit)
+                    spawn_impact(particles, hit, sound_manager=current_scene.sound_manager)
             if shooter_weapon.muzzle_particle:
                 particles.spawn(shooter_weapon.muzzle_particle, start, forward=aim,
                                 colors=shooter_weapon.muzzle_color, size=shooter_weapon.muzzle_size,
@@ -1059,11 +1074,29 @@ def main():
             spawn_smite(position)
     net_mgr.on_death = remote_death
     # Another player's shot hit us: the shooter decided that, we apply it.
-    def on_damaged(amount, attacker_id, weapon_name, headshot, push=None, damage_class="bullet"):
+    def on_damaged(amount, attacker_id, weapon_name, headshot, push=None, damage_class="bullet", origin=None):
         death["damage_class"] = damage_class   # what killed us, if this hit does - see begin_death
         change_health(-amount)
         if push is not None:      # an explosion's shove: if this kills us, our gibs fly that way
             death["push"], death["push_time"] = glm.vec3(*push), time.perf_counter()
+        # Points the damage indicator at wherever this actually came from. origin (the
+        # shooter's own hit/blast position - see network_manager.py's send_damage docstring)
+        # is preferred when given: exact for a direct hit, and the only correct choice for
+        # splash damage (an explosion can reach someone standing well off to the side of
+        # wherever the attacker themselves is). Falls back to the attacker's own CURRENT
+        # position (looked up live off their replicated state - body_center is continuously
+        # updated from their movement stream) only for an older/odd message with no origin;
+        # None either way (they disconnected/despawned between firing and this landing, or
+        # this is the test dummy, which isn't a RemotePlayer at all, AND no origin was sent)
+        # just skips showing an arrow rather than guessing.
+        if origin is not None:
+            to_source = glm.vec3(*origin) - camera.position
+            damage_indicator.trigger((to_source.x, to_source.z))
+        else:
+            attacker = net_mgr.remote_players.get(attacker_id)
+            if attacker is not None:
+                to_attacker = attacker.body_center - camera.position
+                damage_indicator.trigger((to_attacker.x, to_attacker.z))
     net_mgr.on_damage = on_damaged
     from Modules.Scenes import scene_base as _scene_base
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
@@ -1233,6 +1266,7 @@ def main():
         particles.prime(prime_camera)
         prime_shooting(prime_camera)
         hitmarker.prime()
+        damage_indicator.prime()
         death_screen.show()       # one invisible frame builds its text
         ui.render()
         death_screen.hide()
@@ -1405,7 +1439,7 @@ def main():
         # after mouse look, before anything reads camera.front for this frame.
         if weapon is not None and alive:
             weapon.recoil.apply(camera, dt)
-        viewmodel.update(camera, not third_person and alive)
+        viewmodel.update(camera, not third_person and alive, dt)
         if weapon is not None:
             weapon.update(follow=lambda: camera.position)   # finishes an in-progress reload once its time is up
 
@@ -1450,8 +1484,9 @@ def main():
                         particles.spawn_surface(
                             weapon.impact_particle, shot.hit.position, shot.hit.normal,
                             colors=weapon.impact_color, size=weapon.impact_size, group=IMPACT_GROUP)
+                        play_impact_sound(current_scene.sound_manager, shot.hit)
                     else:
-                        spawn_impact(particles, shot.hit)
+                        spawn_impact(particles, shot.hit, sound_manager=current_scene.sound_manager)
                     if weapon.explosion is not None and shot.hit is not None:
                         explode(weapon, shot.hit)
                     if weapon.muzzle_particle:
@@ -1479,7 +1514,8 @@ def main():
                                         damage_class=weapon.damage_class.name)
                         else:
                             net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot,
-                                                damage_class=weapon.damage_class.name)
+                                                damage_class=weapon.damage_class.name,
+                                                origin=tuple(shot.hit.position))
 
         prof.mark("camera + weapons")
 
@@ -1556,6 +1592,7 @@ def main():
                 end_death()
         kill_feed.update()
         chatbox.update()
+        damage_indicator.update(camera)
         if (dummy_state["respawn_at"] is not None and time.perf_counter() >= dummy_state["respawn_at"]
                 and test_dummy is not None):
             dummy_state["respawn_at"] = None

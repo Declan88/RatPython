@@ -583,6 +583,7 @@ class Scene:
             _release(model.get("texture"))
             _release(model.get("metallic_roughness_texture"))
             _release(model.get("normal_texture"))
+            _release(model.get("emissive_texture"))
             return None
 
         return {
@@ -606,6 +607,7 @@ class Scene:
             "texture": model.get("texture"),
             "metallic_roughness_texture": model.get("metallic_roughness_texture"),
             "normal_texture": model.get("normal_texture"),
+            "emissive_texture": model.get("emissive_texture"),
             "metallic": model.get("metallic", 0.1),
             "roughness": model.get("roughness", 0.5),
             "emissive": model.get("emissive", [0.0, 0.0, 0.0]),
@@ -614,6 +616,7 @@ class Scene:
             "has_texture": model.get("has_texture", 0),
             "has_metallic_roughness_texture": model.get("has_metallic_roughness_texture", 0),
             "has_normal_texture": model.get("has_normal_texture", 0),
+            "has_emissive_texture": model.get("has_emissive_texture", 0),
             "alpha_mode": model.get("alpha_mode", "OPAQUE"),
             "alpha_cutoff": model.get("alpha_cutoff", 0.5),
             "base_alpha": model.get("base_alpha", 1.0),
@@ -653,6 +656,7 @@ class Scene:
                 _release(m.get("texture"))
                 _release(m.get("metallic_roughness_texture"))
                 _release(m.get("normal_texture"))
+                _release(m.get("emissive_texture"))
             for m in shadow_groups:
                 _release(m.get("vao"))
             return []
@@ -692,6 +696,7 @@ class Scene:
                 "texture": model.get("texture"),
                 "metallic_roughness_texture": model.get("metallic_roughness_texture"),
                 "normal_texture": model.get("normal_texture"),
+                "emissive_texture": model.get("emissive_texture"),
                 "metallic": model.get("metallic", 0.1),
                 "roughness": model.get("roughness", 0.5),
                 "emissive": model.get("emissive", [0.0, 0.0, 0.0]),
@@ -700,6 +705,7 @@ class Scene:
                 "has_texture": model.get("has_texture", 0),
                 "has_metallic_roughness_texture": model.get("has_metallic_roughness_texture", 0),
                 "has_normal_texture": model.get("has_normal_texture", 0),
+                "has_emissive_texture": model.get("has_emissive_texture", 0),
                 "alpha_mode": model.get("alpha_mode", "OPAQUE"),
                 "alpha_cutoff": model.get("alpha_cutoff", 0.5),
                 "base_alpha": model.get("base_alpha", 1.0),
@@ -724,7 +730,7 @@ class Scene:
                     specular_strength_overrides=None, water_overrides=None,
                     double_sided_overrides=None, ignore_source_double_sided=False,
                     collision_overrides=None, collision_object_overrides=None,
-                    base_alpha_overrides=None):
+                    base_alpha_overrides=None, self_illum_overrides=None):
         """collision=True registers a collider for this object in
         self.physics, so a CharacterController (or a dynamic object
         with its own collision=True) can stand/collide on it.
@@ -947,6 +953,35 @@ class Scene:
         reflection_mode works on any near-mirror-smooth material
         regardless.
 
+        self_illum_overrides: optional {material_name: bool} - Source's
+        own $selfillum: True reinterprets that ONE material's base color
+        texture's own ALPHA channel as a self-illumination mask (see
+        pbr_shader.py's u_has_self_illum/main() own self_illum block)
+        instead of transparency, and adds the surface's own full-bright
+        albedo back in as emissive wherever that mask is nonzero -
+        exactly Source's "paint a glow mask into a texture's spare alpha
+        channel" trick, rather than needing a whole separate emissive_
+        texture (see model_loader.py's _extract_material) just for a
+        mask. Only actually does anything for an OPAQUE material - the
+        alpha channel is otherwise completely unused there (an OPAQUE
+        fragment always outputs full alpha regardless - see pbr_
+        shader.py's alpha_mode==0 handling), which is exactly what makes
+        it safe to repurpose; a MASK/BLEND material's alpha is already
+        spoken for (cutout/transparency) and setting this on one would
+        just make its own transparency double as a (wrong) glow mask.
+        Matched by the same material_name as alpha_mode_overrides.
+        Setting this True also clears whatever flat emissiveFactor/
+        emissiveTexture that material's own source file was authored
+        with (model_loader.py's "emissive"/"has_emissive_texture") -
+        self_illum is meant to BE that material's one emissive
+        mechanism (same as Source itself, where $selfillum and a
+        separate emission map aren't both set on one material), not an
+        extra glow stacked on top of an existing one - most likely to
+        actually matter for a material exported with some placeholder/
+        wrong flat emissiveFactor (a re-export default, not deliberate
+        authoring) that would otherwise wash out the whole surface
+        uniformly alongside the real, masked self-illum this adds.
+
         double_sided_overrides: optional {material_name: bool} - forces
         whether ONE specific material back-face culls (False) or not
         (True), overriding whatever Scene._render_scene would otherwise
@@ -1005,6 +1040,11 @@ class Scene:
                 model["base_alpha"] = float(base_alpha_overrides[model["material_name"]])
             if specular_strength_overrides and model.get("material_name") in specular_strength_overrides:
                 model["specular_strength"] = float(specular_strength_overrides[model["material_name"]])
+            if self_illum_overrides and model.get("material_name") in self_illum_overrides:
+                model["self_illum"] = bool(self_illum_overrides[model["material_name"]])
+                if model["self_illum"]:
+                    model["emissive"] = [0.0, 0.0, 0.0]
+                    model["has_emissive_texture"] = 0
             if water_overrides and model.get("material_name") in water_overrides:
                 params = water_overrides[model["material_name"]]
                 if "pan1_speed" in params:
@@ -4531,6 +4571,19 @@ class Scene:
                 blending = is_blend
                 if blending:
                     self.ctx.enable(moderngl.BLEND)
+                    # Explicit, not inherited: particle_system.py's own render() (drawn via
+                    # before_viewmodels, right before this method, every frame an overlay
+                    # effect like a muzzle flash is alive) sets blend_func to its OWN additive
+                    # or premultiplied mode for its own draws, then disables BLEND afterward
+                    # without ever resetting blend_func back - disabling BLEND doesn't reset
+                    # it, it's a separate persistent GL value. Without setting it HERE too,
+                    # a gun's glass/text (this is exactly the alpha_mode this branch is for)
+                    # would silently inherit whatever the last live muzzle flash left behind
+                    # instead of normal straight-alpha blending - confirmed as the actual
+                    # cause of a real bug (firing broke the Gouda Gun's text transparency
+                    # specifically because that's the one frame an overlay particle actually
+                    # draws something, versus returning immediately with nothing live).
+                    self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
                     self._screen.depth_mask = False
                 else:
                     self.ctx.disable(moderngl.BLEND)
@@ -4715,7 +4768,7 @@ class Scene:
     def _release_object(self, obj):
         for key in (
             "vao", "shadow_vao", "lightmap_vao", "lightmap_texture", "sun_lightmap_texture",
-            "texture", "metallic_roughness_texture", "normal_texture", "_material_ubo",
+            "texture", "metallic_roughness_texture", "normal_texture", "emissive_texture", "_material_ubo",
             "_material_ubo_untinted", "tint_mask_texture",
         ):
             _release(obj.get(key))

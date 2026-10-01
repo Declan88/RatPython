@@ -87,7 +87,7 @@ class NetworkManager:
         self.on_footstep = None  # callback(material, position, volume) to play another player's footstep
         self.on_dissolve_spark = None  # callback(position) - a Zap-dissolving remote player's periodic spark/glow burst
         self.on_dissolve_arc = None    # callback(position) - a Zap-dissolving remote player's periodic tesla-arc burst
-        self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name, headshot, push, damage_class) when someone shoots us
+        self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name, headshot, push, damage_class, origin) when someone shoots us - origin: (x,y,z) or None, see send_damage's own docstring
         # callback(killer_steam_id, victim_steam_id, weapon_name, headshot) for
         # EVERY kill in the match this client learns about (see
         # _broadcast_kill/_receive_killfeed) - not just our own, so a kill
@@ -521,7 +521,8 @@ class NetworkManager:
         self.local_alive = True
         self._death_push = None
 
-    def send_damage(self, victim_id, amount, weapon_name="", headshot=False, push=None, damage_class="bullet"):
+    def send_damage(self, victim_id, amount, weapon_name="", headshot=False, push=None, damage_class="bullet",
+                     origin=None):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
         a hit (against the victim's hitbox as the shooter sees it) and the
         victim applies it to their own health - see on_damage. RELIABLE, unlike
@@ -536,6 +537,16 @@ class NetworkManager:
         receiving end, since that's a cosmetic display name ("Gouda Gun"), not a registry id
         the weapon class could be looked back up from.
 
+        origin: optional world-space (x, y, z) where the damage actually originated - a
+        bullet's own impact point, or an explosion's blast centre. Lets the victim's own
+        damage-direction indicator (app.py's on_damaged/DamageIndicator) point at exactly
+        where the hit/blast was, rather than guessing from the attacker's CURRENT position,
+        which is only a reasonable stand-in for a direct hitscan hit (the attacker is
+        standing right where they aimed from) and can be badly wrong for splash damage - an
+        explosion can reach someone standing well off to the side of wherever the attacker
+        themselves is, who would otherwise see an arrow pointing at the attacker instead of
+        the actual blast.
+
         Returns whether it was sent."""
         if victim_id == self.local_steam_id or not self.current_lobby_id:
             return False
@@ -543,6 +554,8 @@ class NetworkManager:
                         "dc": str(damage_class)}
         if push is not None:
             payload_dict["p"] = [round(float(c), 2) for c in push]   # an explosion's shove, for the victim's gibs
+        if origin is not None:
+            payload_dict["o"] = [round(float(c), 2) for c in origin]
         payload = json.dumps(
             payload_dict, separators=(",", ":"),
         ).encode("utf-8")
@@ -570,10 +583,17 @@ class NetworkManager:
                 push = None
             if push is not None and len(push) != 3:
                 push = None
+            origin = message.get("o")
+            try:
+                origin = [float(c) for c in origin][:3] if origin is not None else None
+            except (TypeError, ValueError):
+                origin = None
+            if origin is not None and len(origin) != 3:
+                origin = None
             damage_class = str(message.get("dc", "bullet"))
             if self.on_damage is not None:
                 self.on_damage(amount, sender_id, self._last_attacker_weapon, self._last_attacker_headshot,
-                               push, damage_class)
+                               push, damage_class, origin)
 
     def _receive_killfeed(self, sender_id, message):
         """sender_id is the VICTIM (see _broadcast_kill's own docstring -

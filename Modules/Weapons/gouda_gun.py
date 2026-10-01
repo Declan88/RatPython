@@ -40,8 +40,19 @@ class GoudaGun(USP):
     icon = "Assets/Textures/Icons/Gouda/Gouda.png"
     tracer_style = "laser"
     damage = 5.0                     # direct hit
-    fire_interval = 0.2              # a bit slower than the USP's 0.1
-    explosion = Explosion(radius=3.0, damage=10.0, self_damage_fraction=0.5, push_speed=10.0)
+    fire_interval = 0.23             # a bit slower than the USP's 0.1 (reverted an earlier 0.17
+                                      # tweak, then nudged up again from 0.2 for a bit more rest
+                                      # between shots - shots-to-kill is unaffected, since that's
+                                      # set by damage, not interval; body TTK moves to (5-1)*0.23
+                                      # = 0.92s)
+    # radius unchanged at 5.0 (was 3.0 - still a real reach increase from the original "too
+    # weak" report). damage brought back down from 25.0 to 19.0: every landed shot ALSO deals
+    # its own splash to the same target it hit (near point-blank range, strength ~0.85-0.95 -
+    # see Explosion.strength and app.py's own explode()), so total effective damage per body
+    # shot is direct(5) + splash(19 * ~0.85-0.95 ~= 16-18) = ~21-23 - comfortably in the
+    # ceil(100/x)=5 bracket (any effective damage in [20, 25) kills in exactly 5 body shots),
+    # not 25.0's own ~27-28 effective (4 shots, tied with the USP).
+    explosion = Explosion(radius=5.0, damage=19.0, self_damage_fraction=0.5, push_speed=10.0)
     fire_sound = "Assets/Audio/Guns/Gouda/GoudaBlast.wav"
     # The raygun's effects, recoloured yellow (only these two systems are loaded from the file).
     particle_files = {"Assets/Particles/blast/bo3_raygun.pcf": ["bo3_raygun_impact", "bo3_raygun_muzzleflash"]}
