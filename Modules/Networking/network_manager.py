@@ -537,15 +537,18 @@ class NetworkManager:
         receiving end, since that's a cosmetic display name ("Gouda Gun"), not a registry id
         the weapon class could be looked back up from.
 
-        origin: optional world-space (x, y, z) where the damage actually originated - a
-        bullet's own impact point, or an explosion's blast centre. Lets the victim's own
-        damage-direction indicator (app.py's on_damaged/DamageIndicator) point at exactly
-        where the hit/blast was, rather than guessing from the attacker's CURRENT position,
-        which is only a reasonable stand-in for a direct hitscan hit (the attacker is
-        standing right where they aimed from) and can be badly wrong for splash damage - an
-        explosion can reach someone standing well off to the side of wherever the attacker
-        themselves is, who would otherwise see an arrow pointing at the attacker instead of
-        the actual blast.
+        origin: optional world-space (x, y, z) where the damage actually originated - the
+        SHOOTER's own position at the moment of a direct hitscan hit (not the point the
+        bullet struck the victim - a spot on their own hitbox a few tenths of a metre
+        across that says nothing about the shooter's bearing from them, and only gets
+        noisier, as a swing in indicated direction, the farther apart the two of them are),
+        or an explosion's blast centre. Lets the victim's own damage-direction indicator
+        (app.py's on_damaged/DamageIndicator) point at exactly where the shot/blast came
+        from, rather than guessing from the attacker's CURRENT (replicated, possibly
+        slightly stale) position, which is only a fallback for an older/odd message with no
+        origin and can be badly wrong for splash damage - an explosion can reach someone
+        standing well off to the side of wherever the attacker themselves is, who would
+        otherwise see an arrow pointing at the attacker instead of the actual blast.
 
         Returns whether it was sent."""
         if victim_id == self.local_steam_id or not self.current_lobby_id:

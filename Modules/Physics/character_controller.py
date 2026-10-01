@@ -139,6 +139,29 @@ _MAX_BUMPS = 4
 # tie-break needs to keep detecting correctly.
 _STEP_TIE_EPSILON_SQ = 1e-4
 
+# How much narrower (per side, in X and Z) the probe used for _categorize_position's ground
+# check and _step_slide_move's up/down sweeps is than the player's real hull. Those three
+# sweeps are all purely VERTICAL and only ever care about what's directly below/above the
+# hull's own footprint - but run with the FULL-width hull, right at the moment the player is
+# pressed flush against a low obstacle (exactly the moment stepping up onto it matters most),
+# they catch that obstacle's own front-top EDGE instead of the floor or the obstacle's flat
+# top: the hull's leading face already touches the obstacle before its CENTER has crossed
+# over it, so a straight-down sweep from there grazes the corner where the obstacle's front
+# and top faces meet (a blended, non-floor-like normal, confirmed directly: a sweep from a
+# hull still short of a 0.1m-tall box reported a hit with normal.y around 0.24-0.30, well
+# under max_slope_cos) and gets rejected as "not walkable" - ground detection then flickers
+# grounded/not-grounded tick to tick (disabling stepping on the "not grounded" ticks and,
+# worse, fully clipping velocity to zero via the flat-only path each time), and even once
+# genuinely grounded, the step-up's own down-settle sweep hits the same corner and rejects
+# the climb outright - reproduced directly: a flat-topped obstacle well under step_height
+# (0.1-0.49m against a 0.5m step_height) simply never got climbed, confirmed via a dedicated
+# physics-only test, no matter how long forward input was held. Narrowing the probe by more
+# than this inset clears the obstacle's edge entirely once the hull's CENTER is still short
+# of it (no longer spanning both the open floor and the obstacle at once), letting the sweep
+# find the real ground cleanly; 0.15m verified (same test) to climb every height from 0.1m up
+# to the 0.5m step_height cleanly while still correctly refusing anything taller.
+_VERTICAL_PROBE_INSET = 0.15
+
 # Direct port of the constants in Source SDK 2013's
 # CBasePlayer::UpdateStepSound / GetStepSoundVelocities /
 # SetStepSoundTime (game/shared/baseplayer_shared.cpp) - confirmed by
@@ -253,6 +276,17 @@ class CharacterController:
         self._current_shape = self._standing_shape
         self._current_height = self.height
 
+        # A narrower stand-in for self._current_shape, used ONLY for _categorize_position's
+        # ground probe and _step_slide_move's up/down vertical sweeps (never for the flat/
+        # stepped horizontal moves, which need the real width to collide correctly) - see
+        # _VERTICAL_PROBE_INSET's own docstring for why the full-width hull can't be used there.
+        probe_radius = max(0.05, self.radius - _VERTICAL_PROBE_INSET)
+        self._standing_vertical_probe_shape = BulletBoxShape(
+            to_physics_extent((probe_radius, self.height / 2.0, probe_radius)))
+        self._crouch_vertical_probe_shape = BulletBoxShape(
+            to_physics_extent((probe_radius, self._crouch_height / 2.0, probe_radius)))
+        self._current_vertical_probe_shape = self._standing_vertical_probe_shape
+
         # A single persistent BulletGhostNode for the whole lifetime of
         # the controller - crouching swaps its shape in place (see
         # _swap_to_shape) via addShape/removeShape, confirmed to work
@@ -310,6 +344,11 @@ class CharacterController:
         self._grounded = False
         self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
         self._ground_material = None
+        # _step_slide_move's flat-vs-stepped tie-break (see its own comment): which candidate
+        # won LAST tick, reused as the default whenever this tick is a near-tie again, instead
+        # of deciding fresh every time - see that comment for why a persistent near-tie needs
+        # this to avoid a visible stutter.
+        self._last_step_was_flat = False
 
         # Footstep cadence bookkeeping - see _update_footsteps and
         # pop_footstep(). Mirrors Source's m_flStepSoundTime: counts
@@ -402,7 +441,10 @@ class CharacterController:
 
         pos = to_render_pos(self.node_path.getPos())
         probe_to = glm.vec3(pos.x, pos.y - _GROUND_TRACE_DISTANCE, pos.z)
-        result = self._sweep(self._current_shape, pos, probe_to)
+        # Narrower than the real hull (see _VERTICAL_PROBE_INSET) - the full-width hull, right
+        # when the player is pressed flush against a low obstacle, catches that obstacle's own
+        # front-top edge here instead of the real floor beneath, flickering grounded on and off.
+        result = self._sweep(self._current_vertical_probe_shape, pos, probe_to)
         if result.hasHit():
             normal = to_render_vec(result.getHitNormal())
             if normal.y >= self._max_slope_cos:
@@ -504,7 +546,9 @@ class CharacterController:
 
         if self._grounded:
             up_target = glm.vec3(start_pos.x, start_pos.y + self.step_height, start_pos.z)
-            up_result = self._sweep(self._current_shape, start_pos, up_target)
+            # Narrower than the real hull (see _VERTICAL_PROBE_INSET), same reasoning as
+            # _categorize_position's own ground probe.
+            up_result = self._sweep(self._current_vertical_probe_shape, start_pos, up_target)
             # Only a genuine ceiling overhead (a surface actually facing
             # DOWN into the sweep, normal.y meaningfully negative) should
             # clamp the step height - a normal near/above 0 means the
@@ -549,7 +593,12 @@ class CharacterController:
             horiz_dist = math.sqrt(horiz_dx * horiz_dx + horiz_dz * horiz_dz)
             settle_distance = self.step_height + horiz_dist * self._max_slope_tan + 0.05
             down_target = glm.vec3(step_pos.x, step_pos.y - settle_distance, step_pos.z)
-            down_result = self._sweep(self._current_shape, step_pos, down_target)
+            # Narrower than the real hull (see _VERTICAL_PROBE_INSET) - this is the sweep that
+            # was confirmed (via a dedicated physics-only test) to catch a short obstacle's own
+            # front-top edge and reject an otherwise-climbable step as "not walkable ground"
+            # while the hull's center is still short of the obstacle, even though its own
+            # leading face already touches it (the moment stepping up matters most).
+            down_result = self._sweep(self._current_vertical_probe_shape, step_pos, down_target)
             # A step is only valid if it actually lands back on walkable
             # ground - without this, sliding past a wall above
             # step_height's reach (grazing a corner, or a wall shorter
@@ -595,7 +644,29 @@ class CharacterController:
                 # docstring for why this comparison needs a real
                 # tolerance rather than an exact ">" (a too-tight one
                 # visibly vibrated the character against any wall).
+                # Moving diagonally up a slope (forward+strafe together, not straight up the
+                # fall line) is a genuine, PERSISTENT near-tie, not sweep noise: the flat
+                # attempt's clip against the slope only removes the into-slope part of vel, so
+                # the more of the player's input is sideways-along-the-slope rather than
+                # straight up it, the closer flat_dist_sq sits to step_dist_sq every single
+                # tick - unlike the wall-vibration case the epsilon above already covers, this
+                # doesn't average out. Deciding fresh each tick inside that near-tie band still
+                # flips the winner tick to tick on which candidate's own sweep noise happened to
+                # land fractionally ahead, and flat_vel/step_vel genuinely differ (flat_vel is
+                # slope-clipped and slower, step_vel carries the raw unclipped input speed) - so
+                # flipping pulses the player's speed up and down while climbing, reading as a
+                # stutter even though neither candidate is more "correct" than the other here.
+                # Sticking with whichever one won last tick while inside the band (only crossing
+                # when one candidate pulls unambiguously ahead by more than the epsilon) turns
+                # that flicker into a single stable choice for as long as the tie persists.
                 if flat_dist_sq > step_dist_sq + _STEP_TIE_EPSILON_SQ:
+                    flat_wins = True
+                elif step_dist_sq > flat_dist_sq + _STEP_TIE_EPSILON_SQ:
+                    flat_wins = False
+                else:
+                    flat_wins = self._last_step_was_flat
+                self._last_step_was_flat = flat_wins
+                if flat_wins:
                     final_pos, final_vel = flat_pos, flat_vel
                 else:
                     final_pos, final_vel = settled_pos, step_vel
@@ -606,6 +677,25 @@ class CharacterController:
 
         self.node_path.setPos(to_physics_pos(final_pos))
         self.velocity = final_vel
+        # The "flat" candidate's own ClipVelocity (inside _try_move) is what makes it climb a
+        # slope in the first place - the clipped vector is tangent to the slope, so it carries a
+        # genuine nonzero Y the moment this tick's input has any into-slope component. Left in
+        # self.velocity for the NEXT tick to inherit, that positive Y satisfies _categorize_
+        # position's OWN "velocity.y > 0 means airborne" test - which this file's own docstrings
+        # assume can only ever happen from an actual jump - so the very next tick skips the
+        # ground probe outright and reports not-grounded, despite the hull sitting right on the
+        # slope's surface with real horizontal speed. That one false "not grounded" tick skips
+        # stepping (disabling it for one tick) and, worse, lets THIS tick's flat-only path clip
+        # velocity straight to near-zero against the slope - exactly a stutter, and more likely
+        # the more of the player's movement is sideways-along-the-slope (see _STEP_TIE_EPSILON_
+        # SQ's own comment on near-ties above) since that's when "flat" wins over "step" more
+        # often. Harmless to clear here regardless of which candidate won: conforming to a
+        # slope/small ledge is handled by this method's own position-based settle every tick,
+        # never by carrying a persistent vertical speed between ticks (see _on_pre_substep's own
+        # landed-velocity-reset, which already does exactly this for the negative/falling case -
+        # this is that same invariant restored for the positive/climbing case it missed).
+        if self._grounded:
+            self.velocity.y = 0.0
 
     # -----------------------------------------------------------------
     # Public control surface (unchanged from the previous version)
@@ -815,6 +905,9 @@ class CharacterController:
 
         self._current_shape = shape
         self._current_height = total_height
+        self._current_vertical_probe_shape = (
+            self._crouch_vertical_probe_shape if shape is self._crouch_shape
+            else self._standing_vertical_probe_shape)
 
         # This recenter is an intentional, instant repositioning - not
         # per-tick sweep-test noise, so it must bypass get_position()'s

@@ -1513,9 +1513,18 @@ def main():
                             damage_dummy(shot.damage, weapon.name, shot.headshot,
                                         damage_class=weapon.damage_class.name)
                         else:
+                            # origin: where the shot came FROM, for the victim's own damage-
+                            # direction indicator (see on_damaged/DamageIndicator) - our own
+                            # position at the moment we fired, not shot.hit.position (where the
+                            # bullet struck THEM, a point on their own hitbox a few tenths of a
+                            # metre across that has nothing to do with our direction from them;
+                            # confirmed as exactly why the indicator read as inaccurate,
+                            # especially at range, where a few tenths of a metre of "where on my
+                            # body did it land" noise swings the shown bearing by a lot more
+                            # degrees than it does up close).
                             net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot,
                                                 damage_class=weapon.damage_class.name,
-                                                origin=tuple(shot.hit.position))
+                                                origin=tuple(camera.position))
 
         prof.mark("camera + weapons")
 
