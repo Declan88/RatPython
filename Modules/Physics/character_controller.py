@@ -338,6 +338,13 @@ class CharacterController:
         self._move_direction = glm.vec3(0.0)
         self._sprinting = False
         self._jump_requested = False
+        # True from the instant a REAL jump executes (see _on_pre_substep) until its
+        # rise is over (velocity.y drops back to <=0 - see _categorize_position's own
+        # clear condition) - what _categorize_position actually skips the ground probe
+        # for, instead of keying off raw velocity.y > 0 (see its own docstring for why
+        # that was wrong: a slope-clip artifact can ALSO produce a transient positive
+        # Y with no jump involved at all).
+        self._jumping = False
         self._crouch_input = False
         self._is_crouched = False
         self._crouch_amount = 0.0  # 0 = standing, 1 = fully crouched (eased, see get_eye_offset)
@@ -382,6 +389,18 @@ class CharacterController:
         self._pending_jump_event = False
         self._fall_speed_on_touch = 0.0
 
+        # One-off diagnostic toggle (see toggle_debug_log/app.py's own debug keybind) -
+        # prints every physics tick's velocity/grounded/jumping/ground_normal straight to
+        # the console while True, so a landing/slide bug can be inspected tick-by-tick
+        # instead of guessed at from how it LOOKS on screen. Off by default - not meant to
+        # stay on during normal play.
+        self._debug_log = False
+        self._debug_tick = 0
+        self._debug_trace_distance = 0.0
+        self._debug_probe_hit = False
+        self._debug_probe_normal_y = None
+        self._debug_probe_fraction = None
+
         # Last completed substep's (smoothed - see _on_pre_substep)
         # render-space position, for get_position() to interpolate
         # from - see PhysicsWorld.get_interpolation_alpha()'s
@@ -406,45 +425,125 @@ class CharacterController:
         to_ts = TransformState.makePos(to_physics_pos(to_render_pos_))
         return self._physics_world.world.sweepTestClosest(shape, from_ts, to_ts, self._sweep_mask, 0.0)
 
-    def _categorize_position(self):
-        """Source's CGameMovement::CategorizePosition: a short, fixed-
-        distance downward trace (independent of velocity) to determine
-        ground contact and the ground normal, run BEFORE movement each
-        tick using last tick's settled position.
+    def _categorize_position(self, dt):
+        """Source's CGameMovement::CategorizePosition: a short downward trace to determine
+        ground contact and the ground normal, run BEFORE movement each tick using last
+        tick's settled position.
 
-        Skips the trace entirely (unconditionally airborne) whenever
-        velocity.y is positive - confirmed as a real, reproducible bug
-        without this: a single tick's rise (jump_speed * dt) can be
-        smaller than _GROUND_TRACE_DISTANCE, so the very next tick's
-        trace re-detects the floor and sets grounded back to True
+        The trace distance is normally the fixed _GROUND_TRACE_DISTANCE, but is extended
+        to cover THIS tick's expected fall distance (-velocity.y * dt) whenever that's
+        bigger - see the "sliding after any jump" bug this fixes, below.
+
+        Why that extension is needed: without it, a fall fast enough that one tick's
+        travel exceeds the fixed trace distance reaches the floor BEFORE this probe ever
+        sees it coming - the probe (run on LAST tick's position) reports not-grounded,
+        so the fall continues through the normal airborne path, and the floor is instead
+        discovered mid-tick by _step_slide_move's own collision sweep (_try_move), which
+        hits it and runs it through the SAME generic _clip_velocity used for walls. For a
+        perfectly flat floor (normal exactly (0,1,0)) that clip only zeroes the vertical
+        component, harmlessly - but for ANY other walkable-but-not-perfectly-flat surface
+        (a ramp, a stair tread, a slightly uneven floor tile - i.e. nearly everything in a
+        real level), clipping a large downward velocity against a tilted normal leaves a
+        genuine horizontal remainder along the surface's own tangent (exactly like a ball
+        deflecting off a ramp - physically correct for an object, wrong for a player who
+        should just land and stop). That remainder is real self.velocity, grounded is
+        still False THAT tick so neither the dedicated "landed -> zero velocity.y" line
+        below nor ground friction ever touches it, and it only starts bleeding off via
+        friction from the NEXT tick onward - reading exactly as "landing puts me in a
+        sliding state," on any surface, not just steep ones, since a typical landing fall
+        speed is comfortably past the fixed trace distance's reach (confirmed: jump_speed
+        itself, 6.0 m/s, already travels _GROUND_TRACE_DISTANCE's 0.0508m in under 0.0085s
+        - under one tick at 120Hz - so even a dead-level jump's landing speed alone is
+        right at this threshold, and landing anywhere even slightly below launch height
+        clears it easily). Extending the trace to always reach at least this tick's own
+        fall distance guarantees the dedicated landing path (the explicit vel.y=0 zeroing
+        a few lines down in _on_pre_substep) is what actually catches every landing,
+        instead of the generic wall-sliding clip math catching it first by accident.
+
+        Skips the trace entirely (unconditionally airborne) while self._jumping is
+        true - confirmed as a real, reproducible bug without this: a single tick's
+        rise (jump_speed * dt) can be smaller than _GROUND_TRACE_DISTANCE, so the
+        very next tick's trace re-detects the floor and sets grounded back to True
         immediately after a jump. Since the landing-velocity-reset in
-        _on_pre_substep only clears NEGATIVE velocity, that leaves the
-        hull re-grounded while still nominally carrying jump_speed -
-        and because _step_slide_move's grounded branch re-settles the
-        hull onto the floor every tick regardless of velocity's sign,
-        the jump silently goes nowhere: velocity is genuinely
-        jump_speed the whole time, but the hull never actually leaves
-        the ground. Rising can only ever mean "airborne, most likely
-        mid-jump" in this system in the first place - grounded movement
-        always holds velocity.y at exactly 0 or lets gravity pull it
-        negative, nothing here ever produces an ambiguous small
-        positive value the way a real trace-based engine occasionally
-        does from ramps/bumps - so there's no real ambiguity being
-        papered over by skipping the trace here. This mirrors Source's
-        own CategorizePosition, which skips ground detection outright
-        above NON_JUMP_VELOCITY for exactly this reason."""
-        if self.velocity.y > 0.0:
+        _on_pre_substep only clears NEGATIVE velocity, that leaves the hull
+        re-grounded while still nominally carrying jump_speed - and because
+        _step_slide_move's grounded branch re-settles the hull onto the floor every
+        tick regardless of velocity's sign, the jump silently goes nowhere: velocity
+        is genuinely jump_speed the whole time, but the hull never actually leaves
+        the ground.
+
+        This used to key off "self.velocity.y > 0.0" directly (treating ANY rise as
+        "must be mid-jump, skip the probe), on the theory that grounded movement
+        never produces an ambiguous positive Y value the way a real trace-based
+        engine occasionally does from ramps/bumps. That theory is WRONG - confirmed
+        directly: _try_move's own ClipVelocity, airborne, against a steep-but-
+        walkable slope, DOES produce a genuine positive clipped.y whenever the
+        incoming horizontal velocity has enough of an UPHILL component relative to
+        the current fall speed (sliding "up and along" the slope's own tangent
+        plane, exactly like a ball thrown at a ramp can deflect upward off it) -
+        reliably reproduced by holding movement input pointed away from a slope's
+        own downhill direction while falling onto it (fast enough fall, enough
+        opposing horizontal speed). Keying off raw velocity.y there meant a player
+        who landed that way got stuck: self._grounded would never go True again
+        (every tick's clip re-produces a positive Y off the slope, re-triggering
+        the skip), sliding down the incline in what LOOKS like ordinary falling
+        (gravity still visibly pulling them down, the hull still in contact with
+        the slope) but with the ground probe never actually running - so jump()
+        never fires either (it requires self._grounded) - until the hull finally
+        slides clear of the incline onto flat ground where the artifact can't
+        recur. self._jumping (see the jump-request handling and its own clear
+        condition further down) instead tracks a REAL jump explicitly, so a
+        slope-clip artifact's transient positive Y can never masquerade as one -
+        the probe still runs on every such tick, correctly re-grounds as soon as
+        the hit normal comes back within max_slope_cos, same as any other landing."""
+        if self._jumping and self.velocity.y <= 0.0:
+            # The jump's rise is over (gravity's caught up - falling now, same
+            # threshold the old velocity.y-based check used) - clear it so the
+            # probe resumes running normally for the actual fall/landing, exactly
+            # like a genuine jump always has.
+            self._jumping = False
+        if self._jumping:
             self._grounded = False
             self._ground_normal = glm.vec3(0.0, 1.0, 0.0)
             self._ground_material = None
             return
 
         pos = to_render_pos(self.node_path.getPos())
-        probe_to = glm.vec3(pos.x, pos.y - _GROUND_TRACE_DISTANCE, pos.z)
+        # See this method's own docstring on why the trace must reach at least this
+        # tick's own expected fall distance, not just the fixed baseline, whenever
+        # falling faster than that baseline would cover.
+        trace_distance = max(_GROUND_TRACE_DISTANCE, -self.velocity.y * dt)
+        probe_to = glm.vec3(pos.x, pos.y - trace_distance, pos.z)
         # Narrower than the real hull (see _VERTICAL_PROBE_INSET) - the full-width hull, right
         # when the player is pressed flush against a low obstacle, catches that obstacle's own
         # front-top edge here instead of the real floor beneath, flickering grounded on and off.
         result = self._sweep(self._current_vertical_probe_shape, pos, probe_to)
+        if not result.hasHit() and self._grounded:
+            # The narrower probe (see _VERTICAL_PROBE_INSET) can genuinely miss a surface
+            # the player is still resting on - confirmed directly via this file's own
+            # debug_log (F6): on some slopes, _try_move's own collision response (which
+            # uses the REAL, full-width hull - self._current_shape) kept finding and
+            # resolving contact against the floor every single tick, while this narrower,
+            # straight-down-only probe reported no hit at all for hundreds of consecutive
+            # ticks in a row, each one stomping self._grounded back to False moments after
+            # _step_slide_move had just set it True from that same real contact (see its
+            # own discovered_ground comment) - a flip-flop every tick that reset grounded
+            # to False before anything (friction, jump eligibility) downstream of THIS
+            # call ever got to see it True. Retried with the actual hull width ONLY when
+            # already grounded (never while first approaching/climbing something, where
+            # the narrower probe's edge-avoidance - see its own docstring - still matters)
+            # since that's the exact shape _try_move keeps successfully colliding with;
+            # only a genuine, real departure from the floor should fail THIS too.
+            result = self._sweep(self._current_shape, pos, probe_to)
+        if self._debug_log:
+            # Raw probe result, independent of whatever _categorize_position's own verdict
+            # ends up being below - see the print in _on_pre_substep, which needs this to
+            # tell "probe found nothing at all" apart from "probe found something but
+            # rejected it as too steep".
+            self._debug_trace_distance = trace_distance
+            self._debug_probe_hit = result.hasHit()
+            self._debug_probe_normal_y = to_render_vec(result.getHitNormal()).y if result.hasHit() else None
+            self._debug_probe_fraction = result.getHitFraction() if result.hasHit() else None
         if result.hasHit():
             normal = to_render_vec(result.getHitNormal())
             if normal.y >= self._max_slope_cos:
@@ -482,13 +581,19 @@ class CharacterController:
         along the CREASE where two hit planes meet this call rather
         than getting stuck if the clipped velocity would drive back
         into an earlier plane. Pure function - does not touch self.*,
-        just returns the resulting (pos, vel) so callers (see
-        _step_slide_move) can try more than one candidate move and
-        keep whichever is better."""
+        just returns the resulting (pos, vel, ground_normal) so callers (see
+        _step_slide_move) can try more than one candidate move and keep
+        whichever is better. ground_normal is None unless this call's own sweep
+        directly touched a walkable floor/ramp (see the landing branch below) -
+        _step_slide_move uses that to set self._grounded immediately, rather
+        than only ever waiting on _categorize_position's separate, narrower,
+        straight-down-only probe to rediscover the same contact a tick later -
+        see _step_slide_move's own comment on why that matters."""
         pos = glm.vec3(start_pos)
         vel = glm.vec3(start_vel)
         time_left = dt
         hit_normals = []
+        ground_normal = None
 
         for _ in range(_MAX_BUMPS):
             if time_left <= 1e-9 or glm.length(vel) < 1e-6:
@@ -508,7 +613,50 @@ class CharacterController:
             pos = pos + normal * _SURFACE_PUSHBACK
             hit_normals.append(normal)
 
-            new_vel = self._clip_velocity(vel, normal)
+            if normal.y >= self._max_slope_cos:
+                # Touched a walkable surface THIS sweep, however this call ends up
+                # resolving velocity below - worth reporting back regardless of whether
+                # vel.y happened to be negative at this exact bump (a sliding-but-not-
+                # currently-falling contact, e.g. one already leveled off by an earlier
+                # bump this same call, still counts as real ground contact).
+                ground_normal = normal
+
+            if normal.y >= self._max_slope_cos and vel.y < 0.0:
+                # Falling straight into a walkable floor/ramp - a LANDING, not a wall to
+                # slide along. Clipping the FULL incoming vector (vel, including its big
+                # negative Y) against the hit plane - what the generic _clip_velocity
+                # below does, correct for a wall - converts part of the fall speed into a
+                # genuine NEW horizontal velocity along the slope's downhill tangent:
+                # physically accurate for a bouncing/skidding object, but not how a
+                # Source-style player should land (confirmed as the earlier cause of
+                # "landing anywhere slides downhill, picking up speed with every landing
+                # until the bottom").
+                #
+                # The fix isn't simply discarding vel.y outright and keeping the
+                # horizontal part dead level, either - confirmed via this file's own
+                # debug_log (F6) that doing exactly that breaks ground adherence on any
+                # DESCENDING slope: moving dead level from a point sitting right on a
+                # downward-curving ramp immediately carries the hull up and away from it,
+                # since the surface drops out from under a level path. A few ticks later
+                # gravity pulls it back down into the ramp again, gets leveled off again,
+                # drifts away again - a repeating bounce that never gives
+                # _categorize_position's own short ground probe (see its own docstring)
+                # a chance to ever latch onto "grounded", confirmed directly in the log as
+                # grounded staying False for the rest of the session after one jump. Since
+                # friction only ever runs while grounded, that's a permanent, undecaying
+                # slide - matching "still sliding, now ALONG the slope" exactly.
+                #
+                # Clipping just the HORIZONTAL part of vel (vel.y already discarded, so
+                # there's nothing left to convert into unwanted NEW speed) against the
+                # same normal re-projects it onto the slope's own tangent - i.e. it keeps
+                # following the ramp's downward direction, hugging the surface, instead of
+                # going dead level and drifting off it. For an exactly flat floor
+                # (normal.y == 1) this is a no-op (dot(horiz_vel, (0,1,0)) is already 0),
+                # so flat-ground landings are completely unaffected.
+                horiz_vel = glm.vec3(vel.x, 0.0, vel.z)
+                new_vel = self._clip_velocity(horiz_vel, normal)
+            else:
+                new_vel = self._clip_velocity(vel, normal)
             for other in hit_normals[:-1]:
                 if glm.dot(new_vel, other) < 0.0:
                     # The plane we just clipped against would send us
@@ -525,7 +673,7 @@ class CharacterController:
                     break
             vel = new_vel
 
-        return pos, vel
+        return pos, vel, ground_normal
 
     def _step_slide_move(self, dt):
         """Source's CGameMovement::StepMove: while grounded, tries the
@@ -538,11 +686,16 @@ class CharacterController:
         approach, which is what makes small steps/slopes invisible to
         the player while a genuine wall still stops them. Airborne,
         there's no stepping at all (matches Source - AirMove never
-        steps), just the flat attempt."""
+        steps), just the flat attempt.
+
+        Also the only place self._grounded is ever set TRUE outside of
+        _categorize_position's own dedicated probe - see discovered_ground's own
+        comment below for why that probe alone isn't reliable enough to be the sole
+        path back into "grounded" after becoming airborne."""
         start_pos = to_render_pos(self.node_path.getPos())
         start_vel = glm.vec3(self.velocity)
 
-        flat_pos, flat_vel = self._try_move(self._current_shape, start_pos, start_vel, dt)
+        flat_pos, flat_vel, flat_ground = self._try_move(self._current_shape, start_pos, start_vel, dt)
 
         if self._grounded:
             up_target = glm.vec3(start_pos.x, start_pos.y + self.step_height, start_pos.z)
@@ -569,7 +722,7 @@ class CharacterController:
             else:
                 raised_pos = up_target
 
-            step_pos, step_vel = self._try_move(self._current_shape, raised_pos, start_vel, dt)
+            step_pos, step_vel, step_ground = self._try_move(self._current_shape, raised_pos, start_vel, dt)
 
             # A fixed settle_distance (just step_height + a small pad)
             # is enough to reach back down to a walkable ramp/stairs
@@ -667,16 +820,35 @@ class CharacterController:
                     flat_wins = self._last_step_was_flat
                 self._last_step_was_flat = flat_wins
                 if flat_wins:
-                    final_pos, final_vel = flat_pos, flat_vel
+                    final_pos, final_vel, discovered_ground = flat_pos, flat_vel, flat_ground
                 else:
-                    final_pos, final_vel = settled_pos, step_vel
+                    final_pos, final_vel, discovered_ground = settled_pos, step_vel, step_ground
             else:
-                final_pos, final_vel = flat_pos, flat_vel
+                final_pos, final_vel, discovered_ground = flat_pos, flat_vel, flat_ground
         else:
-            final_pos, final_vel = flat_pos, flat_vel
+            final_pos, final_vel, discovered_ground = flat_pos, flat_vel, flat_ground
 
         self.node_path.setPos(to_physics_pos(final_pos))
         self.velocity = final_vel
+        if discovered_ground is not None:
+            # _try_move's own collision sweep just directly touched a walkable floor/ramp
+            # THIS tick - trust that immediately rather than waiting on
+            # _categorize_position's separate, narrower, straight-down-only probe to
+            # independently rediscover the same contact (possibly not until next tick, if
+            # ever): confirmed via this file's own debug_log (F6) that after landing on a
+            # sloped surface, that probe can keep reporting hit=False indefinitely even
+            # while the player is plainly resting on/sliding along the exact surface
+            # _try_move keeps colliding with every tick - a straight vertical ray only
+            # has to miss a tilted plane by a little to never reach it within its own
+            # short fixed reach, especially from a contact point offset to the side of
+            # where the hull center's own straight-down ray would land. Every tick that
+            # keeps missing is a tick _grounded stays False, which means friction never
+            # runs (see the grounded-gated branches in _on_pre_substep) - a slide that
+            # never decays. Setting it here, from ground contact _try_move already
+            # confirmed directly, closes that gap instead of depending on the probe ever
+            # managing to independently confirm the same thing.
+            self._grounded = True
+            self._ground_normal = discovered_ground
         # The "flat" candidate's own ClipVelocity (inside _try_move) is what makes it climb a
         # slope in the first place - the clipped vector is tangent to the slope, so it carries a
         # genuine nonzero Y the moment this tick's input has any into-slope component. Left in
@@ -740,6 +912,15 @@ class CharacterController:
         self._prev_position = to_render_pos(self.node_path.getPos())
         self._smoothed_position = glm.vec3(self._prev_position)
         self._grounded = False
+        self._jumping = False
+
+    def toggle_debug_log(self):
+        """Flips the per-physics-tick console dump on/off (see self._debug_log's own
+        comment) - returns the new state so a caller (app.py's debug keybind) can also
+        reflect it somewhere on screen if useful."""
+        self._debug_log = not self._debug_log
+        self._debug_tick = 0
+        return self._debug_log
 
     def is_on_ground(self):
         return self._grounded
@@ -1012,7 +1193,16 @@ class CharacterController:
         # tick's movement - matches Source's CategorizePosition, which
         # runs at the start of PlayerMove using the position left over
         # from the previous frame.
-        self._categorize_position()
+        self._categorize_position(dt)
+        if self._debug_log:
+            # Snapshot of categorize_position's own verdict, before anything below
+            # (jump handling, friction/gravity, step_slide_move) can change it - see the
+            # print at the bottom of this method for why both this and the post-move
+            # state matter.
+            debug_pre_grounded = self._grounded
+            debug_pre_jumping = self._jumping
+            debug_pre_normal = glm.vec3(self._ground_normal)
+            debug_pre_vel = glm.vec3(self.velocity)
 
         # Captured immediately after categorize_position, BEFORE the
         # jump-request handling below can clear self._grounded again -
@@ -1045,12 +1235,16 @@ class CharacterController:
             # velocity so it doesn't accumulate call after call; actual
             # ground-conforming (slopes, small ledges) is handled by
             # _step_slide_move's position-based settle, not by feeding
-            # it a persistent downward speed.
+            # it a persistent downward speed. Horizontal velocity is
+            # deliberately left alone - fall momentum carries through
+            # into the landing, same as every other velocity-driven move
+            # here.
             self.velocity.y = 0.0
 
         if self._jump_requested and self._grounded:
             self.velocity.y = self.jump_speed
             self._grounded = False
+            self._jumping = True
             self._pending_jump_event = True
         self._jump_requested = False
 
@@ -1063,6 +1257,30 @@ class CharacterController:
             self._air_accelerate(wishdir, wishspeed, self.air_accel, dt)
 
         self._step_slide_move(dt)
+
+        if self._debug_log:
+            # One line per physics tick: the ground verdict/velocity BEFORE this tick's
+            # jump/gravity/move handling ran ("pre", i.e. exactly what categorize_position
+            # saw) next to the velocity/position AFTER _step_slide_move settled this
+            # tick's actual move ("post") - printed together so a landing/slide tick is
+            # visible as one line showing both "what the probe thought" and "what the
+            # move actually did to velocity", instead of needing to cross-reference two
+            # separate prints.
+            self._debug_tick += 1
+            pos = to_render_pos(self.node_path.getPos())
+            horiz_speed = math.hypot(self.velocity.x, self.velocity.z)
+            print(
+                f"[movedbg #{self._debug_tick}] "
+                f"pre(grounded={debug_pre_grounded}, jumping={debug_pre_jumping}, "
+                f"normal=({debug_pre_normal.x:.3f},{debug_pre_normal.y:.3f},{debug_pre_normal.z:.3f}), "
+                f"vel=({debug_pre_vel.x:.3f},{debug_pre_vel.y:.3f},{debug_pre_vel.z:.3f})) "
+                f"probe(trace_dist={self._debug_trace_distance:.4f}, hit={self._debug_probe_hit}, "
+                f"normal_y={self._debug_probe_normal_y}, fraction={self._debug_probe_fraction}) "
+                f"post(grounded={self._grounded}, "
+                f"vel=({self.velocity.x:.3f},{self.velocity.y:.3f},{self.velocity.z:.3f}), "
+                f"horiz_speed={horiz_speed:.3f}, "
+                f"pos=({pos.x:.3f},{pos.y:.3f},{pos.z:.3f}))"
+            )
 
         self._update_footsteps(dt)
 

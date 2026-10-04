@@ -51,6 +51,25 @@ class GameMode:
         (random choice, avoiding other players - see Deathmatch)."""
         return self.spawn_points[0]
 
+    def choose_spawn_rotation(self):
+        """(yaw, pitch) degrees the camera snaps to on every (re)spawn - same
+        call sites as choose_spawn_position (app.py's setup_game/start_game's
+        reuse path/end_death), always applied together with it. A FIXED value
+        deliberately - a respawning player's camera used to just keep
+        whatever orientation it already had (frozen from the death animation,
+        or carried over from however the menu camera happened to be looking),
+        which let a player choose which way they'd be facing the instant they
+        respawned by choosing where to look right before dying. Spawning
+        looking a known, fixed direction removes that - nobody can set up
+        their own respawn facing. -90.0 matches Camera's own default yaw (see
+        Modules/Camera/camera.py) purely so a spawn with no real mode
+        configured yet looks the same direction Camera already starts facing
+        before any match begins, not for any deeper reason. Override for a
+        mode that wants each spawn POINT to face a particular way (a per-
+        point yaw stored alongside spawn_points, say) instead of one fixed
+        direction for every spawn."""
+        return -90.0, 0.0
+
     def on_kill(self, killer_id, victim_id, weapon_name=""):
         """Called once for every kill THIS client has full information for -
         in practice that's only kills the local player scored (app.py wires

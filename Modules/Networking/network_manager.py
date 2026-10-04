@@ -521,6 +521,30 @@ class NetworkManager:
         self.local_alive = True
         self._death_push = None
 
+    def notify_emote(self, emote_name):
+        """Reliable 1-message broadcast, to every OTHER lobby member, that we
+        just started playing `emote_name` - same shape as _broadcast_kill
+        (own-authority, discrete, reliable event; no counter/ack needed since
+        there's nothing to lose that matters - a dropped emote packet just
+        means that one peer doesn't see it play, same failure mode kill feed
+        already accepts). "en" (not bare "n") for the name field - the regular
+        movement packet already uses "n" for the sender's display name (see
+        RemotePlayer.receive_state); this is a separate packet type handled by
+        its own early-return branch in handle_data, so there's no actual
+        collision, but a distinct key avoids confusing the two while reading
+        the dispatch code."""
+        if not self.current_lobby_id:
+            return
+        payload = json.dumps(
+            {"em": 1, "en": str(emote_name)}, separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            for member_id in self.client.get_lobby_members(self.current_lobby_id):
+                if member_id != self.local_steam_id:
+                    self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
+        except Exception:
+            pass
+
     def send_damage(self, victim_id, amount, weapon_name="", headshot=False, push=None, damage_class="bullet",
                      origin=None):
         """Tells `victim_id` they were shot for `amount`: the shooter decides
@@ -611,6 +635,19 @@ class NetworkManager:
             self._kill_count += 1
         if self.on_killfeed is not None:
             self.on_killfeed(killer_id, sender_id, weapon_name, headshot)
+
+    def _receive_emote(self, sender_id, state):
+        """Dispatches straight into the specific RemotePlayer instance (unlike
+        on_killfeed/on_chat above, which are NetworkManager-level callbacks for
+        a global UI event) - an emote is a per-player effect on that one
+        player's own model, not something app.py-level UI code needs to react
+        to generically."""
+        rp = self.remote_players.get(sender_id)
+        if rp is None:
+            return   # a packet from a peer we haven't discovered via a movement packet yet
+        name = str(state.get("en", ""))
+        if name:
+            rp.play_emote(name)
 
     def send_chat(self, text):
         """Broadcasts a chat message to every OTHER lobby member (not
@@ -931,6 +968,9 @@ class NetworkManager:
                 return
             if "ak" in state:
                 self._receive_admin_kill(sender_id, str(state.get("dc", "bullet")))
+                return
+            if "em" in state:
+                self._receive_emote(sender_id, state)
                 return
             if "p" not in state or "y" not in state:
                 return  # not this version's movement packet

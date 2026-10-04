@@ -651,13 +651,30 @@ class PlayerModel:
         self._crouch_blend_space = _as_blend_space(crouch_animation, directional_clips)
         self._crouch_blend_kwargs = {"blend_duration": float(crouch_blend_duration)}
 
-        # One of "locomotion" / "jump" / "crouch" - see this class's own
-        # docstring above. Starts at "locomotion" unconditionally: a
-        # caller only ever passes is_grounded=False/is_crouched=True on a
-        # LATER update() call, matching every caller before jump/crouch
-        # existed (nothing constructs a PlayerModel already airborne or
-        # already crouched).
+        # One of "locomotion" / "jump" / "crouch" / "emote" - see this
+        # class's own docstring above. Starts at "locomotion"
+        # unconditionally: a caller only ever passes
+        # is_grounded=False/is_crouched=True on a LATER update() call,
+        # matching every caller before jump/crouch existed (nothing
+        # constructs a PlayerModel already airborne or already crouched).
         self._top_state = "locomotion"
+
+        # Name of the clip currently playing as an emote, or None - see
+        # play_emote/cancel_emote/is_emoting. Unlike jump/crouch (configured
+        # per-model via jump_animation/crouch_animation and resolved from a
+        # blend space), an emote is an arbitrary runtime clip name picked by
+        # the caller (the emote wheel) from whatever Assets/Animations/
+        # Emotes/Emotes.glb happened to merge into this model's own
+        # obj["skeleton"].animations - there's no blend space for it.
+        self._emote_clip = None
+        # Whatever self._upper_override held right before play_emote()
+        # overwrote it, so cancel_emote() can put it BACK (a held weapon's
+        # own idle/aim pose locks the upper body exactly
+        # the same way - see set_upper_override's own docstring - so simply
+        # clear_upper_override()-ing when an emote ends would silently drop
+        # a weapon's held pose back to bare locomotion sway instead of
+        # restoring it) rather than just discarding it.
+        self._pre_emote_upper_override = None
 
         # 0.0 (walk intent) .. 1.0 (run intent) - see update()'s own
         # is_sprinting docstring for why this exists and how it's eased
@@ -879,7 +896,7 @@ class PlayerModel:
         self.obj["position"] = feet_pos
 
     def update(self, dt, position, yaw_degrees, speed, is_crouched=False, is_grounded=True,
-               is_sprinting=None, move_direction=None, just_jumped=False):
+               is_sprinting=None, move_direction=None, just_jumped=False, just_shot=False):
         """Call once per frame (or per network update, for a remote
         player) to sync this model's transform and animation state.
 
@@ -990,7 +1007,17 @@ class PlayerModel:
         as a fallback for entering "jump" without this flag (e.g. walking
         off a ledge with no jump key involved at all needs SOME way to
         detect genuine airborne-ness), so the two together cover both a
-        deliberate jump (instant) and an incidental fall (debounced)."""
+        deliberate jump (instant) and an incidental fall (debounced).
+
+        just_shot: True for exactly the one update() call covering the frame a
+        shot actually fired (the local player's own weapon.shots_this_frame()
+        count > 0, forwarded by app.py; a remote player forwards its own
+        shot-counter transition - see RemotePlayer.receive_state's
+        _pending_shot_cancel). The ONLY thing this currently does is cancel an
+        in-progress emote (see play_emote/cancel_emote) - firing a weapon mid-
+        emote cuts it short, same as moving or jumping does. Omit it (the
+        default, False) for a caller with no such signal; harmless since it's
+        only ever read while self._top_state == "emote"."""
         if self.obj is None:
             return
 
@@ -1042,6 +1069,33 @@ class PlayerModel:
 
         entering_locomotion = False
         entry_blend_kwargs = self._animation_blend_kwargs
+
+        if self._top_state == "emote":
+            # Moving, jumping, or shooting cuts an emote short - checked BEFORE
+            # the jump/crouch blocks below (which only ever act on is_grounded/
+            # is_crouched themselves) so an emote cancelled this way falls
+            # straight through into whichever of those states actually applies
+            # this frame, with no added latency (e.g. jumping out of an emote
+            # plays the jump takeoff pose the same frame, not one frame late).
+            # has_input (just computed above) is the SAME debounced signal
+            # locomotion's own direction axis already uses - reusing it here
+            # means a single-frame move_direction blip doesn't insta-cancel an
+            # emote the debounce would otherwise have ignored for every other
+            # purpose.
+            if just_jumped or not is_grounded or just_shot or has_input:
+                self.cancel_emote()
+                entering_locomotion = True
+                entry_blend_kwargs = self._animation_blend_kwargs
+            else:
+                # Still emoting - the clip loops (see play_emote) rather than
+                # playing once and holding its last frame, so there's no
+                # natural-finish duration to poll here any more; moving/
+                # jumping/shooting/dying (cancel_emote, above and in app.py's
+                # own begin_death) is now the ONLY way an emote ends. Hold it,
+                # skipping jump/crouch/locomotion entirely this frame, same
+                # shape as the existing "if self._top_state == 'jump': return"
+                # below.
+                return
 
         if self._jump_blend_space is not None:
             # _confirmed_airborne (not a plain "not is_grounded" check) -
@@ -1236,6 +1290,125 @@ class PlayerModel:
         self._upper_override = None
         if self.obj is not None and self._override_upper_body_root_joints is not None:
             self._scene.set_skeletal_upper_joint_mask(self.obj, self._upper_body_root_joints)
+
+    def play_emote(self, name):
+        """Plays `name` full-body, LOOPING, as an "emote" top_state - the
+        radial emote wheel's own selection handler calls this (identically for
+        the local player and, via RemotePlayer.play_emote, every remote one;
+        this method has no notion of local-vs-remote beyond self.
+        _upper_auto_driven, see below). `name` must already be a clip on this
+        model's own obj["skeleton"].animations - merged in once at startup/
+        construction time from Assets/Animations/Emotes/Emotes.glb (see
+        Scene.load_additional_animations) - NOT a fixed/hardcoded list, so an
+        unrecognized name (a stale catalogue, or a bad value arriving over the
+        network) is simply ignored rather than raising. Since it loops, there's
+        no natural finish - cancel_emote() (movement/jump/shot/death - see
+        app.py's own wiring) is the only way it ends.
+
+        Calling this again while ALREADY emoting (picking a second emote
+        before the first one was cancelled) stops the current one first via
+        cancel_emote(), rather than just overwriting self._emote_clip in
+        place - needed because self._pre_emote_upper_override, below, would
+        otherwise capture the CURRENT emote's own clip name (self.
+        _upper_override, at that moment, IS the current emote, not the real
+        pre-emote pose) instead of the actual weapon idle/aim pose from before
+        any emote started - corrupting it so that cancelling the SECOND emote
+        later would wrongly restore to the FIRST emote's frozen last frame
+        instead of the real weapon pose. cancel_emote() itself never touches
+        the lower body at all, so it still crossfades directly from whatever
+        the first emote's current pose is into the new one (set_skeletal_
+        animation's own crossfade, a few lines down) - there's no visible
+        detour through locomotion/weapon-idle in between."""
+        if self.obj is None or name not in self.obj["skeleton"].animations:
+            return
+        if self._top_state == "emote":
+            self.cancel_emote()
+        self._top_state = "emote"
+        self._emote_clip = name
+        if self._upper_auto_driven:
+            # Saved BEFORE set_upper_override below overwrites it, so
+            # cancel_emote() can restore whatever pose was active before this
+            # emote started (a held weapon's own idle/aim lock, most commonly -
+            # see set_upper_override's own docstring for why a weapon's pose
+            # lives in this exact same field) instead of just dropping it back
+            # to bare locomotion sway.
+            self._pre_emote_upper_override = self._upper_override
+        # loop=True (the default - set_skeletal_animation's own loop=True,
+        # matching set_upper_override's own set_skeletal_upper_animation call
+        # below, which already defaults to loop=True too) so the emote plays
+        # continuously until cancelled rather than freezing on its last frame.
+        self._scene.set_skeletal_animation(self.obj, name, **self._animation_blend_kwargs)
+        # set_skeletal_animation no-ops if `name` is already what's playing
+        # (see its own docstring) - force a restart so re-selecting the SAME
+        # emote twice in a row plays it again instead of silently doing
+        # nothing, the same fix ViewModel.play already applies to one-shot
+        # weapon states for the identical reason.
+        self.obj["anim_time"] = 0.0
+        if self._upper_auto_driven:
+            # Full-body: the SAME clip drives the upper body too, via
+            # set_upper_override - which, same as a weapon idle pose, widens
+            # to override_upper_body_root_joints/Spine4 if this model has one
+            # configured (see its own docstring). That widening is harmless
+            # here specifically BECAUSE both tracks are the exact same clip:
+            # whichever joints (clavicles-only, or Spine4 and everything it
+            # parents) end up upper-driven, they're being fed the identical
+            # pose the lower track already supplies, so there's no visible
+            # difference either way - unlike a weapon idle pose, which only
+            # actually NEEDS the wider split because it's a different pose
+            # than whatever the lower body is doing.
+            self.set_upper_override(name)
+            self.obj["upper_anim_time"] = 0.0
+
+    def cancel_emote(self):
+        """Exits an active emote (see play_emote) - since an emote loops
+        forever, this is the ONLY way it ever ends: app.py calls it the
+        instant the player moves/jumps/shoots/dies (see update()'s own
+        "emote" branch for the first three, begin_death for the last). A
+        no-op if no emote is currently playing.
+
+        Only restores the pre-emote upper-body pose if NOTHING ELSE has
+        already claimed the upper body since the emote started - checked via
+        self._upper_override still being exactly the emote's own clip name
+        (play_emote's own set_upper_override(name) call is what put it there,
+        and nothing else touches it while actually emoting). A first attempt
+        at this used a restore_upper=False param instead, set whenever
+        shooting was the cancel reason, on the assumption that weapon.fire()'s
+        own play("shoot") call (which runs BEFORE update(), so before this)
+        would have already set a fresh "shoot" pose worth protecting -
+        confirmed WRONG by direct testing: WeaponsBase.player_animations only
+        ever defines "idle" (see its own class attribute, never overridden
+        with a "shoot" entry by any weapon), so play("shoot") finds no
+        ("player", "shoot") clip and never touches the upper body at all -
+        restore_upper=False then left the upper body frozen on the emote's
+        own last pose FOREVER, since nothing else was ever going to fix it
+        either (exactly the "shooting doesn't stop the emote" bug this fixes).
+        Checking self._upper_override directly instead of guessing from the
+        cancel REASON handles both cases correctly on its own: if some future
+        weapon state change DOES legitimately claim the upper body the same
+        frame a cancel fires, _upper_override will have already changed away
+        from the emote's clip by the time this runs, so the comparison below
+        naturally leaves that alone too - no cancel-reason bookkeeping needed."""
+        if self._top_state != "emote":
+            return
+        self._top_state = "locomotion"
+        if self._upper_auto_driven and self._upper_override == self._emote_clip:
+            # Restore whatever pose was active before this emote started
+            # (see play_emote's own comment) instead of unconditionally
+            # clearing it - a held weapon's idle/aim lock needs to come right
+            # back, not silently drop to bare locomotion sway until some
+            # unrelated weapon-state change happens to re-assert it.
+            if self._pre_emote_upper_override is not None:
+                self.set_upper_override(self._pre_emote_upper_override)
+            else:
+                self.clear_upper_override()
+        self._emote_clip = None
+        self._pre_emote_upper_override = None
+
+    def is_emoting(self):
+        """Whether an emote (see play_emote) is currently playing - app.py
+        polls this every frame to know when to cancel on movement/jump/shot
+        and when to revert the camera back out of third person."""
+        return self._top_state == "emote"
 
     def set_upper_rotation_offset(self, degrees, blend_duration=None):
         """Changes upper_rotation_offset_degrees (see __init__) at

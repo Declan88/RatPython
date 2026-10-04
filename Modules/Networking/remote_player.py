@@ -174,6 +174,14 @@ class RemotePlayer:
                 scene.load_additional_animations(
                     self.model.obj, path, rename=rename, time_scale=time_scale,
                 )
+            # Same emote catalogue file app.py merges onto the local player's own
+            # model (see its own load_additional_animations call site) - needed
+            # here too so play_emote (triggered by an incoming "em" packet - see
+            # NetworkManager._receive_emote) can find the clip by name. The
+            # return value isn't needed on this side - a remote player only ever
+            # has to validate/play a name the network tells it, which play_emote's
+            # own animations.get(name) guard already covers.
+            scene.load_additional_animations(self.model.obj, "Assets/Animations/Emotes/Emotes.glb")
 
         # The weapon in their hand is whichever their packets name (see _apply_weapon);
         # each one they've shown is kept (loaded once) so switching back is instant.
@@ -200,6 +208,12 @@ class RemotePlayer:
         self._hat_applied = None
         self._shot_seen = None     # last shot counter value seen
         self._pending_shots = 0
+        # Set alongside _pending_shots whenever the shot counter increases (see
+        # receive_state) - consumed the same one-shot way _pending_jump is
+        # (update() passes it into model.update() as just_shot, then clears it),
+        # so a shot cancels an in-progress emote on THIS peer's own screen with
+        # no extra network message - see PlayerModel.update()'s own just_shot.
+        self._pending_shot_cancel = False
         self._pending_tracers = []  # end points of shots to draw a tracer for
         self.on_tracer = None       # callback(start, end), set by NetworkManager
         self._footstep_seen = None   # last footstep counter value seen
@@ -233,6 +247,16 @@ class RemotePlayer:
         self.on_dissolve_spark = None   # callback(position), set by NetworkManager - see update()
         self.on_dissolve_arc = None     # callback(position), set by NetworkManager - see update()
 
+    def play_emote(self, name):
+        """Called by NetworkManager._receive_emote the instant this peer's own
+        "em" packet arrives - a trivial forwarder, since PlayerModel.play_emote
+        is fully shared between local and remote use (the "switch to third
+        person"/"notify_emote" parts are local-only, app.py-level concerns, not
+        part of PlayerModel at all)."""
+        if self.model.obj is None:
+            return
+        self.model.play_emote(name)
+
     def receive_state(self, state):
         """state: the decoded packet dict from NetworkManager._broadcast_
         transform - "p" feet position, "y" yaw degrees, "v" horizontal
@@ -259,6 +283,7 @@ class RemotePlayer:
         shots = int(state.get("f", 0))
         if self._shot_seen is not None and shots > self._shot_seen:
             self._pending_shots = min(self._pending_shots + shots - self._shot_seen, 3)
+            self._pending_shot_cancel = True
             # The packet carries the end points of their last few shots; the
             # newest ones are the shots just fired.
             ends = state.get("e") or []
@@ -330,9 +355,11 @@ class RemotePlayer:
                 is_sprinting=bool(s.get("s", False)),
                 move_direction=None if stale else glm.vec3(move[0], 0.0, move[1]),
                 just_jumped=self._pending_jump,
+                just_shot=self._pending_shot_cancel,
             )
             self._model_debt = 0.0
             self._pending_jump = False
+            self._pending_shot_cancel = False
         else:
             self.model.move_to(feet_pos)
         if self._pending_death:

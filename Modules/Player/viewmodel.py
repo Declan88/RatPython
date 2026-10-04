@@ -22,7 +22,7 @@ import glm
 
 from Modules.Graphics import pose_batch
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
-from Modules.Weapons.weapons_base import _load_state_clip
+from Modules.Weapons.weapons_base import _load_state_clip, _parse_clip_spec
 
 
 # The rigs are authored around a reference camera at the model origin (0, 0, 0)
@@ -182,15 +182,15 @@ class ViewModel:
             self._scene.set_skeletal_tint(arms, self._tint)
         clips = {}
         # The gun rig's clips (see WeaponsBase.viewmodel_animations) play on
-        # both parts: it's the arms rig plus the weapon bones. A value can be
-        # (path, skin_index) instead of a bare path, for a file whose gun rig
-        # isn't at the weapon's usual viewmodel_gun_skin (see that field's
-        # own docstring - USP's "reload" entry needs this).
+        # both parts: it's the arms rig plus the weapon bones. See _parse_
+        # clip_spec's own docstring for the full set of forms a value can
+        # take - a bare path, (path, skin_index) for a file whose gun rig
+        # isn't at the weapon's usual viewmodel_gun_skin (USP's "reload"
+        # entry needs this), or (path, source_clip_name) for a file exported
+        # with several named actions sharing one skin instead of one clip
+        # per file (pencil.py's Pencil.glb needs this).
         for state, clip_spec in weapon.viewmodel_animations.items():
-            if isinstance(clip_spec, tuple):
-                clip_path, skin_index = clip_spec
-            else:
-                clip_path, skin_index = clip_spec, weapon.viewmodel_gun_skin
+            clip_path, skin_index, source_clip = _parse_clip_spec(clip_spec, weapon.viewmodel_gun_skin)
             # "draw" is the only state with a speed multiplier right now
             # (WeaponsBase.draw_speed) - baked into the clip's own timeline
             # at load time (see _load_state_clip's own time_scale docstring),
@@ -200,7 +200,7 @@ class ViewModel:
             for part, obj in [("arms", arms)] + [("gun", g) for g in gun_parts]:
                 clip = _load_state_clip(
                     self._scene, obj, clip_path, f"{weapon.player_clip(state)}_viewmodel",
-                    skin_index=skin_index, time_scale=time_scale)
+                    skin_index=skin_index, time_scale=time_scale, source_clip=source_clip)
                 if clip is not None:
                     clips[(part, state)] = clip
         self._primed[weapon] = {"arms": arms, "gun": gun, "gun_parts": gun_parts, "clips": clips}
@@ -336,12 +336,24 @@ class ViewModel:
         self._sway_yaw *= decay
         self._sway_pitch *= decay
 
-    def update(self, camera, visible, dt):
+    def update(self, camera, visible, dt, scope_blend=0.0):
         """Call once per frame with the camera as it will render; visible
         False (third person, dead, menu...) hides the ACTIVE weapon (any
         other primed weapon is already hidden regardless - see
         _set_visible). dt drives the mouse-look sway's own settle speed
-        (_SWAY_DECAY) - see _update_sway."""
+        (_SWAY_DECAY) - see _update_sway.
+
+        scope_blend: the active weapon's own eased 0..1 ADS fraction (see WeaponsBase.
+        update_scope - app.py calls that BEFORE this, same frame, and passes the result
+        straight through). Shifts the whole viewmodel's own LOCAL (camera-space)
+        transform so its scope_point() moves toward the camera's view origin - NOT a
+        camera.position move: the viewmodel is rendered entirely in camera space
+        already (transform = inverse(camera.get_view_matrix()) * local, see this
+        method's own tail end), so moving camera.position has literally no visible
+        effect on it at all - it would just be screen-locked in exactly the same spot
+        regardless of where the "world" camera sits. Moving the GUN's own local
+        transform toward the camera's fixed view axis instead is what actually reads as
+        the view pushing into the gun/scope."""
         parts = []
         for o in [self.arms] + self.gun_parts:
             if o is not None and o not in parts:
@@ -371,7 +383,42 @@ class ViewModel:
                 * glm.translate(glm.mat4(1.0), -_SWAY_PIVOT)
                 * local
             )
-        transform = glm.inverse(camera.get_view_matrix()) * local
+        view = camera.get_view_matrix()
+        weapon = self._weapon
+        if (scope_blend > 0.0 and weapon is not None and weapon.has_scope
+                and weapon.viewmodel_scope_bone and self.gun is not None):
+            # Read the scope bone's CURRENT camera-space position - set obj["transform"]
+            # to the pre-ADS `local` FIRST (joint_world_position reads it straight off
+            # obj["transform"] via Scene._get_model_matrix), get its WORLD position back,
+            # then re-project through `view` to land back in camera space: world = inverse
+            # (view) * local * bone_local, so view * world = local * bone_local exactly -
+            # the bone's position in `local`'s own space, with the full skin/bone
+            # hierarchy already accounted for (view/inverse(view) cancel out completely;
+            # going via world space is just the easiest way to reuse scene.joint_world_
+            # position's existing skinning math rather than re-deriving it here).
+            self.gun["transform"] = glm.inverse(view) * local
+            world_point = self._scene.joint_world_position(
+                self.gun, weapon.viewmodel_scope_bone, local_offset=weapon.viewmodel_scope_offset)
+            if world_point is not None:
+                cam_space_point = glm.vec3(view * glm.vec4(world_point, 1.0))
+                # Shifts the WHOLE viewmodel by the negative of that point, scaled by how
+                # far into the scope we are - at scope_blend=1.0 the bone sits exactly at
+                # camera-space (0,0,0), i.e. the eye itself. By the time that's reached,
+                # `scoped` is True and hidden_while_scoped below has already taken the
+                # model off screen, so this extreme convergence is never actually seen
+                # clipping through the near plane - the scope overlay has fully taken
+                # over by then.
+                local = glm.translate(glm.mat4(1.0), -cam_space_point * scope_blend) * local
+        transform = glm.inverse(view) * local
+        # Once fully eased into the scope (see WeaponsBase.scoped) the gun is doing
+        # nothing useful on screen anyway (it's converged to sitting right at the eye -
+        # see the block above) and the scope overlay (app.py's own reticle widget) is
+        # meant to read as actually looking THROUGH the sight, not still seeing the gun
+        # in the way - see _render_viewmodels' own hidden_while_scoped filter for why
+        # this is a separate flag from viewmodel_visible rather than just hiding it the
+        # normal way (animation/muzzle tracking need to keep running live underneath).
+        hidden_while_scoped = bool(weapon is not None and weapon.has_scope and weapon.scoped)
         for obj in parts:
             obj["transform"] = transform
             obj["position"] = camera.position
+            obj["hidden_while_scoped"] = hidden_while_scoped

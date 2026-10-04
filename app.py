@@ -85,8 +85,10 @@ from Modules.Window.loading_screen import show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
 from Modules.UI import Anchor, Crosshair, Hitmarker, Label, ProgressBar
+from Modules.UI.scope_overlay import ScopeOverlay
 from Modules.UI.death_screen import DeathScreen
 from Modules.UI.pause_menu import PauseMenu
+from Modules.UI.emote_wheel import EmoteWheel
 from Modules.Graphics.tracers import Tracers
 from Modules.Particles import ParticleManager
 from Modules.Particles.blood import register_blood
@@ -110,7 +112,15 @@ TEST_DUMMY_STEAM_ID = 1
 TEST_DUMMY_OFFSET = (3.0, 0.0, -2.0)   # metres from SPAWN_POSITION, feet-height
 TEST_DUMMY_RESPAWN_SECONDS = 1.5
 TEST_DUMMY_HEALTH = 100.0
-STARTING_LOADOUT = ["usp", "gouda_gun"]   # weapon ids (see Modules/Weapons/registry.py) everyone spawns with
+STARTING_LOADOUT = ["usp", "gouda_gun", "pencil"]   # weapon ids (see Modules/Weapons/registry.py) everyone spawns with
+# Number-row keys 1-9 select inventory slots 0-8 directly (see on_key_down) - same
+# switch_weapon() the scroll wheel already uses, just jumping straight to a slot instead
+# of stepping by +-1. Only as many of these as the inventory actually has slots for are
+# ever reachable - the rest are harmless no-ops (on_key_down checks len(inventory)).
+WEAPON_SLOT_KEYS = {
+    pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2, pygame.K_4: 3, pygame.K_5: 4,
+    pygame.K_6: 5, pygame.K_7: 6, pygame.K_8: 7, pygame.K_9: 8,
+}
 
 # /smite's sound pair - see app.py's own spawn_smite. Distances are Minecraft's own attenuation
 # (given in blocks) carried straight over as metres, this project's own world scale (a block and
@@ -216,6 +226,18 @@ def main():
     print("Yo wsg")
     window = WindowManager(800, 600, "RatWar")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
+    # The normal, hip-fire FOV - camera.fov itself gets temporarily narrowed while
+    # scoping (see the main loop's own scope handling) and eased back to exactly this
+    # afterward, so it has to be captured once, up front, rather than hardcoding
+    # Camera's own default again here (or trusting camera.fov to still read it after
+    # the first time scoping touches it).
+    BASE_FOV = camera.fov
+    # Same idea, for mouse sensitivity: a real scope makes the same physical mouse
+    # movement turn the view much less (zoomed in = more screen-space travel per
+    # degree), so camera.sensitivity is scaled by the same fov/BASE_FOV ratio
+    # camera.fov is already eased by every frame (see the main loop) - at full zoom
+    # (scope_fov/BASE_FOV) a mouse swipe turns the camera proportionally less.
+    BASE_SENSITIVITY = camera.sensitivity
 
     # Scene classes, not instances - see get_or_load_scene below. Only
     # ever constructed the first time something actually switches to
@@ -261,8 +283,10 @@ def main():
     # scroll-wheel handling further down.
     inventory = Inventory(STARTING_LOADOUT)
     boom_arm = None
+    # No manual toggle any more (see the removed V keybind in on_key_down) - purely
+    # state-driven: begin_death/end_death flip this directly (dead means third person,
+    # alive means first, full stop - see their own comments).
     third_person = False
-    toggle_third_person = lambda key: None
 
     def apply_third_person_visibility():
         """The current weapon's world model follows third_person exactly like the local
@@ -284,7 +308,7 @@ def main():
     dummy_state = {"deaths": 0, "respawn_at": None, "pos": None, "yaw": 180.0, "health": 100.0}
 
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, toggle_third_person, test_dummy
+        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, test_dummy
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
@@ -535,22 +559,23 @@ def main():
             "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
             rename={"New": "rifle_crouch"},
         )
+        # Emotes.glb's own clips become the radial wheel's catalogue directly -
+        # no hardcoded name list anywhere: whatever's actually in the file is
+        # what the wheel shows (see PlayerModel.play_emote's own docstring and
+        # EmoteWheel.set_pages). No rename needed - confirmed none of its clip
+        # names (Breakdance, Criss Cross, Gagnam Style, Griddy, Quagmire today)
+        # collide with any name already merged onto rat.glb's skeleton.
+        emote_catalogue = current_scene.load_additional_animations(
+            local_player_model.obj, "Assets/Animations/Emotes/Emotes.glb",
+        )
+        emote_wheel.set_pages(emote_catalogue)
         # Third-person mode - see Modules/Camera/camera_boom_arm.py. Off by
         # default (first person): the local player's own model stays
-        # shadow-only (visible_in_color=False above) until this is toggled.
+        # shadow-only (visible_in_color=False above) until begin_death/
+        # end_death flip it (no manual toggle any more - see the module-level
+        # third_person's own comment).
         third_person = False
         boom_arm = CameraBoomArm(current_scene.physics)
-
-        def toggle_third_person(key):
-            nonlocal third_person
-            if key == pygame.K_v:
-                third_person = not third_person
-                # The local player's body is normally shadow-only (a first-
-                # person player never sees their own model - see
-                # local_player_model's own visible_in_color=False above) -
-                # third person needs it actually drawn instead.
-                local_player_model.set_visible_in_color(third_person)
-                apply_third_person_visibility()
 
         # The current weapon decides everything about how the player holds it:
         # its gun and arm animations on the first-person viewmodel, its world
@@ -617,10 +642,9 @@ def main():
         weapon.equip_viewmodel(viewmodel)
         weapon.equip_player(current_scene, local_player_model)
         # equip_player always shows the new weapon's world model (WeaponsBase.set_active has no
-        # idea whether the local player is first- or third-person) - mask it back down to match,
-        # same as toggle_third_person does for the toggle itself. Covers the very first equip
-        # too (third_person defaults False, so this hides it immediately instead of it being
-        # visible in first person until the player happens to press V once).
+        # idea whether the local player is first- or third-person) - mask it back down to match.
+        # Covers the very first equip too (third_person defaults False, so this hides it
+        # immediately instead of it being visible in first person).
         apply_third_person_visibility()
 
     def spawn_test_dummy():
@@ -674,6 +698,21 @@ def main():
 
     ui = UIManager(window)
     ui_demo = build_demo(ui)
+
+    # The scope sight picture, full-screen (Reticle.png is authored at 1920x1080, a
+    # vignette mask + reticle lines meant to cover the whole view, not a small centred
+    # icon) - shown instead of the crosshair once a scoped weapon's ADS has FULLY eased
+    # in (WeaponsBase.scoped), replacing the ordinary crosshair for "looking through the
+    # sight" rather than overlaying it. ScopeOverlay (not a plain Image) fits the
+    # image's own aspect ratio undistorted and extends its border to cover whatever's
+    # left over on a non-16:9 window instead of stretching it - see its own docstring.
+    # Added FIRST, before every other HUD element below (ui.root paints children in
+    # add order, so whatever's added first sits at the very back) - it's a full-screen
+    # overlay meant to sit UNDER the real HUD (health bar, weapon HUD, kill feed, ...),
+    # not cover any of it. Added here, not where it's used lower down, specifically so
+    # a later HUD element never accidentally lands behind it again the same way the
+    # health bar did when this used to be added after it.
+    reticle = ui.root.add(ScopeOverlay("Assets/Textures/UI/Reticle.png", visible=False))
 
     # TEMPORARY health bar - a placeholder until a real damage system exists.
     # H takes 10 damage, J heals 10 (see on_key_down); nothing else reads or
@@ -730,6 +769,11 @@ def main():
                                           # each one's own change_health call - begin_death reads and
                                           # resets it once the death it names actually happens
     death_screen = ui.root.add(DeathScreen(RESPAWN_SECONDS))
+    # Radial emote wheel (hold B) - built once here, same as every other full-
+    # screen UI widget; its actual pages (the auto-discovered emote catalogue)
+    # aren't known until setup_game loads Emotes.glb onto local_player_model,
+    # so set_pages() is called from there, not here - see that call site.
+    emote_wheel = ui.root.add(EmoteWheel())
     # ESC in a game: resume / disconnect to the main menu / quit. Added last so it draws on top.
     pause = {"on": False, "quit": False}
     pause_menu = ui.root.add(PauseMenu(
@@ -1101,13 +1145,29 @@ def main():
     from Modules.Scenes import scene_base as _scene_base
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
     menu_scene = get_or_load_scene("mainmenu")
-    game_look = (camera.yaw, camera.pitch, glm.vec3(camera.front))
 
     def request_start(map_key):
         nonlocal pending_start
         pending_start = map_key
 
     paper_doll = None  # head of the local rat beside the health bar - built in start_game
+
+    def reset_weapon_ammo():
+        """Refills every carried weapon's magazine (not just the active one) - called
+        everywhere the player (re)spawns, alongside game_mode.choose_spawn_position/
+        choose_spawn_rotation. A weapon with no ammo tracking at all (magazine_size <= 0)
+        has nothing to refill - WeaponsBase.ammo just sits unused for those, same as
+        always."""
+        for w in inventory.weapons:
+            if w.magazine_size > 0:
+                w.ammo = w.magazine_size
+
+    def apply_spawn_rotation():
+        """Snaps the camera to game_mode's own fixed spawn facing (see its own docstring
+        for why this is deliberately fixed, not whatever the camera already happened to be
+        looking) - called alongside every player.teleport(game_mode.choose_spawn_position())."""
+        camera.yaw, camera.pitch = game_mode.choose_spawn_rotation()
+        camera.update_vectors()
 
     def start_game(map_key):
         nonlocal in_menu, paper_doll
@@ -1118,6 +1178,7 @@ def main():
             current_scene.sound_manager.resume_all()
             player.teleport(game_mode.choose_spawn_position())
             change_health(health["max"])
+            reset_weapon_ammo()
             if weapon is not None:
                 weapon.recoil.reset()
         else:
@@ -1136,7 +1197,7 @@ def main():
             prime_effects()
         in_menu = False
         ui.set_cursor_free(False)
-        camera.yaw, camera.pitch, camera.front = game_look
+        apply_spawn_rotation()
         window.reset_frame_timer()
         net_mgr.scene = current_scene
         net_mgr.in_game = True
@@ -1173,6 +1234,7 @@ def main():
         window.reset_frame_timer()
 
     def begin_death():
+        nonlocal third_person
         death["pending"] = False
         death["active"] = True
         death["eye_drop"] = 0.0
@@ -1182,9 +1244,10 @@ def main():
         damage_class, death["damage_class"] = death["damage_class"], "bullet"
         # No gibs for a dissolve death (Zap) - matches what everyone ELSE sees us do (see
         # RemotePlayer's own dissolve state machine): the local player's own body is always
-        # hidden instantly either way (never watches its own third-person death - see
-        # set_local_body_visible below), so there's no local dissolve ANIMATION to show, just
-        # this one difference in what flies out of us when we die.
+        # hidden instantly either way regardless of the third-person switch just below (see
+        # set_local_body_visible - visible=False there forces it off no matter what
+        # third_person is set to), so there's no local dissolve ANIMATION to show, just this
+        # one difference in what flies out of us when we die.
         if current_scene.gibs is not None and get_damage_class(damage_class).death_effect != DISSOLVE:
             current_scene.gibs.spawn(feet, player.velocity, push=push, tint=net_mgr.local_color)
         smite, death["smite"] = death["smite"], False
@@ -1192,6 +1255,16 @@ def main():
             spawn_smite(feet)
         net_mgr.notify_death(push=push, damage_class=damage_class)
         set_local_body_visible(False)
+        # A player who dies mid-emote shouldn't keep playing it into their death
+        # pose - cuts it short the same way moving/jumping/shooting would (see
+        # PlayerModel.cancel_emote's own docstring), restoring whatever upper-
+        # body pose (a held weapon's idle lock, if any) was active beforehand.
+        local_player_model.cancel_emote()
+        # Pulls the camera back (see the main loop's own `if third_person:` branch) for the
+        # death screen/gib view instead of staring at the inside of your own hidden-while-
+        # dead body - no manual toggle involved any more (see on_key_down's own removed V
+        # bind), purely state-driven: dead means third person, full stop.
+        third_person = True
         crosshair.visible = False
         weapon_hud.visible = False
         player.set_move_direction(glm.vec3(0.0))
@@ -1199,9 +1272,17 @@ def main():
         death_screen.show()
 
     def end_death():
+        nonlocal third_person
         death["active"] = False
+        # Back to first person BEFORE set_local_body_visible below - that call's own
+        # "visible and third_person" math (see its docstring) is what actually restores the
+        # normal first-person "my own body is shadow-only" state, which only works out
+        # correctly if third_person has already flipped back to False by the time it runs.
+        third_person = False
         player.teleport(game_mode.choose_spawn_position())
+        apply_spawn_rotation()
         change_health(health["max"])
+        reset_weapon_ammo()
         if weapon is not None:
             weapon.recoil.reset()
         set_local_body_visible(True)
@@ -1286,6 +1367,16 @@ def main():
 
     trigger_clicks = [0]   # left clicks since the last frame's firing check
     wheel_delta = [0]      # net scroll wheel motion since the last frame's weapon-switch check
+    # Set the instant B is released over a highlighted slot (see count_click's own
+    # K_b KEYUP branch below) and consumed once in the main loop - a single-slot
+    # flag rather than triggering play_emote/third_person/notify_emote directly
+    # from count_click, since count_click runs earlier in the frame than the main
+    # loop's own `alive`/death["active"] read and has no access to that local.
+    pending_emote = [None]
+    # Last frame's local_player_model.is_emoting() - lets the main loop detect
+    # the edge (was emoting, now isn't) that means "revert to first person",
+    # whether that's from the clip finishing naturally or being cancelled.
+    emote_was_playing = [False]
 
     def count_click(event):
         """window.handle_events' event filter: counts left clicks (from the
@@ -1296,13 +1387,34 @@ def main():
                 return ui.handle_event(event)   # let TextInput's own Escape close chat instead of pausing
             set_paused(not pause["on"])
             return True
+        # Hold B: opens the radial emote wheel (mouse freed, camera look stops via
+        # ui.cursor_free - see Modules/Window/window.py's own event_filter short-
+        # circuit); release confirms whatever slot the mouse was over (see
+        # EmoteWheel.confirmed_emote_name) and closes it. No on_key_up hook exists
+        # anywhere else in this file (window.handle_events' own on_key_down is
+        # KEYDOWN-only) - count_click, as the event_filter, is the one place that
+        # sees raw KEYUP events before camera/key handling does.
+        if (event.type == pygame.KEYDOWN and event.key == pygame.K_b
+                and not in_menu and not chatbox.focused and not pause["on"]):
+            emote_wheel.open()
+            ui.set_cursor_free(True)
+            return True
+        if event.type == pygame.KEYUP and event.key == pygame.K_b and emote_wheel.visible:
+            pending_emote[0] = emote_wheel.confirmed_emote_name()
+            emote_wheel.close()
+            ui.set_cursor_free(False)
+            return True
         if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                 and not in_menu and not ui.cursor_free):
             trigger_clicks[0] += 1
         if event.type == pygame.MOUSEWHEEL and not in_menu and not ui.cursor_free:
             # Accumulated, not consumed here directly, in case several land in
             # one frame - the main loop turns the total into at most one
-            # weapon switch (see wheel_delta below).
+            # weapon switch (see wheel_delta below). Note: once the emote wheel
+            # sets ui.cursor_free=True, this branch no longer fires for its own
+            # scroll events - they fall through to ui.handle_event below instead,
+            # which is exactly what drives EmoteWheel's own page-scrolling (see
+            # its pick_scroll/scroll_by) with no extra wiring needed here.
             wheel_delta[0] += event.y
             return True
         return ui.handle_event(event)
@@ -1331,12 +1443,29 @@ def main():
             prof.set_enabled(not prof.enabled)
             profile_label.visible = prof.enabled
             profile_label.text = ""
+        if key == pygame.K_F6 and player is not None:
+            # Movement debug dump - see CharacterController.toggle_debug_log's own
+            # comment. Prints straight to the console (this is a one-off diagnostic for
+            # the jump-landing slide bug, not a feature), one line per physics tick.
+            enabled = player.toggle_debug_log()
+            print(f"[movedbg] {'ON' if enabled else 'OFF'}")
         if death["active"]:
             return
-        toggle_third_person(key)
         toggle_ui_demo(key)
         if key == pygame.K_r and weapon is not None and not ui.cursor_free:
             weapon.start_reload()
+        # Number row: jumps straight to that inventory slot (see WEAPON_SLOT_KEYS' own
+        # comment) - same switch_weapon() the scroll wheel already uses, same gating as
+        # the wheel's own (len(inventory) > 1 - nothing to switch TO with only one
+        # weapon) plus reload's own (not ui.cursor_free - a menu/chat open shouldn't
+        # react to background gameplay keys). switch_weapon itself already no-ops for
+        # a slot that's already the active one, and inventory.select wraps out-of-range
+        # indices rather than erroring, but the explicit length check below means a key
+        # for a slot that doesn't exist does nothing at all instead of wrapping around
+        # to some OTHER slot by surprise.
+        slot = WEAPON_SLOT_KEYS.get(key)
+        if slot is not None and weapon is not None and not ui.cursor_free and len(inventory) > 1 and slot < len(inventory):
+            switch_weapon(slot)
         if key == pygame.K_t and weapon is not None and weapon.reloading and viewmodel is not None:
             reload_time = viewmodel.one_shot_time("reload")
             if reload_time is not None:
@@ -1394,9 +1523,47 @@ def main():
             move_dir -= camera.get_flat_right()
         if keys[pygame.K_d]:
             move_dir += camera.get_flat_right()
-        if alive and (pause["on"] or chatbox.focused):
+        if emote_wheel.visible:
+            # Hover picking stops the instant close() starts (see is_closing's
+            # own docstring) - a shrinking/fading wheel shouldn't still be
+            # changing its highlighted slot on the way out.
+            if not emote_wheel.is_closing():
+                mx, my = pygame.mouse.get_pos()
+                emote_wheel.update_hover(mx / ui.scale, my / ui.scale)
+            emote_wheel.update()
+        if pending_emote[0] is not None:
+            name, pending_emote[0] = pending_emote[0], None
+            # Only from a standstill on solid ground - picking an emote mid-
+            # air or while still sliding to a stop would otherwise start a
+            # full-body dance animation the player's own momentum immediately
+            # cancels a frame or two later (see PlayerModel.update()'s own
+            # has_input/is_grounded cancel check) - requiring both up front
+            # means a selection either plays properly or does nothing at all,
+            # never a one-frame flash. Checked against the CharacterController's
+            # own real velocity, not input, since residual momentum with no
+            # key held should count as "not still" too.
+            still = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z)) < 0.1
+            if alive and player.is_on_ground() and still:
+                local_player_model.play_emote(name)
+                third_person = True
+                # Re-evaluates visible_in_color (see set_local_body_visible's own
+                # "visible and third_person" formula) now that third_person just
+                # flipped True - without this, the body stays shadow-only (its
+                # last-computed value from whenever third_person was last False)
+                # since this function isn't re-run every frame on its own.
+                set_local_body_visible(True)
+                net_mgr.notify_emote(name)
+        if alive and (pause["on"] or chatbox.focused or emote_wheel.visible):
             player.set_move_direction(glm.vec3(0.0))
             player.set_sprinting(False)
+            # move_dir itself is only ever the raw WASD vector (computed above
+            # regardless of pause/chat/wheel state) - zeroed here too so a key
+            # held while paused/typing/picking an emote doesn't ALSO reach
+            # local_player_model.update()'s own move_direction param further
+            # down and spuriously look like "the player moved" (e.g. instantly
+            # cancelling an emote the instant it starts, if a movement key
+            # happened to still be held from before the wheel closed).
+            move_dir = glm.vec3(0.0)
         elif alive:
             player.set_move_direction(move_dir)
             player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
@@ -1416,6 +1583,14 @@ def main():
         if current_scene.gibs is not None:
             current_scene.gibs.update(dt)     # before particles.update: the blood follows the gibs
         prof.mark("input + scene.update")
+        # Fell out of the map (see Scene.min_height's own docstring) - same death path as
+        # /kill (kill_self), just triggered by height instead of a command. alive-gated so
+        # this can't re-fire every frame once death becomes active (death["pending"] already
+        # debounces change_health itself from going below 0, but damage_class would keep
+        # getting stomped back to "bullet" every frame otherwise - harmless, but pointless).
+        if alive and current_scene.min_height is not None and player.get_position().y < current_scene.min_height:
+            death["damage_class"] = "bullet"
+            change_health(-(health["max"] + 1.0))
         eye_position = player.get_position() + glm.vec3(
             0.0, player.get_eye_offset(), 0.0
         )
@@ -1439,9 +1614,48 @@ def main():
         # after mouse look, before anything reads camera.front for this frame.
         if weapon is not None and alive:
             weapon.recoil.apply(camera, dt)
-        viewmodel.update(camera, not third_person and alive, dt)
+        # Right-click: eases the VIEWMODEL (not the world camera - see ViewModel.
+        # update's own scope_blend docstring for why moving camera.position has no
+        # visible effect on a camera-space-rendered viewmodel at all) toward the active
+        # weapon's own scope point. update_scope just advances/returns the eased 0..1
+        # blend fraction; the actual transform math lives in ViewModel.update, which
+        # needs this same value.
+        scope_blend = 0.0
+        if weapon is not None:
+            aiming = (alive and not third_person and not ui.cursor_free
+                      and pygame.mouse.get_pressed()[2])
+            scope_blend = weapon.update_scope(aiming, dt)
+        # Narrows the FOV right alongside the same eased fraction driving the viewmodel's
+        # own ADS move above - always reset to BASE_FOV outright (not just "left alone")
+        # for a weapon with no scope, or no active weapon at all, so a stale zoomed FOV
+        # from whatever was equipped before a switch can never linger.
+        camera.fov = BASE_FOV + (weapon.scope_fov - BASE_FOV) * scope_blend if (
+            weapon is not None and weapon.has_scope) else BASE_FOV
+        # Mouse sensitivity scales down by the exact same ratio the FOV just did - takes
+        # effect on the NEXT frame's own mouse motion (window.handle_events, which reads
+        # camera.sensitivity, already ran earlier THIS frame - one frame of lag here is
+        # the same tolerance scope_point()'s own measurement already accepts elsewhere).
+        camera.sensitivity = BASE_SENSITIVITY * (camera.fov / BASE_FOV)
+        viewmodel.update(camera, not third_person and alive, dt, scope_blend)
         if weapon is not None:
             weapon.update(follow=lambda: camera.position)   # finishes an in-progress reload once its time is up
+        # Once the ADS ease above has FULLY finished (WeaponsBase.scoped - not just
+        # scope_blend > 0, which is still mid-transition with the viewmodel still
+        # visibly sliding toward the eye), swap the ordinary crosshair for the scope's
+        # own full-screen sight picture - "looking through the sight" rather than a
+        # crosshair floating over a half-raised gun. Also gated on the same conditions
+        # that let aiming start in the first place, so pausing/dying instantly drops
+        # the overlay rather than waiting for scope_blend to ease back down to 0 first.
+        fully_scoped = (weapon is not None and weapon.has_scope and weapon.scoped
+                         and alive and not third_person and not ui.cursor_free)
+        reticle.visible = fully_scoped
+        # Only touches crosshair.visible during otherwise-legitimate active-play frames
+        # (same condition the firing block below uses) - crosshair already has its own
+        # baseline on/off from set_paused/begin_death/end_death (pause, death, menus),
+        # and unconditionally setting it here would stomp that: e.g. forcing it back to
+        # visible while paused, just because fully_scoped also reads False then.
+        if weapon is not None and not ui.cursor_free and alive:
+            crosshair.visible = not fully_scoped
 
         # Scroll wheel switches weapons (see switch_weapon) - up goes to the
         # previous slot, down to the next, wrapping around either way.
@@ -1459,8 +1673,10 @@ def main():
         if weapon is not None:
             crosshair.set_spread(weapon.spread_degrees(), camera.fov)
             weapon_hud.update(weapon, inventory.weapons, inventory.index)
+        shots_fired_this_frame = 0
         if weapon is not None and not ui.cursor_free and alive:
             shots = weapon.shots_this_frame(clicks, pygame.mouse.get_pressed()[0])
+            shots_fired_this_frame = shots
             for _ in range(shots):
                 # A line trace from the camera along the aim (see PhysicsWorld.
                 # raycast): the first thing it meets - wall, prop or another
@@ -1571,7 +1787,24 @@ def main():
             # was built from a few lines up.
             move_direction=move_dir,
             just_jumped=just_jumped,
+            # Firing cancels an in-progress emote (see PlayerModel.update()'s
+            # own just_shot docstring) - shots_fired_this_frame was already
+            # computed above, before this call, by the firing block.
+            just_shot=shots_fired_this_frame > 0,
         )
+        was_emoting, is_emoting_now = emote_was_playing[0], local_player_model.is_emoting()
+        if was_emoting and not is_emoting_now and not death["active"]:
+            # Natural finish or a cancel (movement/jump/shot) just happened this
+            # frame - back to first person, unless death got there first (begin_
+            # death's own third_person=True must win - see its cancel_emote()
+            # call, which makes is_emoting_now already False by the time this
+            # runs on the SAME frame a player dies mid-emote).
+            third_person = False
+            # Re-evaluates visible_in_color back to shadow-only now that
+            # third_person just flipped False again - mirrors the matching
+            # call where the emote started (see above).
+            set_local_body_visible(True)
+        emote_was_playing[0] = is_emoting_now
         if test_dummy is not None:
             test_dummy.update(dt)
         # The same values driving the local model, sent to other players so

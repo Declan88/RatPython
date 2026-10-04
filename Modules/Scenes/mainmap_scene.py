@@ -6,6 +6,11 @@ class MainMapScene(Scene):
     def __init__(self, ctx):
         super().__init__(ctx, recalculate_shadows=True)
 
+        # Falling off the map (through the water, off a ledge into the void) kills the
+        # local player instead of letting them fall forever - see Scene.min_height's own
+        # docstring. -20 is comfortably below every walkable surface in mainmap.glb.
+        self.min_height = -20.0
+
         # Same sun/skybox lighting setup as TorusScene (torus_scene.py) -
         # kept identical rather than re-tuned, since this scene's only
         # purpose right now is showing mainmap.glb under the same
@@ -49,7 +54,14 @@ class MainMapScene(Scene):
             # docstring) as a Source-style glow mask, so only whatever
             # the texture's alpha actually marks (the glowing parts)
             # self-illuminates; everywhere else renders normally lit.
-            self_illum_overrides={"Vending_machine": True},
+            # Light_shop2 (the shop ceiling light fixture node) is the
+            # SAME situation again - flat emissiveFactor=(1,1,1), no
+            # emissiveTexture at all this time, so it'd otherwise glow
+            # uniformly across its whole mesh - but its own baseColorTexture
+            # (confirmed via a raw glTF dump: alpha ranges across the full
+            # 0-255 range, not a flat/unused channel) already has a real
+            # glow mask baked into its alpha, same trick as Vending_machine.
+            self_illum_overrides={"Vending_machine": True, "Light_shop2": True},
             # 1.0 = fully opaque, 0.0 = fully invisible - only has any
             # visible effect because Watermat is BLEND now (see above).
             # Tune to taste in-engine.

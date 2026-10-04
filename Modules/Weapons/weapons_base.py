@@ -5,9 +5,19 @@ animation files pose the owner's arms - plus the little behaviour every weapon
 shares (a rate-limited fire() that plays the gunshot, equip/unequip, and
 play(state) to switch every attached part to that state's animation).
 
-Subclass it (see usp.py) and override the class attributes below; nothing
-else needs touching. The defaults describe the pistol set, so a bare
-WeaponsBase() is a working (USP-sounding) pistol.
+Subclass it (see usp.py) and override the class attributes below - that part
+really does need nothing else touched, Modules/Weapons/registry.py's own
+pkgutil-based discovery finds a new subclass automatically. The defaults
+describe the pistol set, so a bare WeaponsBase() is a working (USP-sounding)
+pistol.
+
+*** BUT, separately: add ONE line to Modules/Weapons/__init__.py too -       ***
+*** "from .yourfile import YourWeaponClass" - or the new weapon works fine   ***
+*** from source and then silently DISAPPEARS from a built .exe with no      ***
+*** error anywhere (confirmed: exactly what happened to Pencil the first    ***
+*** time around). See registry.py's own module docstring for the full       ***
+*** why (Nuitka/PyInstaller can't see a module only ever reached through a  ***
+*** dynamically-computed import name, so it never gets compiled in at all). ***
 
 One instance per OWNER: it remembers what it attached (the world model in a
 hand, the first-person gun), so the local player and every remote player each
@@ -55,7 +65,7 @@ def _first_clip_name(path, skin_index=0):
     return None
 
 
-def _load_state_clip(scene, obj, path, clip_name, skin_index=0, time_scale=1.0):
+def _load_state_clip(scene, obj, path, clip_name, skin_index=0, time_scale=1.0, source_clip=None):
     """Merges the clip of `path` that animates its skin `skin_index` onto obj's
     skeleton as `clip_name`. Returns the name to play (clip_name), or None when
     there was nothing to load. A path of None means the clip already lives in
@@ -67,7 +77,16 @@ def _load_state_clip(scene, obj, path, clip_name, skin_index=0, time_scale=1.0):
     here it's what a speed multiplier like USP's own draw_speed actually
     does: 1/draw_speed shrinks the clip's timeline, so it plays through the
     same poses in less real time. Baked in at load time rather than adjusted
-    per-frame, so it costs nothing beyond the one-time merge."""
+    per-frame, so it costs nothing beyond the one-time merge.
+
+    source_clip: use this exact animation NAME from `path` instead of
+    _first_clip_name's own "first clip that animates this skin" heuristic -
+    for a file exported with SEVERAL named actions sharing one skin (e.g.
+    Pencil.glb's own Idle/Shoot/Reload/DrawAction, all baked into one file -
+    see pencil.py) rather than the usual one-clip-per-file pose convention,
+    where "the first one" would just pick the same wrong clip for every
+    state. See _parse_clip_spec for how a viewmodel_animations/player_
+    animations/worldmodel_animations entry asks for this."""
     if obj is None or "skeleton" not in obj:
         return None
     animations = obj["skeleton"].animations
@@ -75,12 +94,57 @@ def _load_state_clip(scene, obj, path, clip_name, skin_index=0, time_scale=1.0):
         return next(iter(animations), None)
     if clip_name in animations:
         return clip_name          # already merged (e.g. another owner of the same rig)
-    source = _first_clip_name(path, skin_index)
+    source = source_clip if source_clip is not None else _first_clip_name(path, skin_index)
     if source is None:
         return None
     added = scene.load_additional_animations(
         obj, path, rename={source: clip_name}, skin_index=skin_index, time_scale=time_scale)
-    return clip_name if clip_name in added else None
+    if clip_name not in added:
+        return None
+    # load_additional_animations merges EVERY clip `path` has for this skin, not just the
+    # one named `source` above - harmless when a file genuinely has only one relevant clip
+    # (every OTHER caller's case), but a file with several named actions sharing one skin
+    # (Pencil.glb's Idle/Shoot/Reload/DrawAction, all in ONE file - see pencil.py) would
+    # otherwise leave the other three sitting in `animations` under their own raw names,
+    # then get needlessly re-parsed and re-merged (with a noisy "already exists -
+    # overwriting" warning each time) on every one of THIS weapon's OTHER _load_state_clip
+    # calls for that same file. Drop anything this call added besides what was actually
+    # asked for - whichever state wants one of those loads and renames it on its own call.
+    for extra in added:
+        if extra != clip_name:
+            del animations[extra]
+    return clip_name
+
+
+def _parse_clip_spec(clip_spec, default_skin_index):
+    """Normalizes one viewmodel_animations/player_animations/worldmodel_
+    animations value into (path, skin_index, source_clip) for _load_state_
+    clip. A bare path (or None - see that function's own docstring) just
+    uses `default_skin_index` and no source_clip (today's existing "first
+    clip in the file" behavior, unchanged). A tuple can add:
+
+      - an int: which SKIN of `path` to read instead of the default - e.g.
+        USP's own "reload"/"draw" entries, whose gun rig happens to live at
+        skin 0 in those particular files instead of the usual skin 1 (see
+        viewmodel_animations' own base-class docstring).
+      - a str: which of `path`'s own ANIMATIONS to use by NAME instead of
+        _load_state_clip's "first clip that animates this skin" guess - for
+        a file exported with several named actions sharing one skin (see
+        _load_state_clip's own source_clip docstring).
+
+    A 2-tuple's second element can be EITHER of those (told apart by type -
+    int vs str), so (path, "Idle") and (path, 0) are both valid and mean
+    different things. A 3-tuple gives both explicitly, always in (path,
+    skin_index, source_clip) order, for a file that needs both at once (a
+    non-default skin AND a specific named action within it)."""
+    if not isinstance(clip_spec, tuple):
+        return clip_spec, default_skin_index, None
+    if len(clip_spec) == 3:
+        return clip_spec
+    path, second = clip_spec
+    if isinstance(second, str):
+        return path, default_skin_index, second
+    return path, second, None
 
 
 def _spread_direction(direction, spread_degrees):
@@ -173,6 +237,133 @@ class WeaponsBase:
     # docstring) unblock exactly that much sooner too, automatically.
     draw_speed = 1.0
 
+    # ---- scope (ADS) -----------------------------------------------------
+    # Right-click smoothly eases the CAMERA'S OWN viewmodel-space transform
+    # toward a real point ON THE GUN MODEL (see scope_point/update_scope,
+    # both called from app.py's main loop every frame), NOT a hand-guessed
+    # camera-space offset: the target is MEASURED off the gun's own current
+    # pose every frame (same scene.joint_world_position mechanism muzzle_
+    # position() already uses), so it moves and rotates exactly with the
+    # actual viewmodel - sway, recoil, the draw animation, all of it -
+    # instead of chasing a fixed guess that would drift out of register with
+    # whatever the gun is actually doing on screen. Alongside that, the same
+    # eased fraction also narrows the camera's own FOV toward scope_fov (see
+    # app.py) and, once FULLY eased in (see `scoped`), swaps the ordinary
+    # crosshair for the scope overlay and hides the viewmodel entirely (see
+    # ViewModel.update's own hidden_while_scoped handling) - "looking
+    # through the sight" rather than still seeing the gun in the way. False
+    # by default: most weapons have nothing worth looking through and
+    # right-click does nothing at all for them.
+    has_scope = False
+    # Which bone of the GUN rig (not the arms) the scope point is measured
+    # from, and an optional (x, y, z) offset in THAT bone's own local frame
+    # (None = right at the bone) - same shape/convention as viewmodel_
+    # muzzle_bone/viewmodel_muzzle_offset. None (the base default) means
+    # this weapon has no actual point defined even if has_scope were somehow
+    # set True - scope_point() then always returns None.
+    viewmodel_scope_bone = None
+    viewmodel_scope_offset = None
+    # Seconds to fully ease between hip-fire and fully scoped (and back,
+    # same rate) - smaller is snappier. Same "how fast", not "how far" role
+    # as draw_speed's own knob, just expressed as a duration instead of a
+    # multiplier since there's no existing animation clip to scale here.
+    scope_time = 0.2
+    # Camera FOV (degrees) once FULLY scoped - app.py eases camera.fov
+    # between its own normal/hip-fire value and this by the same fraction
+    # update_scope returns, same as everything else about this ADS
+    # transition. Meaningless for a has_scope False weapon (app.py never
+    # reads this unless has_scope is True). Default picked as "a real,
+    # noticeable zoom" for whichever future weapon doesn't bother overriding
+    # it - see pencil.py's own value for an actual sniper-grade zoom.
+    scope_fov = 20.0
+    # Multiplies spread_degrees()'s own result once FULLY scoped, eased in by the exact
+    # same smoothstepped fraction as everything else about this ADS transition (see
+    # spread_degrees' own use of this) - 1.0 (the base default) means scoping gives no
+    # accuracy benefit of its own beyond the camera/FOV/sensitivity effects everyone
+    # already gets. 0.0 means PERFECTLY accurate once fully scoped, however wide
+    # spread_min/spread_max would otherwise be - see pencil.py's own override, a real
+    # sniper rifle's whole reason to look through its scope at all.
+    scope_accuracy_multiplier = 1.0
+    # Played once (not looped, not positional - see update_scope's own add_sound call)
+    # the instant aiming actually STARTS/STOPS - a plain scope-lens zoom sound, same for
+    # every scoped weapon unless a specific one overrides it. None (the base default)
+    # means has_scope True with no sound set just stays silent, same as every other
+    # optional sound slot in this file (fire_sound, muzzle_particle, ...).
+    scope_zoom_in_sound = None
+    scope_zoom_out_sound = None
+
+    def scope_point(self, scene):
+        """World position of this weapon's scope point RIGHT NOW - None if this weapon
+        has no scope, no viewmodel_scope_bone configured, or the first-person gun isn't
+        currently posed/visible (same guards as muzzle_position's own gun branch).
+        Reflects whatever the gun is ACTUALLY doing this frame (sway, recoil, the current
+        animation pose), since it's measured fresh off the live skeleton every call rather
+        than cached - see app.py's own scope-handling for why it's called once a frame,
+        right after viewmodel.update() has finished posing the gun for THIS frame."""
+        if not self.has_scope or not self.viewmodel_scope_bone:
+            return None
+        gun = self._viewmodel.gun if self._viewmodel is not None else None
+        if gun is None or not gun.get("viewmodel_visible"):
+            return None
+        return scene.joint_world_position(
+            gun, self.viewmodel_scope_bone, local_offset=self.viewmodel_scope_offset)
+
+    def update_scope(self, aiming, dt):
+        """Call once a frame (app.py's main loop does, unconditionally - same shape as
+        weapon.update()) with whether the player is CURRENTLY holding right-click (and
+        every other reason it should count right now - alive, not in a menu, not third-
+        person - already folded in by the caller). Eases _scope_blend toward 1.0
+        (aiming) or 0.0 (not) at a rate set by scope_time, and returns that fraction
+        SMOOTHSTEPPED (3t^2-2t^3, an ease-in/ease-out feel rather than a linear blend) -
+        the caller blends the camera between its normal eye position and scope_point()'s
+        own measured world position by this fraction (see app.py's own handling), so it
+        arrives smoothly instead of snapping the instant the button goes down.
+
+        Always 0.0 for a weapon with has_scope False - a caller can call this
+        unconditionally on whatever weapon is active without checking has_scope itself
+        first, same as every other per-frame weapon method here (update(), recoil.apply,
+        ...).
+
+        Forces `aiming` False outright while self.racking is true (a weapon with a rack
+        clip only - see that property's own docstring) - overriding whatever the player
+        is still holding right-click for. A real scope sight picture wouldn't show the
+        bolt being worked at all (the viewmodel is hidden entirely once fully scoped -
+        see ViewModel.update's own hidden_while_scoped), and working a bolt action takes
+        your eye off the scope anyway - so the player is kicked back out to see (and be
+        gated by) the rack animation instead of staring at a frozen sight picture while
+        it plays unseen underneath."""
+        if not self.has_scope:
+            self._scope_blend = 0.0
+            return 0.0
+        if self.racking:
+            aiming = False
+        if aiming != self._was_aiming:
+            # Edge-triggered (the instant the input actually CHANGES, not every frame
+            # it happens to be held) - a plain scope-lens zoom sound, same one whether
+            # aiming started because the player pressed right-click or stopped because
+            # racking just forced it back out (see this method's own racking check
+            # above) - either way the lens is physically moving. Flat, in both ears, at
+            # any distance (universal=True): it's feedback for the player looking
+            # through their OWN scope, not a sound anyone else in the world would hear
+            # (same reasoning as app.py's own hitmarker sound).
+            sound = self.scope_zoom_in_sound if aiming else self.scope_zoom_out_sound
+            if sound and self._scene is not None:
+                self._scene.sound_manager.add_sound(sound, glm.vec3(0.0), loop=False, universal=True)
+            self._was_aiming = aiming
+        target = 1.0 if aiming else 0.0
+        step = dt / max(self.scope_time, 1e-6)
+        if self._scope_blend < target:
+            self._scope_blend = min(target, self._scope_blend + step)
+        else:
+            self._scope_blend = max(target, self._scope_blend - step)
+        return self._scope_blend * self._scope_blend * (3.0 - 2.0 * self._scope_blend)
+
+    @property
+    def scoped(self):
+        """True once fully (or near enough) eased into the scope point - for a later
+        overlay to gate itself on, instead of comparing the raw blend fraction itself."""
+        return self._scope_blend >= 0.999
+
     @property
     def drawing(self):
         """True while this weapon's draw animation is still ACTUALLY playing
@@ -182,6 +373,26 @@ class WeaponsBase:
         weapon with no viewmodel at all (e.g. a remote player's own copy -
         see RemotePlayer) or no "draw" clip loaded."""
         return self._one_shot_still_playing("draw")
+
+    @property
+    def racking(self):
+        """True from the moment a shot is fired (see fire()) until its "rack" (bolt-
+        cycle) animation has actually FINISHED playing - fire() refuses a new shot while
+        this is true, same idea as drawing/reloading. Covers two separate waits: the
+        time between firing (or a resumed weapon switch - see deactivate()'s own
+        comment) and whichever one-shot is currently blocking it ("shoot", or "draw"
+        after a resume) actually finishing (_rack_pending - see fire()/update()), since
+        starting "rack" any earlier would cut that other one off entirely (there's only
+        one active one-shot slot per viewmodel - see ViewModel.play's own docstring),
+        and then "rack" actually playing once it starts. Switching away before either
+        phase finishes makes the NEXT draw start this all over again from scratch
+        instead of silently counting as already cycled (see deactivate()). Always False
+        for a weapon with no "rack" clip loaded (every weapon except a bolt-action one -
+        see pencil.py's own "rack" entry): _rack_pending still gets set for a beat after
+        firing, but the very next update() immediately clears it once nothing's left to
+        wait for - same "nothing loaded, nothing to block on" fallback drawing/reloading
+        already rely on."""
+        return self._rack_pending or self._one_shot_still_playing("rack")
 
     def _one_shot_still_playing(self, state):
         vm = self._viewmodel
@@ -342,6 +553,18 @@ class WeaponsBase:
     # USP's own "reload" entry (see usp.py): unlike pistol_idle.glb/pistol_
     # shoot.glb, pistol_reload.glb's gun rig happens to be its skin 0, not 1
     # (confirmed by inspecting the file directly - it has only one skin).
+    #
+    # It can ALSO be (path, source_clip_name) - a string instead of an int -
+    # to pick ONE of that file's own named actions by name, instead of the
+    # usual "first clip in the file" guess (_first_clip_name): needed for a
+    # file exported with SEVERAL actions sharing one rig instead of this
+    # project's usual one-clip-per-pose-file convention (e.g. pencil.py's
+    # Pencil.glb, which bakes Idle/Shoot/Reload/DrawAction all into ONE
+    # file) - the "first clip" guess would otherwise just pick the same one
+    # action for every state. A 3-tuple (path, skin_index, source_clip_name)
+    # gives both explicitly, for a file that needs a non-default skin AND a
+    # specific named action within it. See _parse_clip_spec's own docstring
+    # for the exact rules.
     viewmodel_animations = {
         "idle": f"{_POSE_DIR}/pistol_idle.glb",
         "shoot": f"{_POSE_DIR}/pistol_shoot.glb",
@@ -376,11 +599,20 @@ class WeaponsBase:
         self._viewmodel = None
         self._clips = {}   # (part, state) -> clip name actually loaded
         self._moving = False
+        # Whether the last set_moving() call skipped applying the moving-yaw spine
+        # correction because an emote was playing - see set_moving's own comment.
+        self._moving_offset_suppressed_by_emote = False
+        self._scope_blend = 0.0   # 0 = hip-fire, 1 = fully scoped - see update_scope
+        self._was_aiming = False  # last frame's `aiming` input - see update_scope's own zoom sound edge-trigger
         # magazine_size <= 0 means "no ammo tracking" (every weapon's old,
         # only behavior) - ammo then just sits unused, can_fire/fire never
         # consult it, and start_reload always refuses (nothing to refill).
         self.ammo = self.magazine_size
         self._reloading = False
+        # Set by fire() right after a shot, waiting for "shoot" to finish before "rack"
+        # itself can start (see racking's own docstring) - cleared either once "rack"
+        # actually starts (update()) or on a weapon switch away mid-wait (deactivate()).
+        self._rack_pending = False
         self._handling_last = (None, 0.0)   # (state, animation time) at the last handling-sound check
 
     # ---- firing --------------------------------------------------------
@@ -390,7 +622,7 @@ class WeaponsBase:
         return self._reloading
 
     def can_fire(self, now=None):
-        if self._reloading or self.drawing:
+        if self._reloading or self.drawing or self.racking:
             return False
         if self.magazine_size > 0 and self.ammo <= 0:
             return False
@@ -431,11 +663,23 @@ class WeaponsBase:
     def spread_degrees(self, now=None):
         """The weapon's accuracy right now: the half-angle (degrees) of the
         cone the next shot would land in - see the accuracy settings above.
-        Reads the clock, so a HUD can poll it every frame."""
+        Reads the clock, so a HUD can poll it every frame.
+
+        Scaled by scope_accuracy_multiplier once scoped in (has_scope only - a weapon
+        that can't scope at all has nothing to ease here), by the exact same smoothstepped
+        fraction driving the camera move/FOV/sensitivity (see update_scope) rather than a
+        hard on/off switch the instant aiming starts - fully resting on spread_min/max
+        when not scoped, and all the way down to scope_accuracy_multiplier's own value
+        (0.0 for a perfectly accurate scoped weapon - see pencil.py) once fully eased
+        in."""
         now = time.perf_counter() if now is None else now
         quiet = now - self._last_fire - self.spread_recovery_delay
         spread = self._spread_at_last_shot - self.spread_recovery * max(0.0, quiet)
-        return max(self.spread_min, spread)
+        spread = max(self.spread_min, spread)
+        if self.has_scope:
+            eased = self._scope_blend * self._scope_blend * (3.0 - 2.0 * self._scope_blend)
+            spread *= 1.0 + (self.scope_accuracy_multiplier - 1.0) * eased
+        return spread
 
     def fire(self, scene, position, direction=None, now=None, follow=None):
         """Pulls the trigger: plays the gunshot at `position` (world space)
@@ -459,6 +703,24 @@ class WeaponsBase:
         self._spread_at_last_shot = min(self.spread_max, spread + self.spread_per_shot)
         self.play_fire_sound(scene, position, follow)
         self.play("shoot")
+        # Schedules a "rack" (bolt-cycle) animation to start once "shoot" itself
+        # finishes (see update()) - NOT right now, since playing it immediately would
+        # cut "shoot" off entirely (one active one-shot slot per viewmodel). ONLY for a
+        # weapon that actually defines a "rack" entry at all (most don't - this is a
+        # bolt-action-specific mechanic, see pencil.py's own) - without this check,
+        # EVERY weapon got gated by _rack_pending/racking (see can_fire()) after every
+        # shot, waiting on "shoot" to finish plus one more update() tick for a no-op
+        # self.play("rack") that has no clip to play - confirmed as a real bug: it
+        # silently capped USP's (and every other non-bolt-action weapon's) real rate of
+        # fire to "however long its OWN shoot animation takes" instead of its own
+        # fire_interval, which happened to read as "as slow as the sniper" since both
+        # ended up bottlenecked by an animation length rather than their own numbers.
+        # Also only when the magazine isn't now empty from this very shot - an empty
+        # magazine reloads instead (see update()'s own auto-reload), and that animation
+        # already covers working the bolt, so racking first would just be a redundant
+        # extra step before the reload even starts. magazine_size <= 0 (no ammo
+        # tracking at all) racks after every shot - there's no "empty" to skip it for.
+        self._rack_pending = "rack" in self.viewmodel_animations and (self.magazine_size <= 0 or self.ammo > 0)
         hit = None
         aim = None
         if direction is not None:
@@ -491,6 +753,20 @@ class WeaponsBase:
         if self.magazine_size <= 0 or self._reloading or self.drawing or self.ammo >= self.magazine_size:
             return False
         self._reloading = True
+        # Cancels any rack still owed from a shot BEFORE this reload (see fire()'s own
+        # _rack_pending comment) - without this, a manual reload pressed while a rack was
+        # still pending/playing left that flag sitting untouched (update()'s reload branch
+        # returns early every tick a reload is in progress, so _rack_pending's own check
+        # never even runs until reload is done), so it got consumed the moment reload
+        # finished and forced an extra rack AFTER it - "Shoot -> Reload -> Rack" instead of
+        # the one-or-the-other "Shoot -> Reload OR Rack -> ready" a reload should give:
+        # working the bolt to reload already re-chambers on its own, so any older,
+        # now-redundant rack debt from before it started should just be forgiven, not
+        # carried through to make the player wait out a second animation afterward. Also
+        # cuts short an actively PLAYING "rack" one-shot the same way (self.play("reload")
+        # right below takes over the viewmodel's one active one-shot slot regardless) -
+        # reloading mid-cycle means the bolt's getting worked by the reload instead.
+        self._rack_pending = False
         self.play("reload")
         return True
 
@@ -544,7 +820,19 @@ class WeaponsBase:
         at all finishes instantly, same as it always refilling used to when
         this was a guessed timer), refilling the magazine and dropping back
         to idle. A no-op for a weapon with no ammo tracking at all
-        (magazine_size <= 0)."""
+        (magazine_size <= 0).
+
+        Also starts a pending "rack" animation (see fire()'s own _rack_
+        pending comment) the instant whatever one-shot is currently blocking
+        it actually finishes - can't start it any earlier (same one-active-
+        one-shot-slot reasoning as every other state here), and checking
+        every frame rather than guessing a clip's length is the same "bound
+        to the real clip" approach drawing/reloading already use. Normally
+        that's "shoot" (fire() just played it); after switching back to a
+        weapon that had its rack interrupted mid-cycle (see deactivate()),
+        it's "draw" instead (set_active plays that fresh on every re-equip) -
+        both are checked so a resumed rack correctly waits for draw to
+        finish instead of cutting it short."""
         self._play_handling_sounds(follow)
         if self._reloading:
             if not self._one_shot_still_playing("reload"):
@@ -552,6 +840,9 @@ class WeaponsBase:
                 self.ammo = self.magazine_size
                 self.play("idle")
             return
+        if self._rack_pending and not self._one_shot_still_playing("shoot") and not self.drawing:
+            self._rack_pending = False
+            self.play("rack")
         if self.magazine_size > 0 and self.ammo <= 0:
             self.start_reload(now)
 
@@ -648,8 +939,10 @@ class WeaponsBase:
         if player_obj is None:
             return
 
-        for state, path in self.player_animations.items():
-            clip = _load_state_clip(scene, player_obj, path, self.player_clip(state))
+        for state, spec in self.player_animations.items():
+            path, skin_index, source_clip = _parse_clip_spec(spec, 0)
+            clip = _load_state_clip(scene, player_obj, path, self.player_clip(state),
+                                    skin_index=skin_index, source_clip=source_clip)
             if clip is not None:
                 self._clips[("player", state)] = clip
 
@@ -703,9 +996,27 @@ class WeaponsBase:
         resume easing itself back to neutral the instant this weapon is
         drawn again - since the viewmodel is camera-relative, that read as
         the gun visibly sliding into place right after the (otherwise
-        instant, blend_duration=0.0) draw cut."""
+        instant, blend_duration=0.0) draw cut.
+
+        Also handles an in-progress "rack" (see fire()/update()'s own _rack_pending):
+        unlike reload, this does NOT just cancel it - a bolt-action player who switches
+        away mid-cycle hasn't actually finished working the bolt, so it's left pending,
+        forcing a FRESH rack (from set_active's own "draw" all the way through) the next
+        time this weapon comes back out, same as a real bolt-action rifle's own bolt
+        doesn't un-cycle itself just because you looked away. self.racking already covers
+        both phases this could be interrupted in - still waiting for "shoot"/"draw" to
+        finish before "rack" even starts, or "rack" itself actually playing - either way
+        becomes a fresh self._rack_pending = True; genuinely not mid-cycle at all (already
+        idle) stays False, exactly like today."""
         if self._reloading:
             self._reloading = False
+        self._rack_pending = self.racking
+        # Snaps back to hip-fire immediately rather than easing out - the NEXT weapon's
+        # own view takes over this same frame, so there's nothing left to visibly ease
+        # (and a lingering nonzero blend would otherwise silently offset the viewmodel
+        # the instant this weapon is drawn again, before update_scope's own first call
+        # that frame has a chance to start easing it back down).
+        self._scope_blend = 0.0
         self._handling_last = (None, 0.0)
         self.recoil.reset()
         self.set_active(False)
@@ -760,10 +1071,12 @@ class WeaponsBase:
                                                 # animations still load on EVERY part below (each
                                                 # is its own add_skeletal call, so its own skeleton
                                                 # - see _load_state_clip's own docstring)
-        for state, path in self.worldmodel_animations.items():
+        for state, spec in self.worldmodel_animations.items():
+            path, skin_index, source_clip = _parse_clip_spec(spec, 0)
             clip_name = f"{self.player_clip(state)}_wm"
             for obj in attached:
-                clip = _load_state_clip(scene, obj, path, clip_name)
+                clip = _load_state_clip(scene, obj, path, clip_name,
+                                        skin_index=skin_index, source_clip=source_clip)
                 if clip is not None:
                     self._clips[("worldmodel", state)] = clip
         idle = self._clips.get(("worldmodel", "idle"))
@@ -781,12 +1094,29 @@ class WeaponsBase:
     def set_moving(self, horizontal_speed):
         """Call each frame with the owner's horizontal speed (m/s): applies or
         releases the moving-yaw correction (player_moving_yaw_degrees) on the
-        pose set by equip_player, crossfading via the usual offset change."""
+        pose set by equip_player, crossfading via the usual offset change.
+
+        Ignored entirely while the player model is mid-emote (see PlayerModel.
+        play_emote/is_emoting): this correction exists to tweak the WEAPON-
+        holding idle pose while walking, which has nothing to do with an
+        emote's own full-body clip sharing the same Spine4-rooted joints
+        (play_emote widens to that same split - see set_upper_override's own
+        docstring) - applying it on top would skew the emote's spine/neck
+        orientation. _moving_offset_suppressed_by_emote forces a fresh
+        reapply the instant an emote that suppressed this correction ends,
+        even if `moving` itself didn't change while it was suppressed -
+        otherwise the correction would stay missing until some LATER,
+        unrelated moving/not-moving edge happened to trigger it again."""
+        model = self._player_model
+        currently_emoting = model is not None and model.is_emoting()
+        resumed_from_emote = self._moving_offset_suppressed_by_emote and not currently_emoting
+        self._moving_offset_suppressed_by_emote = currently_emoting
         moving = horizontal_speed > self.player_moving_speed
-        if moving == self._moving:
+        if moving == self._moving and not resumed_from_emote:
             return
         self._moving = moving
-        model = self._player_model
+        if currently_emoting:
+            return
         if model is not None and getattr(model, "_override_upper_body_root_joints", None) is not None:
             offsets = self._upper_offsets()
             if offsets:

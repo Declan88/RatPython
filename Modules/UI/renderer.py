@@ -12,6 +12,11 @@ import moderngl
 import numpy as np
 import pygame
 
+# The ordinary, undistorted 0..1 UV mapping for a quad's (top-left, top-right,
+# bottom-right, bottom-left) corners - textures are uploaded flipped (see
+# texture_from_surface), so the quad's top edge samples v=1.
+_STANDARD_UV = ((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0))
+
 _VERTEX = """
 #version 330
 uniform vec2 u_screen;
@@ -49,13 +54,17 @@ class DrawList:
     def __init__(self, scale, white_tex):
         self.scale = scale
         self.white = white_tex
-        # (texture, corners, (r, g, b, a), clip) - corners is ((x0,y0), (x1,y0), (x1,y1),
-        # (x0,y1)) in pixel space for every axis-aligned call below (rect/texture/
-        # texture_logical), matching draw()'s own (0,1)/(1,1)/(1,0)/(0,0) UV assignment -
-        # kept as 4 explicit points rather than a plain (x0,y0,x1,y1) rect so texture_
-        # logical_oriented (the damage indicator's rotating arrow - see its own docstring)
-        # can hand back a rotated quad through the exact same draw()/batching path with no
-        # special-casing, instead of needing a second, parallel kind of quad.
+        # (texture, corners, uvs, (r, g, b, a), clip) - corners/uvs are each ((x0,y0),
+        # (x1,y0), (x1,y1), (x0,y1))-shaped 4-tuples (pixel space for corners, 0..1
+        # texture space for uvs) in this same (top-left, top-right, bottom-right,
+        # bottom-left) winding - kept as explicit points rather than a plain
+        # (x0,y0,x1,y1) rect so texture_logical_oriented (the damage indicator's
+        # rotating arrow) and texture_logical_cover (the scope overlay's own aspect-
+        # preserving fit - see its own docstring) can both hand back a non-trivial quad
+        # through this exact same draw()/batching path with no special-casing, instead
+        # of needing a separate kind of quad per caller. uvs defaults to _STANDARD_UV
+        # (0..1 the ordinary way) for every axis-aligned/rotated-but-undistorted call;
+        # only texture_logical_cover ever hands back something else.
         self.quads = []
         self.clip = None  # current clip as pixel (x0, y0, x1, y1), or None
         self._clip_stack = []
@@ -91,18 +100,60 @@ class DrawList:
         s = self.scale
         x0, y0 = round(x * s), round(y * s)
         x1, y1 = round((x + w) * s), round((y + h) * s)
-        self.quads.append((self.white, self._axis_aligned_corners(x0, y0, x1, y1), color, self.clip))
+        self.quads.append((self.white, self._axis_aligned_corners(x0, y0, x1, y1), _STANDARD_UV, color, self.clip))
 
     def texture(self, tex, px, py, pw, ph, color):
         x0, y0 = round(px), round(py)
-        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x0 + pw, y0 + ph), color, self.clip))
+        self.quads.append(
+            (tex, self._axis_aligned_corners(x0, y0, x0 + pw, y0 + ph), _STANDARD_UV, color, self.clip))
 
     def texture_logical(self, tex, logical_rect, color):
         x, y, w, h = logical_rect
         s = self.scale
         x0, y0 = round(x * s), round(y * s)
         x1, y1 = round((x + w) * s), round((y + h) * s)
-        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x1, y1), color, self.clip))
+        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x1, y1), _STANDARD_UV, color, self.clip))
+
+    def texture_logical_cover(self, tex, logical_rect, image_size, color):
+        """Like texture_logical, but preserves the TEXTURE's own aspect ratio instead of
+        stretching it to logical_rect's shape: fits image_size (the texture's own native
+        (w, h), any units - only the ratio matters) undistorted against whichever axis of
+        logical_rect actually constrains it, then EXTENDS to fully cover the other axis
+        by letting that axis's own UV range run outside [0, 1] - relying on the texture's
+        own CLAMP_TO_EDGE wrap mode (set this on `tex` - see texture_from_surface's own
+        repeat_x/y, not the default REPEAT) to repeat its outermost pixel row/column
+        across the leftover space, rather than wrapping back around to the image's
+        opposite edge. Built for a full-screen overlay authored at one fixed aspect ratio
+        (the scope reticle's own 1920x1080) that has to cover an arbitrary window aspect
+        without visibly warping its own centred artwork - a solid-coloured border (this
+        kind of overlay's own vignette) extending this way reads as seamless, unlike
+        texture_logical's own non-uniform stretch or a plain crop-to-cover fit.
+
+        image_size: (w, h) - the texture's own pixel dimensions (or any value in the
+        same ratio; only width/height matters, not the absolute scale)."""
+        x, y, w, h = logical_rect
+        s = self.scale
+        x0, y0 = round(x * s), round(y * s)
+        x1, y1 = round((x + w) * s), round((y + h) * s)
+        screen_w, screen_h = x1 - x0, y1 - y0
+        img_w, img_h = image_size
+        if img_w <= 0 or img_h <= 0 or screen_w <= 0 or screen_h <= 0:
+            return
+        # The scale that fits image_size inside (screen_w, screen_h) undistorted and
+        # without cropping - exactly one axis comes out equal to its own screen size
+        # (the constraining one); the other comes out smaller, leaving a gap.
+        fit_scale = min(screen_w / img_w, screen_h / img_h)
+        fitted_w, fitted_h = img_w * fit_scale, img_h * fit_scale
+        # Per axis: half the screen size expressed in "fitted images" (0.5 exactly on
+        # the constraining axis, since screen_size == fitted_size there -> UV stays
+        # [0, 1] unchanged; > 0.5 on the gap axis, extending UV beyond [0, 1] by exactly
+        # how much gap there is, so the image is still centred).
+        half_u = (screen_w / fitted_w) / 2.0
+        half_v = (screen_h / fitted_h) / 2.0
+        u0, u1 = 0.5 - half_u, 0.5 + half_u
+        v0, v1 = 0.5 - half_v, 0.5 + half_v
+        uvs = ((u0, v1), (u1, v1), (u1, v0), (u0, v0))
+        self.quads.append((tex, self._axis_aligned_corners(x0, y0, x1, y1), uvs, color, self.clip))
 
     def texture_logical_oriented(self, tex, center_logical, forward, logical_size, color):
         """Like texture_logical, but the quad is built from an explicit 2D unit `forward`
@@ -136,7 +187,7 @@ class DrawList:
             (bottom[0] + rx * hw, bottom[1] + ry * hw),
             (bottom[0] - rx * hw, bottom[1] - ry * hw),
         )
-        self.quads.append((tex, corners, color, self.clip))
+        self.quads.append((tex, corners, _STANDARD_UV, color, self.clip))
 
 
 class UIRenderer:
@@ -177,15 +228,15 @@ class UIRenderer:
         self._ensure_capacity(len(quads))
 
         verts = []
-        for _, corners, c, _clip in quads:
-            # y is down in UI space, so the quad's top edge (corners[0]/[1]) samples the
-            # top of the texture (v=1 - textures were uploaded flipped). corners is already
-            # in this exact (top-left, top-right, bottom-right, bottom-left) winding for
-            # every quad, axis-aligned or not - see DrawList's own docstring.
+        for _, corners, uvs, c, _clip in quads:
+            # corners/uvs are already in this exact (top-left, top-right, bottom-right,
+            # bottom-left) winding for every quad, axis-aligned or not - see DrawList's
+            # own docstring.
             (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
+            (u0, v0), (u1, v1), (u2, v2), (u3, v3) = uvs
             verts.extend((
-                x0, y0, 0.0, 1.0, *c,  x1, y1, 1.0, 1.0, *c,  x2, y2, 1.0, 0.0, *c,
-                x0, y0, 0.0, 1.0, *c,  x2, y2, 1.0, 0.0, *c,  x3, y3, 0.0, 0.0, *c,
+                x0, y0, u0, v0, *c,  x1, y1, u1, v1, *c,  x2, y2, u2, v2, *c,
+                x0, y0, u0, v0, *c,  x2, y2, u2, v2, *c,  x3, y3, u3, v3, *c,
             ))
         self.vbo.orphan()     # a fresh buffer: writing the one the GPU may still be reading would stall
         self.vbo.write(np.asarray(verts, dtype="f4").tobytes())
@@ -205,8 +256,8 @@ class UIRenderer:
         start = 0
         for i in range(1, len(quads) + 1):
             if (i == len(quads) or quads[i][0] is not quads[start][0]
-                    or quads[i][3] != quads[start][3]):
-                clip = quads[start][3]
+                    or quads[i][4] != quads[start][4]):
+                clip = quads[start][4]
                 if clip is None:
                     ctx.scissor = None
                 else:

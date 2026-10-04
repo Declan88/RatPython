@@ -110,6 +110,19 @@ EARLY_Z_PREPASS = False
 # squeezed into (from the near end).
 _VIEWMODEL_DEPTH_SCALE = 0.05
 
+# The viewmodel's OWN near clip plane (see Scene._render_viewmodels), much
+# closer than the main camera's own (camera.near, typically 0.1 - see
+# Camera's own default) - built as a separate projection matrix rather than
+# just lowering camera.near globally, since that would reduce depth-buffer
+# precision for the whole WORLD for a problem that's only ever about the
+# viewmodel. Needed now that a weapon can scope in (see WeaponsBase.
+# has_scope/ViewModel.update's own scope_blend handling) and push its own
+# geometry right up to (at full scope, exactly AT) the camera's origin -
+# parts of the gun trailing behind the scope point would otherwise clip
+# through camera.near's own 0.1m plane well before the scope animation
+# even finishes.
+_VIEWMODEL_NEAR = 0.01
+
 # Mirrors pbr_shader.py's own (private) _ALPHA_MODE_TO_INT - kept as a
 # separate constant here rather than importing that one, since it's a
 # plain literal with no real shared-ownership concern, and reaching into
@@ -322,6 +335,15 @@ class Scene:
         # the cached files aren't there yet (e.g. first run).
         self.recalculate_shadows = recalculate_shadows
         self.lightmap_dir = Path("Assets/Lightmaps") / self.__class__.__name__
+
+        # World-space Y below which the local player dies instantly (falling out of the
+        # map, off a cliff into the void, etc.) - checked once per frame in app.py's main
+        # loop against the player capsule's own feet/centre height. None (the default)
+        # means no kill plane at all for this scene - a scene has to opt in by setting this
+        # in its own __init__ (see MainMapScene for a real value), since a scene with no
+        # real bounds yet (or one that's deliberately open, like a space/sky map) shouldn't
+        # suddenly start killing players who've simply wandered somewhere low.
+        self.min_height = None
 
         self.static_objects = []
         self._static_cull = None      # see _visible_statics
@@ -1371,6 +1393,16 @@ class Scene:
             model["roughness"] = float(roughness_overrides[name])
         model["viewmodel"] = True
         model["viewmodel_visible"] = False
+        # Distinct from viewmodel_visible (see that flag's own docstring just above) -
+        # this one ONLY affects _render_viewmodels' own draw filter, set per frame by
+        # ViewModel.update once a scoped-in weapon has fully eased into its sight
+        # picture (WeaponsBase.scoped) and the scope overlay takes over the screen.
+        # viewmodel_visible stays True the whole time, so animation keeps updating and
+        # muzzle_position()/scope_point() keep reading this object's REAL current pose
+        # (still needed - firing while fully scoped should still trace from the gun's
+        # actual current muzzle bone, not a frozen stale one) even while nothing is
+        # actually drawn on screen.
+        model["hidden_while_scoped"] = False
         model["specular_strength"] = 0
         model["transform"] = glm.mat4(1.0)
         model["position"] = glm.vec3(0.0)
@@ -4528,7 +4560,7 @@ class Scene:
         # updating the depth buffer too.
         self._screen.depth_mask = True
 
-    def _render_viewmodels(self):
+    def _render_viewmodels(self, camera):
         """Draws the first-person viewmodels (see add_viewmodel) last, over
         everything else. They must never poke into a wall they're standing
         right against, and the usual fix (clear the depth buffer first)
@@ -4542,7 +4574,12 @@ class Scene:
         _render_scene, so a visible part adds a couple of uniform writes and
         one draw call, and with nothing visible (the third-person/no-arms
         case) this returns before touching any GL state."""
-        visible = [o for o in self.viewmodel_objects if o.get("viewmodel_visible")]
+        # hidden_while_scoped (see add_viewmodel's own docstring) is checked ONLY here -
+        # everywhere else (animation updates, muzzle_position/scope_point) still goes by
+        # viewmodel_visible alone, so a fully-scoped weapon's gun keeps posing/tracking
+        # live even though nothing from it actually reaches the screen this way.
+        visible = [o for o in self.viewmodel_objects
+                   if o.get("viewmodel_visible") and not o.get("hidden_while_scoped")]
         if not visible:
             return
 
@@ -4550,9 +4587,14 @@ class Scene:
         squash = glm.mat4(1.0)
         squash[2][2] = _VIEWMODEL_DEPTH_SCALE
         squash[3][2] = _VIEWMODEL_DEPTH_SCALE - 1.0
-        if self._skeletal_view_proj is None:
-            return
-        view_proj = squash * self._skeletal_view_proj
+        # A SEPARATE projection from the main camera.get_projection_matrix() (only the
+        # near plane actually differs - same fov/aspect/far) - see _VIEWMODEL_NEAR's own
+        # docstring for why this needs its own much-closer near clip instead of reusing
+        # self._skeletal_view_proj (built from camera.near, shared with every other
+        # skeletal object this frame - lowering THAT globally would cost the whole
+        # scene's depth precision for a problem that's only ever about the viewmodel).
+        viewmodel_proj = glm.perspective(glm.radians(camera.fov), camera.aspect, _VIEWMODEL_NEAR, camera.far)
+        view_proj = squash * viewmodel_proj * camera.get_view_matrix()
 
         prog = self.skeletal_program
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -4692,7 +4734,7 @@ class Scene:
         self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
         if self.before_viewmodels is not None:
             self.before_viewmodels()
-        self._render_viewmodels()
+        self._render_viewmodels(camera)
 
 
     # =============================================================
