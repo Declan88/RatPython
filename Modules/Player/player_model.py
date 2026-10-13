@@ -1464,13 +1464,11 @@ class PlayerModel:
         self.obj["visible_in_color"] = bool(visible)
 
     def destroy(self):
-        """Removes this model from the scene. No Scene.remove_skeletal
-        helper exists (nothing in this codebase currently removes a
-        skeletal object once added), so this is the minimal safe
-        teardown - drop it from the list the render/update loops
-        iterate. GPU resource release (VAOs/VBOs/textures) is a
-        pre-existing gap in Scene's own API this doesn't attempt to
-        fix."""
-        if self.obj is not None and self.obj in self._scene.skeletal_objects:
-            self._scene.skeletal_objects.remove(self.obj)
+        """Removes this model from the scene via Scene.remove_skeletal,
+        which also releases its GPU resources (VAOs/VBOs/textures) - a
+        no-op there (and so here) if the scene itself was already torn
+        down first via Scene.destroy() (its own skeletal_objects list is
+        empty by then, so there's nothing left to double-release)."""
+        if self.obj is not None:
+            self._scene.remove_skeletal(self.obj)
         self.obj = None

@@ -27,8 +27,23 @@ class GameMode:
     purely cosmetic, nothing here reads it."""
     name = "Game Mode"
 
+    # Round length in seconds, or None (default - no timer, matching
+    # is_match_over's own "never ends" default) for a mode with no time
+    # limit. Set on a subclass to opt in - see round_remaining below for
+    # how it's actually read, and app.py's own start_game for where the
+    # shared, host-independent clock it reads from gets started.
+    round_duration = None
+
+    # Extra scoreboard columns this mode adds after K/D/KD: ((key, header), ...).
+    # The values themselves live on NetworkManager.local_mode_values (written via
+    # set_local_stat) and RemotePlayer.mode_values (replicated), read via get_stat.
+    stat_columns = ()
+
     def __init__(self, net_mgr, scene=None, spawn_points=None):
         self.net_mgr = net_mgr
+        # A fresh mode starts every mode-specific value from scratch.
+        if net_mgr is not None and hasattr(net_mgr, "local_mode_values"):
+            net_mgr.local_mode_values.clear()
         # Set by app.py whenever the active map changes (a mode that wants
         # to reason about the level - e.g. pick a spawn point via a raycast,
         # or read map-authored spawn markers once that exists - has it
@@ -39,6 +54,24 @@ class GameMode:
         # one point", which is exactly today's single-SPAWN_POSITION
         # behavior - see choose_spawn_position.
         self.spawn_points = list(spawn_points) if spawn_points else [(0.0, 2.0, 3.0)]
+
+    def update(self, dt):
+        """Called once per frame by app.py while a match is running. No-op by
+        default - a mode with per-frame rules (see CheeseWar) overrides it."""
+
+    def get_stat(self, steam_id, key):
+        """A mode-specific value (see stat_columns) for any player, local or
+        remote - 0.0 if they haven't replicated one yet."""
+        net = self.net_mgr
+        if steam_id == net.local_steam_id:
+            return net.local_mode_values.get(key, 0.0)
+        player = net.remote_players.get(steam_id)
+        return player.mode_values.get(key, 0.0) if player is not None else 0.0
+
+    def set_local_stat(self, key, value):
+        """Sets the LOCAL player's mode-specific value; it goes out to every
+        peer with the next state packet."""
+        self.net_mgr.local_mode_values[key] = float(value)
 
     def choose_spawn_position(self):
         """Where the local player (re)spawns - called by app.py's
@@ -82,6 +115,22 @@ class GameMode:
         docstring) - this hook exists for anything ON TOP of that a mode
         wants: an announcement, a win-condition check (see is_match_over),
         a streak bonus. No-op by default."""
+
+    def round_remaining(self):
+        """Seconds left in the round, or None if round_duration isn't
+        set on this mode (no timer at all) OR the shared timer hasn't
+        actually been started yet (see NetworkManager.start_round_timer/
+        get_round_remaining's own docstrings - this just forwards to
+        the latter). Deliberately reads Steam lobby metadata fresh on
+        every call rather than keeping a local countdown - that's what
+        makes this correct for a player who joined mid-round, AND for
+        every remaining player after whichever peer originally started
+        the round (possibly the "host" at the time) has since
+        disconnected: the timestamp lives on the lobby itself, not on
+        any one peer's continued presence."""
+        if self.round_duration is None:
+            return None
+        return self.net_mgr.get_round_remaining()
 
     def is_match_over(self):
         """Whichever mode-specific condition ends the round (a kill/score

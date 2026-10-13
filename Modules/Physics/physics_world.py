@@ -34,6 +34,8 @@ import numpy as np
 from panda3d.core import NodePath, PandaNode, Point3, Vec3, BitMask32
 from Modules.Graphics.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object, _is_no_collision_node
 from Modules.Audio.footstep_materials import guess_physical_material
+from Modules.Physics.collision_shape_cache_io import load_shape_cache, save_shape_cache
+from Modules.Physics.ladders import LadderVolume
 from panda3d.core import Quat as PandaQuat
 from panda3d.bullet import (
     BulletWorld, BulletRigidBodyNode, BulletBoxShape, BulletSphereShape,
@@ -154,6 +156,31 @@ class CollisionGroup:
     # (a second, HEAD-only trace) without the head box competing with the body box in the
     # ordinary bullet trace. Never part of any solid body's mask.
     HEAD = BitMask32.bit(6)
+    # Source-engine-style "player clip" - solid for the PLAYER's own
+    # movement sweep only (CharacterController._sweep_mask/
+    # CameraBoomArm's own analogous mask both include this - it's just
+    # ALL minus a few bits, and this bit was never one of them), never
+    # for a weapon hit-scan raycast (PhysicsWorld.raycast's own default
+    # mask is an explicit union that doesn't include it either). Use
+    # this for an invisible blocking volume that should feel solid to
+    # walk on but never absorb a shot - e.g. ActorBase's own
+    # collision_model_path proxy standing in for a shape real bullets
+    # should instead pass through to hit the ACTUAL mesh (see BULLET
+    # below).
+    PLAYER_CLIP = BitMask32.bit(7)
+    # The flip side of PLAYER_CLIP above: hit by a weapon's hit-scan
+    # raycast (explicitly added to PhysicsWorld.raycast's own default
+    # mask below) but NEVER solid to the player's own movement sweep
+    # (explicitly excluded from CharacterController._sweep_mask/
+    # CameraBoomArm's own analogous mask - everything else here works
+    # the OPPOSITE way, included in the sweep by default since it's just
+    # "ALL minus PLAYER/GIB", so this one bit needs the explicit
+    # exclusion, not PLAYER_CLIP's inclusion). Use this for an actor's
+    # own REAL mesh when it's too expensive/unstable to collide against
+    # for movement (e.g. a morphing shape-key mesh - see CheesePile's
+    # own Cheesepile.glb) but should still register a real per-triangle
+    # hit for shooting it.
+    BULLET = BitMask32.bit(8)
     ALL = BitMask32.all_on()
 
 
@@ -223,6 +250,32 @@ def _build_triangle_mesh_shape(vertices, faces):
     return BulletTriangleMeshShape(tri_mesh, dynamic=False)
 
 
+def _build_or_load_triangle_mesh_shape(model_path, discriminator, scale, vertices, faces, recalculate_shadows):
+    """Wraps _build_triangle_mesh_shape with collision_shape_cache_io.py's
+    disk cache - same recalculate_shadows-driven policy as Scene.
+    bake_static_lighting's own lightmap cache (see that module's own
+    docstring for why this exists at all: the per-triangle addTriangle()
+    loop above, not the trimesh reload that produces vertices/faces, is
+    the actual ~13-second cost on a 138k-face level). True rebuilds and
+    overwrites the cache; False tries the cache first, falling back to
+    building (and then still saving, so a later run benefits) if nothing
+    valid is cached yet."""
+    vertex_count, face_count = len(vertices), len(faces)
+    if not recalculate_shadows:
+        cached = load_shape_cache(
+            BulletTriangleMeshShape, model_path, discriminator, scale, vertex_count, face_count,
+        )
+        if cached is not None:
+            return cached
+        print(
+            f"[PhysicsWorld] recalculate_shadows is False but no valid cached collision "
+            f"shape found for {model_path!r} ({discriminator!r}) - building instead."
+        )
+    shape = _build_triangle_mesh_shape(vertices, faces)
+    save_shape_cache(shape, model_path, discriminator, scale, vertex_count, face_count)
+    return shape
+
+
 class PhysicsWorld:
     """One per Scene (see Scene.__init__'s self.physics). Owns the
     Bullet simulation for that scene's static/dynamic colliders and
@@ -236,6 +289,16 @@ class PhysicsWorld:
         self._node_paths = []
         self._accumulator = 0.0
         self._pre_substep_callbacks = []
+        # Climbable volumes (ladders.py), read by CharacterController every tick.
+        self.ladders = []
+
+    def add_ladder(self, center, rotation, half_extents):
+        """Registers a ladder volume (see ladders.py): an oriented box, `center` and `half_extents` in
+        render space, `rotation` a glm.mat3 of its local axes. Not a collider - nothing is blocked by it;
+        it only lets a CharacterController touching it climb."""
+        ladder = LadderVolume(center, rotation, half_extents)
+        self.ladders.append(ladder)
+        return ladder
 
     def add_pre_substep_callback(self, callback):
         """callback(dt) is invoked once for every fixed-size physics
@@ -333,16 +396,24 @@ class PhysicsWorld:
         hit point, surface normal, distance and owner (see RayHit).
 
         collision_mask defaults to "everything a bullet should stop at":
-        level geometry (STATIC), props (DYNAMIC) and player HITBOXES - but not
-        PLAYER, the local player's own movement hull, which sits at the
-        camera and would otherwise block every shot before it left. Pass a
-        narrower mask to trace against just some of those (e.g. HITBOX alone
+        level geometry (STATIC), props (DYNAMIC), player HITBOXES, and
+        BULLET (an actor's own real mesh, hit-scan-only - see
+        CollisionGroup.BULLET's own docstring for why that's a separate
+        bit rather than just STATIC) - but not PLAYER, the local
+        player's own movement hull, which sits at the camera and would
+        otherwise block every shot before it left, and not PLAYER_CLIP
+        either (an invisible walk-on-only proxy should never itself
+        absorb a shot - see that bit's own docstring). Pass a narrower
+        mask to trace against just some of those (e.g. HITBOX alone
         to ignore walls). One Bullet rayTestClosest - cheap, no allocation
         beyond the result.
 
         line_of_sight is the no-detail version for "is anything in the way"."""
         if collision_mask is None:
-            collision_mask = CollisionGroup.STATIC | CollisionGroup.DYNAMIC | CollisionGroup.HITBOX
+            collision_mask = (
+                CollisionGroup.STATIC | CollisionGroup.DYNAMIC
+                | CollisionGroup.HITBOX | CollisionGroup.BULLET
+            )
         start, end = glm.vec3(from_pos), glm.vec3(to_pos)
         result = self.world.rayTestClosest(to_physics_pos(start), to_physics_pos(end), collision_mask)
         if not result.hasHit():
@@ -365,7 +436,7 @@ class PhysicsWorld:
 
     def add_static_mesh(self, model_path, position=None, rotation=None,
                          scale=None, collision_mask=CollisionGroup.ALL,
-                         exclude_local_bounds=None, material=None):
+                         exclude_local_bounds=None, material=None, recalculate_shadows=True):
         """Exact per-triangle collision built by loading model_path a
         second time through trimesh (cheap - no GPU upload, independent
         of model_loader.py's render-focused load), so level geometry
@@ -385,7 +456,14 @@ class PhysicsWorld:
         overlapping surfaces happens to be closest that tick, flipping
         surface normal and update-direction mid-slide) - this excludes
         them at the source instead of trying to make two independent
-        colliders agree."""
+        colliders agree.
+
+        recalculate_shadows: same name/policy as Scene's own constructor
+        param (pass it straight through - see _add_static_collision) -
+        True rebuilds the collision shape's per-triangle Bullet mesh and
+        overwrites its disk cache; False tries that cache first (see
+        collision_shape_cache_io.py - this is the real cost, not the
+        trimesh reload above, confirmed ~13s vs ~0.1s on mainmap.glb)."""
         vertices, faces = _load_mesh(model_path, scale)
 
         if exclude_local_bounds is not None:
@@ -394,12 +472,15 @@ class PhysicsWorld:
             inside = np.all((centroids >= mins) & (centroids <= maxs), axis=1)
             faces = faces[~inside]
 
-        shape = _build_triangle_mesh_shape(vertices, faces)
+        shape = _build_or_load_triangle_mesh_shape(
+            model_path, exclude_local_bounds, scale, vertices, faces, recalculate_shadows,
+        )
         return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_mesh", material=material)
 
     def add_static_mesh_by_material(self, model_path, position=None, rotation=None,
                                      scale=None, collision_mask=CollisionGroup.ALL,
-                                     material_overrides=None, default_material=None):
+                                     material_overrides=None, default_material=None,
+                                     recalculate_shadows=True):
         """Like add_static_mesh, but builds a SEPARATE Bullet collider
         per distinct material in model_path (the same per-material split
         the render pipeline uses for a multi-material level - see
@@ -439,7 +520,11 @@ class PhysicsWorld:
 
         Returns the list of node paths actually created - one per
         material that got a real collider; a material overridden to
-        None contributes none at all."""
+        None contributes none at all.
+
+        recalculate_shadows: see add_static_mesh's own docstring - same
+        policy, applied independently to EACH material's own cached
+        shape (one per group, not one for the whole file)."""
         groups = load_mesh_groups_by_material(model_path, scale=scale)
         node_paths = []
         for material_name, vertices, faces in groups:
@@ -450,7 +535,9 @@ class PhysicsWorld:
             else:
                 physical_material = guess_physical_material(material_name) or default_material
 
-            shape = _build_triangle_mesh_shape(vertices, faces)
+            shape = _build_or_load_triangle_mesh_shape(
+                model_path, material_name, scale, vertices, faces, recalculate_shadows,
+            )
             node_paths.append(
                 self._add_body(
                     shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
@@ -460,7 +547,8 @@ class PhysicsWorld:
 
     def add_static_mesh_by_object(self, model_path, position=None, rotation=None,
                                    scale=None, collision_mask=CollisionGroup.ALL,
-                                   object_overrides=None, default_material=None):
+                                   object_overrides=None, default_material=None,
+                                   recalculate_shadows=True):
         """Like add_static_mesh_by_material, but splits/matches by each
         mesh's own OBJECT/NODE name (Blender's "Object name" - see
         model_loader.py's load_mesh_groups_by_object) instead of its
@@ -488,7 +576,10 @@ class PhysicsWorld:
 
         Returns the list of node paths actually created - one per object
         that got a real collider; an object overridden to None
-        contributes none at all."""
+        contributes none at all.
+
+        recalculate_shadows: see add_static_mesh's own docstring - same
+        policy, applied independently to EACH object's own cached shape."""
         groups = load_mesh_groups_by_object(model_path, scale=scale)
         node_paths = []
         for node_name, material_name, vertices, faces in groups:
@@ -499,7 +590,9 @@ class PhysicsWorld:
             else:
                 physical_material = guess_physical_material(material_name) or default_material
 
-            shape = _build_triangle_mesh_shape(vertices, faces)
+            shape = _build_or_load_triangle_mesh_shape(
+                model_path, node_name, scale, vertices, faces, recalculate_shadows,
+            )
             node_paths.append(
                 self._add_body(
                     shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
@@ -798,6 +891,38 @@ class PhysicsWorld:
         self._node_paths.append(node_path)
         return node_path
 
+    def add_sphere_trigger(self, radius, position=None, owner=None, collision_mask=CollisionGroup.ALL):
+        """A BulletGhostNode sphere - same non-solid, query-only shape as
+        add_hitbox (never attachRigidBody, so it can never physically
+        collide with or block anything in the simulation step - but note a
+        sweepTestClosest (CharacterController's movement) DOES hit a ghost
+        whose mask overlaps the sweep's, so the default ALL mask makes it
+        act as a wall for the player: pass CollisionGroup.PLAYER (a bit the
+        sweep excludes) for a trigger that only needs to detect the player).
+        Meant to be queried with world.contactTest(result_node_path.node())
+        (see CharacterController._can_stand for the exact pattern - an
+        immediate, on-demand narrow-phase check, not the separately-cached,
+        can-go-stale getOverlappingNodes()) and the contact's own "owner"
+        python tag (same convention add_hitbox/CharacterController's own
+        owner param use) to identify WHOSE body is actually overlapping,
+        rather than trying to pre-filter by collision_mask alone - a plain
+        rigid body (a wall, the floor) would also satisfy a mask-only
+        filter, so the real "is this a player" check happens by tag
+        presence in Python instead (see Modules/Actors/actor_base.py's own
+        update())."""
+        shape = BulletSphereShape(float(radius))
+        node = BulletGhostNode("sphere_trigger")
+        node.addShape(shape)
+        node.setPythonTag("owner", owner)
+        node.setIntoCollideMask(collision_mask)
+
+        node_path = self._root.attachNewNode(node)
+        node_path.setPos(to_physics_pos(position) if position is not None else Point3(0, 0, 0))
+
+        self.world.attachGhost(node)
+        self._node_paths.append(node_path)
+        return node_path
+
     def update_hitbox(self, node_path, position, rotation):
         """Repositions a hitbox created by add_hitbox - identical to
         set_transform's own body (a ghost's transform is externally
@@ -817,6 +942,24 @@ class PhysicsWorld:
         rather than waiting for scene teardown, or it leaks in the
         Bullet world for the rest of the process."""
         self.world.removeGhost(node_path.node())
+        node_path.removeNode()
+        if node_path in self._node_paths:
+            self._node_paths.remove(node_path)
+
+    def remove_body(self, node_path):
+        """Generic teardown for ANY node_path this class returned - a rigid
+        body (add_static_mesh/add_static_box_from_bounds/add_dynamic_*,
+        mass 0 or not) OR a ghost (add_hitbox/add_sphere_trigger) - checks
+        which kind it actually is first, unlike remove_hitbox above (ghost-
+        only despite sharing most of this same body). For an actor that
+        needs to fully disappear mid-game (see Modules/Actors/actor_base.py's
+        own destroy()) rather than only ever being torn down in bulk by
+        destroy() below at process exit."""
+        node = node_path.node()
+        if isinstance(node, BulletRigidBodyNode):
+            self.world.removeRigidBody(node)
+        else:
+            self.world.removeGhost(node)
         node_path.removeNode()
         if node_path in self._node_paths:
             self._node_paths.remove(node_path)

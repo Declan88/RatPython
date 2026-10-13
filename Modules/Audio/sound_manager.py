@@ -2,6 +2,16 @@ import numpy as np
 import pygame
 import glm
 
+# pygame's own mixer default is only 8 - raised once, process-wide, the
+# first time any SoundManager touches the mixer (see preload/add_sound
+# below). 64, not the original 32: a secondary safety margin alongside
+# pause_all's own fix (see its docstring) for the actual root cause of
+# "frequently can't play sounds" - a few scenes' worth of permanently-
+# leaked looping-ambient channels used to eat meaningfully into a pool
+# this size well before a firefight's simultaneous one-shot impacts/
+# gibs/hitmarkers ever got a chance to compete for what was left.
+_NUM_CHANNELS = 64
+
 
 class SoundManager:
     """Positional sound emitters: distance-based volume attenuation plus
@@ -30,6 +40,7 @@ class SoundManager:
         self.emitters = []
         self._listener = None   # (position, right vector) from the last update()
         self._muffled = {}      # (path, cutoff Hz) -> low-passed sample array
+        self._slots = {}        # slot key -> the emitter currently holding it (see add_sound's slot)
 
     @classmethod
     def _muffle_cutoff(cls, dist):
@@ -87,7 +98,7 @@ class SoundManager:
         over the whole clip) instead of on the first shot heard from far away."""
         if not pygame.mixer.get_init():
             pygame.mixer.init()
-            pygame.mixer.set_num_channels(32)
+            pygame.mixer.set_num_channels(_NUM_CHANNELS)
         sound = pygame.mixer.Sound(sound_path)
         if gain != 1.0 or pitch != 1.0:
             self._amplified(sound, sound_path, gain, pitch)
@@ -114,6 +125,7 @@ class SoundManager:
         muffle=False,
         gain=1.0,
         pitch=1.0,
+        slot=None,
     ):
         """falloff="inverse" swaps the flat point-light-style curve for a
         realistic-for-a-game one: full volume inside min_distance, then
@@ -155,10 +167,21 @@ class SoundManager:
         needing a free channel from the pool each time, which with the mixer
         busy could be none. The channel is only reused while one of this
         manager's emitters is still playing the same file on it; otherwise a
-        free one is taken as usual."""
+        free one is taken as usual.
+
+        slot: any hashable key (e.g. ("footstep", steam_id), ("impact", id(gun))). At most ONE
+        sound lives in a slot at a time: a new sound with the same slot takes over the channel
+        of the one already there (cutting it off, whichever file it was) instead of asking the
+        pool for another, so a rapid-fire gun or a sprinting player can't pile up a channel
+        per impact/step - it only ever holds one. Unlike `channel`, nothing needs passing
+        back in; the manager remembers who holds the slot.
+
+        If the pool really is full and a sound would be dropped, the oldest one-shot (one
+        held in a slot first) is cut off to make room, so a new sound is not the one that
+        gets lost."""
         if not pygame.mixer.get_init():
             pygame.mixer.init()
-            pygame.mixer.set_num_channels(32)
+            pygame.mixer.set_num_channels(_NUM_CHANNELS)
 
         cutoff = None
         if muffle and not universal and self._listener is not None:
@@ -173,11 +196,17 @@ class SoundManager:
         if channel is not None and not any(
                 e["channel"] is channel and e["path"] == sound_path for e in self.emitters):
             channel = None
+        if channel is None and slot is not None:
+            held = self._slots.get(slot)
+            if held is not None and self._still_ours(held):
+                channel = held["channel"]
         if channel is not None:
             self.emitters = [e for e in self.emitters if e["channel"] is not channel]
             channel.play(sound, loops=-1 if loop else 0)
         else:
             channel = sound.play(loops=-1 if loop else 0)
+            if channel is None:
+                channel = self._steal_channel(sound, loop)
 
         if channel is None:
             print(f"[SoundManager] No free mixer channel for sound: {sound_path}")
@@ -194,6 +223,7 @@ class SoundManager:
             "universal": bool(universal),
             "follow": follow,
             "falloff": falloff,
+            "slot": slot,
         }
         # Attenuate NOW, from where the listener was at the last update(): a
         # new sound otherwise plays at full volume, dead centre, until the next
@@ -203,7 +233,43 @@ class SoundManager:
         if channel is not None and self._listener is not None:
             self._apply(emitter, *self._listener)
         self.emitters.append(emitter)
+        if slot is not None and channel is not None:
+            self._slots[slot] = emitter
         return emitter
+
+    @staticmethod
+    def _still_ours(emitter):
+        """True if emitter's channel can safely be played on again: it still holds this
+        emitter's own sound, or has finished. A finished channel goes back to the pool and
+        pygame can hand it to an unrelated sound, which must not be cut off."""
+        channel = emitter["channel"]
+        if channel is None:
+            return False
+        try:
+            return (not channel.get_busy()) or channel.get_sound() is emitter["sound"]
+        except Exception:
+            return False
+
+    def _steal_channel(self, sound, loop):
+        """Called when the mixer had no free channel: cuts off the oldest one-shot (preferring
+        one held in a slot - a footstep or impact is the least missed) and plays `sound` on its
+        channel. None if every channel belongs to a looping sound."""
+        victim = None
+        for e in self.emitters:
+            if not e["loop"] and e["channel"] is not None and self._still_ours(e):
+                if e["slot"] is not None:
+                    victim = e
+                    break
+                if victim is None:
+                    victim = e
+        if victim is None:
+            return None
+        channel = victim["channel"]
+        self.emitters = [e for e in self.emitters if e is not victim]
+        if victim["slot"] is not None and self._slots.get(victim["slot"]) is victim:
+            del self._slots[victim["slot"]]
+        channel.play(sound, loops=-1 if loop else 0)
+        return channel
 
     @staticmethod
     def _apply(emitter, listener_pos, right_vec):
@@ -253,6 +319,9 @@ class SoundManager:
                 # Channel object (pygame can reuse a finished channel
                 # for an unrelated sound, and calling .set_volume() on
                 # it afterward would affect that different sound).
+                slot = emitter["slot"]
+                if slot is not None and self._slots.get(slot) is emitter:
+                    del self._slots[slot]
                 continue
 
             self._apply(emitter, listener_pos, right_vec)
@@ -261,34 +330,62 @@ class SoundManager:
         self.emitters = still_active
 
     def pause_all(self):
-        """Pauses every currently-playing emitter's own mixer channel,
-        WITHOUT stopping/clearing them (see resume_all) - for a Scene
-        that's been switched away from but still exists (app.py keeps
-        every Scene constructed for the lifetime of the app, not just
-        the active one - see its own scene-switching code), so its
-        emitters (including a looping ambient sound started once in
-        __init__, never re-triggered) are still there to resume from
-        exactly where they left off if switched back to, rather than
-        needing to restart from the beginning or never play again.
-        Without this, a Scene's own looping sounds keep playing
-        completely independently of whether that Scene is the one
-        actually being rendered/updated - pygame mixer channels have no
-        concept of "which scene is active" on their own, and this
-        project's own per-frame SoundManager.update() (which is what
-        keeps a still-active emitter's volume/panning current) simply
-        isn't called for an inactive Scene at all, which stops it being
-        updated but was never enough to stop it being HEARD."""
+        """STOPS (not merely pauses - see below for why that word
+        changed) every currently-playing emitter's own mixer channel,
+        freeing it back to pygame's shared, process-wide 32-channel
+        pool, for a Scene that's been switched away from but still
+        exists (app.py keeps every Scene constructed for the lifetime
+        of the app, not just the active one - see its own scene-
+        switching code).
+
+        This used to call channel.pause() instead, specifically to
+        resume a looping ambient (started once in a Scene's own
+        __init__, never re-triggered) from exactly where it left off
+        rather than restarting it. That turned out to be exactly why
+        sounds kept failing to play ("[SoundManager] No free mixer
+        channel"): pygame's Channel.get_busy() reports a PAUSED channel
+        as busy forever, same as a genuinely playing one, and
+        update()'s own per-frame sweep (which is what normally frees a
+        finished one-shot's channel) never runs for an inactive Scene
+        at all - so every Scene ever visited with a looping ambient
+        permanently pinned one of the 32 shared slots for the rest of
+        the process's lifetime, even while silent and switched away
+        from. Visit a handful of scenes and the pool is already
+        meaningfully smaller than 32 before a single gunshot/impact/
+        hitmarker one-shot ever competes for it.
+
+        Stopping instead means a paused ambient loop restarts from the
+        beginning on resume_all() rather than resuming mid-loop - a
+        real but inaudible difference for a LOOPING sound (it's on its
+        Nth repeat either way) and the only way to actually give the
+        channel back. Each paused emitter is flagged _paused=True (and
+        its own "channel" set back to None, so update()'s per-frame
+        sweep - which only ever runs for the ACTIVE scene anyway, so
+        wouldn't see this one until resumed regardless - doesn't try to
+        touch a channel that no longer belongs to it) so resume_all()
+        knows which ones it personally stopped, as opposed to one that
+        had already finished/never gotten a channel before this ran."""
         for emitter in self.emitters:
             channel = emitter["channel"]
             if channel is not None:
-                channel.pause()
+                channel.stop()
+                emitter["channel"] = None
+                emitter["_paused"] = True
 
     def resume_all(self):
-        """Undoes pause_all - see that method's own docstring."""
+        """Undoes pause_all - see that method's own docstring for why
+        this REPLAYS (sound.play(), a fresh channel from whatever's
+        free in the pool right now) rather than unpausing: there's no
+        longer a paused channel left to unpause, by design."""
         for emitter in self.emitters:
-            channel = emitter["channel"]
-            if channel is not None:
-                channel.unpause()
+            if not emitter.pop("_paused", False):
+                continue
+            channel = emitter["sound"].play(loops=-1 if emitter["loop"] else 0)
+            emitter["channel"] = channel
+            if channel is None:
+                print(f"[SoundManager] No free mixer channel to resume sound: {emitter['path']}")
+            elif self._listener is not None:
+                self._apply(emitter, *self._listener)
 
     def destroy(self):
         for emitter in self.emitters:
@@ -298,3 +395,4 @@ class SoundManager:
             except Exception:
                 pass
         self.emitters.clear()
+        self._slots.clear()

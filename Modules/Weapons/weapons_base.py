@@ -540,6 +540,12 @@ class WeaponsBase:
     # own frame and units (None = at the bone). For a gun whose barrel tip isn't
     # where the borrowed bone is.
     viewmodel_muzzle_offset = None
+    # Shifts the WHOLE first-person viewmodel (arms and gun together) from where the rig
+    # puts it: (x, y, z) in camera space, metres - +X right, +Y up, -Z forward (so a gun
+    # that sits too close to the eye wants a NEGATIVE z). Applied before the mouse-look sway
+    # and the scope zoom (see ViewModel.update), so muzzle_position()/scope_point() follow it
+    # and a scoped-in view still lands exactly on the eye. (0, 0, 0) = no shift.
+    viewmodel_offset = (0.0, 0.0, 0.0)
 
     # ---- animations (state -> .glb, or None for the model's own clip) ----
     # One set for both parts: the arms and the gun share an armature (the gun
@@ -588,7 +594,10 @@ class WeaponsBase:
     def __init__(self):
         self._last_fire = float("-inf")
         self._spread_at_last_shot = self.spread_min
-        self.recoil = Recoil(self)   # the owner's camera kick - see Recoil.apply
+        # The camera kick this gun's shots go into - see recoil.py. A gun in an Inventory is handed the
+        # player's shared one (Inventory.add) so the kick outlives a weapon switch; this own one is just
+        # for a gun outside an inventory (another player's), where nothing ever applies it.
+        self.recoil = Recoil()
         self._fire_channel = None   # the mixer channel the last shot played on
         self._scene = None
         self._player_model = None
@@ -729,7 +738,7 @@ class WeaponsBase:
             hit = scene.physics.raycast(origin, origin + aim * self.max_range)
         # After the trace: the shot goes where the camera was pointing when the
         # trigger was pulled; the kick moves it for the NEXT one.
-        self.recoil.kick()
+        self.recoil.kick(self)
         # A shot that struck a player is a headshot if the same trace also passes through THAT
         # player's head box (a second trace, against head boxes only - see CollisionGroup.HEAD).
         headshot = False
@@ -989,14 +998,9 @@ class WeaponsBase:
         this weapon later needs a fresh reload, same as most shooters -
         the magazine keeps whatever it had before the reload started.
 
-        Also resets recoil: recoil.apply() (app.py's main loop) only runs
-        for the currently ACTIVE weapon, so an unsettled kick from a shot
-        fired right before switching away would otherwise sit frozen
-        (recoil.update never gets called while inactive to drain it) and
-        resume easing itself back to neutral the instant this weapon is
-        drawn again - since the viewmodel is camera-relative, that read as
-        the gun visibly sliding into place right after the (otherwise
-        instant, blend_duration=0.0) draw cut.
+        Recoil is deliberately NOT touched here: it belongs to the player's
+        camera (Inventory.recoil), is advanced every frame whichever gun is
+        out, and so keeps settling on its own after a switch.
 
         Also handles an in-progress "rack" (see fire()/update()'s own _rack_pending):
         unlike reload, this does NOT just cancel it - a bolt-action player who switches
@@ -1018,7 +1022,6 @@ class WeaponsBase:
         # that frame has a chance to start easing it back down).
         self._scope_blend = 0.0
         self._handling_last = (None, 0.0)
-        self.recoil.reset()
         self.set_active(False)
 
     def _attach_worldmodel(self, scene, player_obj):
@@ -1146,7 +1149,6 @@ class WeaponsBase:
 
     def unequip(self):
         self.unequip_player()
-        self.recoil.reset()
         if self._viewmodel is not None:
             self._viewmodel.clear_weapon()
             self._viewmodel = None

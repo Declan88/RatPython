@@ -31,6 +31,9 @@ source assets. Don't call both add_skybox() and an equirect setup in
 the same scene; whichever renders wouldn't be dangerous, just redundant.
 """
 
+import math
+
+import glm
 import moderngl
 import numpy as np
 from PIL import Image
@@ -335,12 +338,15 @@ EQUIRECT_VERTEX_SHADER = """
 #version 330
 uniform mat4 u_view;
 uniform mat4 u_projection;
+uniform float u_yaw;       // radians: turns the panorama around the vertical axis (0 = as authored)
 
 in vec3 in_position;
 out vec3 v_direction;
 
 void main() {
-    v_direction = in_position;
+    float c = cos(u_yaw), s = sin(u_yaw);
+    v_direction = vec3(c * in_position.x + s * in_position.z, in_position.y,
+                       -s * in_position.x + c * in_position.z);
 
     mat4 rot_view = mat4(mat3(u_view));
     vec4 pos = u_projection * rot_view * vec4(in_position, 1.0);
@@ -353,6 +359,17 @@ EQUIRECT_FRAGMENT_SHADER = """
 uniform sampler2D u_equirect;
 uniform float u_exposure;
 uniform bool u_apply_tonemap;
+uniform float u_yaw;            // radians - the same uniform the vertex shader turns the sky by
+// "Flat" mode (u_flat_span > 0): the panorama is laid straight onto the screen by its own longitude/
+// latitude instead of being projected through a lens, so nothing is stretched however much of it is
+// shown. u_flat_span is the vertical span in degrees (180 = the image's full height); the horizontal
+// span follows from the window's shape. u_view_center is the (u, v) of the screen's centre.
+uniform float u_flat_span;
+uniform vec2 u_viewport;
+uniform vec2 u_view_center;
+// Optional haze toward the scene's fog colour at the horizon (Scene.set_fog's sky_density; 0 = none).
+uniform vec3 u_fog_color;
+uniform float u_fog_sky_density;
 
 in vec3 v_direction;
 out vec4 fragColor;
@@ -371,6 +388,13 @@ void main() {
     // without this).
     float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
     float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI;
+    if (u_flat_span > 0.0) {
+        vec2 n = gl_FragCoord.xy / u_viewport - 0.5;
+        float h_span = u_flat_span * u_viewport.x / u_viewport.y;
+        // (minus yaw: the same sense as the projected mode - a larger yaw slides the scenery right)
+        u = u_view_center.x + n.x * h_span / 360.0 - u_yaw / (2.0 * PI);
+        v = u_view_center.y - n.y * u_flat_span / 180.0;
+    }
 
     vec3 color = texture(u_equirect, vec2(u, v)).rgb * u_exposure;
 
@@ -386,6 +410,11 @@ void main() {
         color = pow(color, vec3(1.0 / 2.2));
     }
 
+    if (u_fog_sky_density > 0.0 && u_flat_span <= 0.0) {
+        float haze = u_fog_sky_density * pow(1.0 - abs(clamp(dir.y, -1.0, 1.0)), 3.0);
+        color = mix(color, u_fog_color, haze);
+    }
+
     fragColor = vec4(color, 1.0);
 }
 """
@@ -393,6 +422,41 @@ void main() {
 
 def create_equirect_skybox_program(ctx):
     return ctx.program(vertex_shader=EQUIRECT_VERTEX_SHADER, fragment_shader=EQUIRECT_FRAGMENT_SHADER)
+
+
+def irradiance_sh_from_equirect(linear_arr, max_width=256):
+    """Diffuse "image based lighting" for an equirect panorama, as 9 spherical-harmonic
+    coefficients (a (9, 3) float array, RGB each; order Y00, Y1-1 (y), Y10 (z), Y11 (x), Y2-2 (xy),
+    Y2-1 (yz), Y20, Y21 (xz), Y22 (x^2-y^2)). pbr_shader.py's env_sh_ambient evaluates it at a surface
+    normal to get the light that surface picks up from the whole sky: the sun-like glows are lit from
+    where they are, the dark ground from below. The coefficients are already cosine-convolved and
+    divided by pi, so a uniform sky of colour c gives exactly c - the same scale as the plain
+    sky/ground average this replaces, and a Lambert surface is just albedo * evaluation.
+
+    linear_arr: (H, W, 3) LINEAR colour (see load_equirect_texture). Uses the same direction
+    convention as EQUIRECT_FRAGMENT_SHADER's mapping: u = atan2(z, x) / 2pi + 0.5, v = 0.5 - asin(y) / pi.
+    Done once at load, on a copy shrunk to max_width (lighting is smooth, so nothing is lost)."""
+    height, width = linear_arr.shape[:2]
+    step = max(1, width // max_width)
+    h, w = height // step, width // step
+    small = linear_arr[:h * step, :w * step].astype(np.float64).reshape(h, step, w, step, 3).mean(axis=(1, 3))
+
+    lon = ((np.arange(w) + 0.5) / w - 0.5) * 2.0 * np.pi          # atan2(z, x)
+    lat = (0.5 - (np.arange(h) + 0.5) / h) * np.pi                # asin(y)
+    lon, lat = np.meshgrid(lon, lat)
+    x, y, z = np.cos(lat) * np.cos(lon), np.sin(lat), np.cos(lat) * np.sin(lon)
+    solid_angle = (2.0 * np.pi / w) * (np.pi / h) * np.cos(lat)   # per pixel
+
+    basis = np.stack([
+        0.282095 * np.ones_like(x),
+        0.488603 * y, 0.488603 * z, 0.488603 * x,
+        1.092548 * x * y, 1.092548 * y * z,
+        0.315392 * (3.0 * z * z - 1.0),
+        1.092548 * x * z, 0.546274 * (x * x - y * y),
+    ])                                                            # (9, h, w)
+    coefficients = np.einsum("khw,hwc,hw->kc", basis, small, solid_angle)
+    convolve = np.array([1.0] + [2.0 / 3.0] * 3 + [0.25] * 5)     # cosine lobe / pi, per band
+    return coefficients * convolve[:, None]
 
 
 def _hemisphere_colors_from_equirect(linear_arr):
@@ -431,7 +495,9 @@ def load_equirect_texture(ctx, path):
     PIL, no extra dependency) are both supported, auto-detected from
     the file extension.
 
-    Returns (texture, is_hdr, sky_color, ground_color). is_hdr tells
+    Returns (texture, is_hdr, sky_color, ground_color, environment_sh). environment_sh is the
+    panorama's diffuse lighting as 9 spherical-harmonic coefficients (see
+    irradiance_sh_from_equirect). is_hdr tells
     render_equirect_skybox whether to apply HDR tonemapping - .exr's
     raw radiance values are unbounded and need it; a normal LDR image
     is already display-ready and would be incorrectly darkened by
@@ -478,8 +544,9 @@ def load_equirect_texture(ctx, path):
     tex.repeat_y = False
 
     sky_color, ground_color = _hemisphere_colors_from_equirect(linear_arr)
+    environment_sh = irradiance_sh_from_equirect(linear_arr)
 
-    return tex, is_hdr, sky_color, ground_color
+    return tex, is_hdr, sky_color, ground_color, environment_sh
 
 
 def create_equirect_skybox_vao(ctx, prog):
@@ -493,7 +560,8 @@ def create_equirect_skybox_vao(ctx, prog):
     return vao, vbo
 
 
-def render_equirect_skybox(ctx, prog, vao, texture, camera, exposure=1.0, apply_tonemap=True):
+def render_equirect_skybox(ctx, prog, vao, texture, camera, exposure=1.0, apply_tonemap=True,
+                           yaw_degrees=0.0, fov_degrees=None, flat_vertical_span=None, fog=None):
     """Call this AFTER rendering all other scene geometry (shadows and
     the color pass), so the skybox only shows through where nothing
     else was drawn.
@@ -507,13 +575,47 @@ def render_equirect_skybox(ctx, prog, vao, texture, camera, exposure=1.0, apply_
     apply_tonemap: whether to run the result through Reinhard tonemap +
     gamma - set this to whatever load_equirect_texture's is_hdr
     returned (True for .exr, False for .png/.jpg/etc) - see the
-    fragment shader's comment for why this matters."""
+    fragment shader's comment for why this matters.
+
+    yaw_degrees: spins the panorama around the vertical axis by this much (a slowly
+    turning menu backdrop passes an angle that grows over time); 0 leaves it as authored.
+
+    fov_degrees: draws the sky with its own vertical field of view instead of the camera's (None =
+    the camera's). The sky is a backdrop at infinity - it never occludes or lines up with anything
+    else - so it can be widened without distorting the scene in front of it. A wider FOV still
+    stretches the sky toward the screen's edges, as any perspective projection does.
+
+    flat_vertical_span: draws the panorama FLAT instead (fov_degrees is then ignored): the screen
+    shows the image as it is authored, this many degrees of its height (180 = all of it, 90 = the
+    middle half, zoomed in) and as much width as the window's shape allows, with no stretching at
+    any size. The yaw scrolls it sideways. None = the normal projected sky.
+
+    fog: Scene.fog (or None). The sky is not fogged like geometry (as in Source, it is infinitely far
+    away) - only if the fog's sky_density is above 0 is it hazed toward the fog colour at the horizon."""
     texture.use(location=0)
     prog["u_equirect"].value = 0
     prog["u_exposure"].value = exposure
+    prog["u_yaw"].value = math.radians(yaw_degrees)
     prog["u_apply_tonemap"].value = apply_tonemap
     prog["u_view"].write(camera.get_view_matrix().to_bytes())
-    prog["u_projection"].write(camera.get_projection_matrix().to_bytes())
+    if fov_degrees is None:
+        projection = camera.get_projection_matrix()
+    else:
+        projection = glm.perspective(glm.radians(fov_degrees), camera.aspect, camera.near, camera.far)
+    prog["u_projection"].write(projection.to_bytes())
+    front = camera.front
+    haze = float(fog["sky_density"]) if fog is not None else 0.0
+    prog["u_fog_sky_density"].value = haze
+    if haze > 0.0:
+        prog["u_fog_color"].value = tuple(fog["color"])
+    prog["u_flat_span"].value = float(flat_vertical_span or 0.0)
+    if flat_vertical_span:
+        _x, _y, view_w, view_h = ctx.viewport
+        prog["u_viewport"].value = (float(view_w), float(view_h))
+        prog["u_view_center"].value = (
+            math.atan2(front.z, front.x) / (2.0 * math.pi) + 0.5,
+            0.5 - math.asin(max(-1.0, min(1.0, front.y))) / math.pi,
+        )
 
     ctx.disable(moderngl.CULL_FACE)
     ctx.depth_func = "<="

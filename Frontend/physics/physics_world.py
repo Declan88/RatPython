@@ -1,0 +1,965 @@
+"""
+Collision/physics backend for Scene: wraps Panda3D's Bullet bindings
+(panda3d.bullet) - Panda3D is already an installed dependency here, so
+this needs no new pip install, and gets a maintained physics engine
+(rigid bodies, capsule sweeping, a ready-made kinematic character
+controller) instead of hand-rolling AABB/capsule-vs-mesh tests. Used
+standalone, without Panda3D's own renderer/ShowBase - a bare NodePath
+tree just hosts the Bullet node attachments Panda3D needs for
+transform tracking; nothing here is ever drawn by Panda3D.
+
+COORDINATE SYSTEMS: this project's renderer (moderngl/glm) is Y-up.
+BulletCharacterControllerNode's fall/step/jump bookkeeping is hardcoded
+to Panda3D's native Z-up axis - it ignores both BulletWorld's gravity
+direction and the capsule shape's own "up" parameter for that internal
+logic (confirmed empirically, not documented anywhere). So this module
+keeps physics space Z-up internally and converts every value crossing
+the render/physics boundary through the to_physics_*/to_render_*
+helpers below - nothing else in this codebase should touch a Panda3D
+Point3/Vec3/Quat directly with a raw render-space value.
+
+COLLISION FILTERING: each body gets one BitMask32 (CollisionGroup
+flags, combinable with |) via its collision_mask parameter. Panda3D-
+Bullet's default filter is a plain bitwise AND check between two
+bodies' masks - not a separate "what am I" vs "what do I hit" pair -
+so two bodies collide only if (a.mask & b.mask) != 0. Leaving
+collision_mask at its default (CollisionGroup.ALL) means "collide with
+everything"; narrow it on both sides of a pairing to carve out
+exceptions (see add_static_box's docstring for a worked example).
+"""
+
+import glm
+import trimesh
+import numpy as np
+from panda3d.core import NodePath, PandaNode, Point3, Vec3, BitMask32
+from Frontend.loading.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object, _is_no_collision_node
+from Frontend.audio.footstep_materials import guess_physical_material
+from Frontend.physics.collision_shape_cache_io import load_shape_cache, save_shape_cache
+from panda3d.core import Quat as PandaQuat
+from panda3d.bullet import (
+    BulletWorld, BulletRigidBodyNode, BulletBoxShape, BulletSphereShape,
+    BulletTriangleMesh, BulletTriangleMeshShape, BulletConvexHullShape,
+    BulletGhostNode,
+)
+
+# Proper (determinant +1) rotation, +90 degrees about X, mapping render
+# Y-up -> physics Z-up while preserving handedness.
+_AXIS_SWAP = glm.angleAxis(glm.radians(90.0), glm.vec3(1.0, 0.0, 0.0))
+_AXIS_SWAP_INV = glm.inverse(_AXIS_SWAP)
+
+# doPhysics(dt, max_substeps, fixed_timestep) can only ever simulate up
+# to max_substeps * fixed_timestep of time in one call, no matter how
+# large dt is - PhysicsWorld.step() clamps dt to that ceiling so a
+# frame-rate stutter makes physics briefly run in slow motion instead
+# of silently falling further and further behind real time each
+# subsequent frame (a "spiral of death").
+_PHYSICS_MAX_SUBSTEPS = 10
+_PHYSICS_FIXED_TIMESTEP = 1.0 / 120.0
+_PHYSICS_MAX_STEP_DT = _PHYSICS_MAX_SUBSTEPS * _PHYSICS_FIXED_TIMESTEP
+
+
+def to_physics_pos(v):
+    r = _AXIS_SWAP * glm.vec3(v)
+    return Point3(r.x, r.y, r.z)
+
+
+def to_render_pos(p):
+    r = _AXIS_SWAP_INV * glm.vec3(p.x, p.y, p.z)
+    return glm.vec3(r.x, r.y, r.z)
+
+
+def to_physics_vec(v):
+    """For values where sign/direction matters - velocities, movement
+    directions, plane normals. NOT for sizes (see to_physics_extent)."""
+    r = _AXIS_SWAP * glm.vec3(v)
+    return Vec3(r.x, r.y, r.z)
+
+
+def to_render_vec(v):
+    r = _AXIS_SWAP_INV * glm.vec3(v.x, v.y, v.z)
+    return glm.vec3(r.x, r.y, r.z)
+
+
+def to_physics_extent(v):
+    """For pure magnitudes (box half-extents) - permutes axes like the
+    others but skips the sign flip a real rotation would introduce,
+    since a negative half-extent is meaningless to BulletBoxShape."""
+    v = glm.vec3(v)
+    return Vec3(abs(v.x), abs(v.z), abs(v.y))
+
+
+def to_physics_quat(q):
+    r = _AXIS_SWAP * q * _AXIS_SWAP_INV
+    return PandaQuat(r.w, r.x, r.y, r.z)
+
+
+def to_render_quat(pq):
+    # getR(), not getW(): Panda's quaternion is a 4-vector (r, i, j, k) whose getW()
+    # is its LAST component (k), so using it produced a non-unit quaternion - a dynamic
+    # body's drawn rotation was wrong and, for anything rolling, visibly stretched.
+    r = glm.quat(pq.getR(), pq.getI(), pq.getJ(), pq.getK())
+    return _AXIS_SWAP_INV * r * _AXIS_SWAP
+
+
+def _euler_to_quat(rotation):
+    """rotation: glm.vec3 of radians, same XYZ order
+    Scene._get_model_matrix applies (rotate X, then Y, then Z)."""
+    rotation = glm.vec3(rotation)
+    return (
+        glm.angleAxis(rotation.x, glm.vec3(1.0, 0.0, 0.0)) *
+        glm.angleAxis(rotation.y, glm.vec3(0.0, 1.0, 0.0)) *
+        glm.angleAxis(rotation.z, glm.vec3(0.0, 0.0, 1.0))
+    )
+
+
+class RayHit:
+    """What a PhysicsWorld.raycast found. Everything is in render space.
+    position/normal: where the ray struck and the surface's normal there;
+    distance: metres from the ray's start; owner: whatever add_hitbox tagged
+    the struck node with (a remote player's steam_id) or None for ordinary
+    level geometry/props; node: the Bullet node itself; material: the
+    struck surface's physical_material name (see Scene.add_static) or None."""
+    __slots__ = ("position", "normal", "distance", "fraction", "owner", "node", "material")
+
+    def __init__(self, position, normal, distance, fraction, owner, node, material=None):
+        self.material = material
+        self.position = position
+        self.normal = normal
+        self.distance = distance
+        self.fraction = fraction
+        self.owner = owner
+        self.node = node
+
+
+class CollisionGroup:
+    """Combinable collision-mask bits (up to 32 available). Two bodies
+    only collide if (a.collision_mask & b.collision_mask) != 0 - see
+    the module docstring. ALL is the default for every add_* method:
+    ordinary solid geometry never needs to think about this at all."""
+    STATIC = BitMask32.bit(0)
+    DYNAMIC = BitMask32.bit(1)
+    PLAYER = BitMask32.bit(2)
+    TRIGGER = BitMask32.bit(3)
+    # Deliberately never combined into any solid body's own collision_mask -
+    # this bit exists purely so a future damage query (a raycast/sweep/
+    # contactTest filtered to this mask) can find hitboxes specifically,
+    # without also picking up ordinary STATIC/DYNAMIC/PLAYER geometry. See
+    # add_hitbox - a hitbox is a BulletGhostNode, never attached as a rigid
+    # body, so it never physically collides with anything regardless of
+    # this bit; Bullet only consults a ghost's mask for manual queries.
+    HITBOX = BitMask32.bit(4)
+    # Gibs (Modules/Gore): collide with level geometry (whose mask is ALL) and each
+    # other, but never with the player hull, hitboxes or props.
+    GIB = BitMask32.bit(5)
+    # Player head hitboxes: a separate group so a shot can ask "did it also pass through a head?"
+    # (a second, HEAD-only trace) without the head box competing with the body box in the
+    # ordinary bullet trace. Never part of any solid body's mask.
+    HEAD = BitMask32.bit(6)
+    # Source-engine-style "player clip" - solid for the PLAYER's own
+    # movement sweep only (CharacterController._sweep_mask/
+    # CameraBoomArm's own analogous mask both include this - it's just
+    # ALL minus a few bits, and this bit was never one of them), never
+    # for a weapon hit-scan raycast (PhysicsWorld.raycast's own default
+    # mask is an explicit union that doesn't include it either). Use
+    # this for an invisible blocking volume that should feel solid to
+    # walk on but never absorb a shot - e.g. ActorBase's own
+    # collision_model_path proxy standing in for a shape real bullets
+    # should instead pass through to hit the ACTUAL mesh (see BULLET
+    # below).
+    PLAYER_CLIP = BitMask32.bit(7)
+    # The flip side of PLAYER_CLIP above: hit by a weapon's hit-scan
+    # raycast (explicitly added to PhysicsWorld.raycast's own default
+    # mask below) but NEVER solid to the player's own movement sweep
+    # (explicitly excluded from CharacterController._sweep_mask/
+    # CameraBoomArm's own analogous mask - everything else here works
+    # the OPPOSITE way, included in the sweep by default since it's just
+    # "ALL minus PLAYER/GIB", so this one bit needs the explicit
+    # exclusion, not PLAYER_CLIP's inclusion). Use this for an actor's
+    # own REAL mesh when it's too expensive/unstable to collide against
+    # for movement (e.g. a morphing shape-key mesh - see CheesePile's
+    # own Cheesepile.glb) but should still register a real per-triangle
+    # hit for shooting it.
+    BULLET = BitMask32.bit(8)
+    ALL = BitMask32.all_on()
+
+
+def _load_mesh(model_path, scale):
+    """Loads model_path independently through trimesh (cheap - no GPU
+    upload, separate from model_loader.py's render-focused load) and
+    returns (vertices, faces), vertices pre-scaled by `scale` if given.
+
+    Loaded as a Scene (not force="mesh") specifically so a nocollision_-prefixed node (model_
+    loader.py's own NO_COLLISION_PREFIX, the mirror of its COLLISION_ONLY_PREFIX - see that
+    module's own comment) can be left out of the merge - everything else, INCLUDING a
+    collision_-prefixed node (that IS exactly the pass meant to pick those up), is merged in
+    unfiltered, same as before this could exclude anything at all. A single-mesh file (no
+    scene graph, so no per-node names to match against either prefix) falls back to using it
+    directly, same as model_loader.py's own _flatten_scene does for that case."""
+    loaded = trimesh.load(str(model_path), process=False)
+    if isinstance(loaded, trimesh.Scene):
+        all_vertices, all_faces, vertex_offset = [], [], 0
+        for node_name in loaded.graph.nodes_geometry:
+            if _is_no_collision_node(node_name):
+                continue
+            transform, geom_name = loaded.graph[node_name]
+            geom = loaded.geometry.get(geom_name)
+            if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0:
+                continue
+            rot, trans = transform[:3, :3], transform[:3, 3]
+            all_vertices.append(np.asarray(geom.vertices) @ rot.T + trans)
+            all_faces.append(np.asarray(geom.faces) + vertex_offset)
+            vertex_offset += len(geom.vertices)
+        vertices = np.concatenate(all_vertices, axis=0) if all_vertices else np.zeros((0, 3), dtype="f8")
+        faces = np.concatenate(all_faces, axis=0) if all_faces else np.zeros((0, 3), dtype="i4")
+    else:
+        vertices = np.asarray(loaded.vertices, dtype="f8")
+        faces = np.asarray(loaded.faces, dtype="i4")
+    vertices = np.asarray(vertices, dtype="f8")
+    if scale is not None:
+        vertices = vertices * np.asarray(glm.vec3(scale), dtype="f8")
+    return vertices, np.asarray(faces, dtype="i4")
+
+
+def _build_triangle_mesh_shape(vertices, faces):
+    """Shared by add_static_mesh and add_static_mesh_by_material - a
+    BulletTriangleMeshShape built from a plain (vertices, faces) pair.
+
+    glTF exports (especially flat-shaded ones) commonly duplicate a
+    vertex's POSITION once per adjacent face so each triangle can carry
+    its own normal - so two triangles that are visually coplanar and
+    share an edge often don't share a vertex index at all in the raw
+    buffer trimesh hands back. Without welding here, Bullet has no way
+    to know those triangles are connected, so it treats their shared
+    edge as an "internal edge" a sweep can snag on (spurious edge/vertex
+    normal instead of the flat face normal) - confirmed as the cause of
+    walking jitter on flat multi-triangle surfaces (see this module's
+    docstring, and torus_scene.py's plane.glb/floorbase.glb comments).
+    A tiny welding distance merges any positions that coincide to within
+    floating-point noise back into shared indices, restoring the
+    adjacency info Bullet needs."""
+    tri_mesh = BulletTriangleMesh()
+    tri_mesh.setWeldingDistance(1e-8)
+    for a, b, c in faces:
+        tri_mesh.addTriangle(
+            to_physics_pos(vertices[a]),
+            to_physics_pos(vertices[b]),
+            to_physics_pos(vertices[c]),
+            True,
+        )
+    return BulletTriangleMeshShape(tri_mesh, dynamic=False)
+
+
+def _build_or_load_triangle_mesh_shape(model_path, discriminator, scale, vertices, faces, recalculate_shadows):
+    """Wraps _build_triangle_mesh_shape with collision_shape_cache_io.py's
+    disk cache - same recalculate_shadows-driven policy as Scene.
+    bake_static_lighting's own lightmap cache (see that module's own
+    docstring for why this exists at all: the per-triangle addTriangle()
+    loop above, not the trimesh reload that produces vertices/faces, is
+    the actual ~13-second cost on a 138k-face level). True rebuilds and
+    overwrites the cache; False tries the cache first, falling back to
+    building (and then still saving, so a later run benefits) if nothing
+    valid is cached yet."""
+    vertex_count, face_count = len(vertices), len(faces)
+    if not recalculate_shadows:
+        cached = load_shape_cache(
+            BulletTriangleMeshShape, model_path, discriminator, scale, vertex_count, face_count,
+        )
+        if cached is not None:
+            return cached
+        print(
+            f"[PhysicsWorld] recalculate_shadows is False but no valid cached collision "
+            f"shape found for {model_path!r} ({discriminator!r}) - building instead."
+        )
+    shape = _build_triangle_mesh_shape(vertices, faces)
+    save_shape_cache(shape, model_path, discriminator, scale, vertex_count, face_count)
+    return shape
+
+
+class PhysicsWorld:
+    """One per Scene (see Scene.__init__'s self.physics). Owns the
+    Bullet simulation for that scene's static/dynamic colliders and
+    lets a CharacterController (character_controller.py) attach a
+    player capsule into the same world."""
+
+    def __init__(self, gravity=9.81):
+        self._root = NodePath(PandaNode("physics_root"))
+        self.world = BulletWorld()
+        self.world.setGravity(Vec3(0, 0, -gravity))
+        self._node_paths = []
+        self._accumulator = 0.0
+        self._pre_substep_callbacks = []
+
+    def add_pre_substep_callback(self, callback):
+        """callback(dt) is invoked once for every fixed-size physics
+        substep this world runs (see step()) - dt is always exactly
+        _PHYSICS_FIXED_TIMESTEP, never a variable render-frame dt. Used
+        by CharacterController to run its Source-engine-style ground/
+        air acceleration at a stable, framerate-independent tick rate -
+        that math needs to happen every physics tick, not once per
+        render frame, the same way Source's own movement code runs on
+        the server's fixed tick rather than the client's render rate."""
+        self._pre_substep_callbacks.append(callback)
+
+    def remove_pre_substep_callback(self, callback):
+        if callback in self._pre_substep_callbacks:
+            self._pre_substep_callbacks.remove(callback)
+
+    def step(self, dt):
+        """Call once per frame (Scene.update already does this).
+
+        Runs its own fixed-size accumulator loop instead of handing
+        Bullet's doPhysics(dt, max_substeps, fixed_timestep) the raw
+        variable per-frame dt directly. That looks like it should be
+        fps-independent (Bullet documents doPhysics as internally
+        sub-stepping to a fixed timestep for exactly this reason), but
+        empirically it is NOT once dt drops below fixed_timestep - which
+        happens at any framerate above ~120fps, i.e. as soon as vsync is
+        off. Confirmed by direct measurement: walking for a fixed
+        simulated 2 seconds at speed 3 covers the correct ~6.0 units at
+        30/60fps, but only ~1.44 units at 500fps and ~0.14 units at
+        5000fps - distance scales down roughly as 1/fps past the
+        threshold, which is why disabling vsync made the player slower.
+        Feeding doPhysics exactly one fixed_timestep-sized step at a
+        time (never smaller) instead of a variable dt sidesteps whatever
+        internal accounting causes that, and measured flat/correct
+        across 30-5000fps in the same test."""
+        self._accumulator = min(self._accumulator + dt, _PHYSICS_MAX_STEP_DT)
+        while self._accumulator >= _PHYSICS_FIXED_TIMESTEP:
+            for callback in self._pre_substep_callbacks:
+                callback(_PHYSICS_FIXED_TIMESTEP)
+            self.world.doPhysics(_PHYSICS_FIXED_TIMESTEP, 1, _PHYSICS_FIXED_TIMESTEP)
+            self._accumulator -= _PHYSICS_FIXED_TIMESTEP
+
+    def get_interpolation_alpha(self):
+        """Fraction (0-1) of a fixed timestep that's elapsed since the
+        last completed substep - i.e. how far real time has crept into
+        the NEXT tick that hasn't been simulated yet. Above ~120fps
+        (see step()'s docstring), most render frames land between two
+        physics substeps, so anything reading a raw physics position
+        every render frame sees it hold still for a frame or two and
+        then jump - most visible at low speed, where each tick's actual
+        movement is small next to that jump. CharacterController.
+        get_position() blends between last tick's and this tick's
+        position by this fraction to smooth that out (the standard
+        fixed-timestep-with-interpolation fix - see e.g. Glenn
+        Fiedler's "Fix Your Timestep!")."""
+        return self._accumulator / _PHYSICS_FIXED_TIMESTEP
+
+    def raycast_light(self, ax, ay, az, bx, by, bz, collision_mask=None):
+        """raycast() for callers that trace hundreds of times a frame (particles): plain floats in,
+        a plain (x, y, z, nx, ny, nz) tuple of render-space hit point and surface normal out (or
+        None) - no glm vectors, no RayHit, and the render->physics axis swap done inline."""
+        if collision_mask is None:
+            collision_mask = CollisionGroup.STATIC
+        result = self.world.rayTestClosest(Point3(ax, -az, ay), Point3(bx, -bz, by), collision_mask)
+        if not result.hasHit():
+            return None
+        p = result.getHitPos()
+        n = result.getHitNormal()
+        return (p.x, p.z, -p.y, n.x, n.z, -n.y)
+
+    def line_of_sight(self, from_pos, to_pos, collision_mask=CollisionGroup.STATIC):
+        """True if nothing in collision_mask (STATIC level geometry by
+        default) sits between from_pos and to_pos, both render-space.
+
+        A single Bullet rayTestClosest against just the STATIC group -
+        cheap (one BVH query, no shape allocation) and safe to call
+        several times per frame per dynamic object, e.g. once per nearby
+        point light to approximate real-time point-light shadowing
+        without the per-light shadow-map/cubemap approach this project
+        deliberately removed (see pbr_shader.py's module docstring - that
+        blew a legacy GLSL register limit as light counts grew). Doing
+        the occlusion test here on the CPU against the same collision
+        mesh already built for player collision instead sidesteps that
+        limit entirely: cost scales with (dynamic objects) x (nearby
+        lights), not with total scene light count, and neither shaders
+        nor GPU shadow-map memory are involved at all."""
+        hit = self.world.rayTestClosest(
+            to_physics_pos(from_pos), to_physics_pos(to_pos), collision_mask,
+        )
+        return not hit.hasHit()
+
+    def raycast(self, from_pos, to_pos, collision_mask=None):
+        """Line trace: the closest thing between from_pos and to_pos (both
+        render space), or None if the segment is clear - a RayHit with the
+        hit point, surface normal, distance and owner (see RayHit).
+
+        collision_mask defaults to "everything a bullet should stop at":
+        level geometry (STATIC), props (DYNAMIC), player HITBOXES, and
+        BULLET (an actor's own real mesh, hit-scan-only - see
+        CollisionGroup.BULLET's own docstring for why that's a separate
+        bit rather than just STATIC) - but not PLAYER, the local
+        player's own movement hull, which sits at the camera and would
+        otherwise block every shot before it left, and not PLAYER_CLIP
+        either (an invisible walk-on-only proxy should never itself
+        absorb a shot - see that bit's own docstring). Pass a narrower
+        mask to trace against just some of those (e.g. HITBOX alone
+        to ignore walls). One Bullet rayTestClosest - cheap, no allocation
+        beyond the result.
+
+        line_of_sight is the no-detail version for "is anything in the way"."""
+        if collision_mask is None:
+            collision_mask = (
+                CollisionGroup.STATIC | CollisionGroup.DYNAMIC
+                | CollisionGroup.HITBOX | CollisionGroup.BULLET
+            )
+        start, end = glm.vec3(from_pos), glm.vec3(to_pos)
+        result = self.world.rayTestClosest(to_physics_pos(start), to_physics_pos(end), collision_mask)
+        if not result.hasHit():
+            return None
+        node = result.getNode()
+        fraction = result.getHitFraction()
+        return RayHit(
+            position=to_render_pos(result.getHitPos()),
+            normal=to_render_vec(result.getHitNormal()),
+            distance=glm.length(end - start) * fraction,
+            fraction=fraction,
+            owner=node.getPythonTag("owner") if node.hasPythonTag("owner") else None,
+            node=node,
+            material=node.getPythonTag("physical_material") if node.hasPythonTag("physical_material") else None,
+        )
+
+    # ---------------------------------------------------------------
+    # STATIC COLLIDERS (mass = 0, never move - level geometry)
+    # ---------------------------------------------------------------
+
+    def add_static_mesh(self, model_path, position=None, rotation=None,
+                         scale=None, collision_mask=CollisionGroup.ALL,
+                         exclude_local_bounds=None, material=None, recalculate_shadows=True):
+        """Exact per-triangle collision built by loading model_path a
+        second time through trimesh (cheap - no GPU upload, independent
+        of model_loader.py's render-focused load), so level geometry
+        collides exactly like it looks. Only valid for STATIC bodies -
+        Bullet requires convex shapes for anything that moves.
+
+        exclude_local_bounds: optional ((min_x,min_y,min_z), (max_x,
+        max_y,max_z)) in the model's own untransformed vertex space -
+        any triangle whose centroid falls inside this box is left out
+        of the collision mesh entirely. For carving out a region that's
+        getting its own simplified collider instead (e.g. a sloped
+        add_static_box standing in for a staircase too fine-grained for
+        the player hull to climb step-by-step - see torus_scene.py).
+        Leaving the fine mesh triangles in there TOO, underneath/around
+        that simplified collider, was confirmed to cause erratic
+        movement (a step-up/settle sweep landing on whichever of the two
+        overlapping surfaces happens to be closest that tick, flipping
+        surface normal and update-direction mid-slide) - this excludes
+        them at the source instead of trying to make two independent
+        colliders agree.
+
+        recalculate_shadows: same name/policy as Scene's own constructor
+        param (pass it straight through - see _add_static_collision) -
+        True rebuilds the collision shape's per-triangle Bullet mesh and
+        overwrites its disk cache; False tries that cache first (see
+        collision_shape_cache_io.py - this is the real cost, not the
+        trimesh reload above, confirmed ~13s vs ~0.1s on mainmap.glb)."""
+        vertices, faces = _load_mesh(model_path, scale)
+
+        if exclude_local_bounds is not None:
+            mins, maxs = np.asarray(exclude_local_bounds[0]), np.asarray(exclude_local_bounds[1])
+            centroids = vertices[faces].mean(axis=1)
+            inside = np.all((centroids >= mins) & (centroids <= maxs), axis=1)
+            faces = faces[~inside]
+
+        shape = _build_or_load_triangle_mesh_shape(
+            model_path, exclude_local_bounds, scale, vertices, faces, recalculate_shadows,
+        )
+        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_mesh", material=material)
+
+    def add_static_mesh_by_material(self, model_path, position=None, rotation=None,
+                                     scale=None, collision_mask=CollisionGroup.ALL,
+                                     material_overrides=None, default_material=None,
+                                     recalculate_shadows=True):
+        """Like add_static_mesh, but builds a SEPARATE Bullet collider
+        per distinct material in model_path (the same per-material split
+        the render pipeline uses for a multi-material level - see
+        model_loader.py's load_mesh_groups_by_material/_flatten_scene_
+        by_material), so different parts of one glb can have entirely
+        different collision behavior (no collider at all for one
+        material, a different physical_material/footstep sound for
+        another) without splitting the level into multiple separate
+        files or add_static calls.
+
+        material_overrides: optional {material_name: str_or_None} - per-
+        material physical_material (see footstep_materials.py), or
+        explicitly None to build NO collider at all for that material's
+        geometry (e.g. a water surface someone should fall/swim through
+        rather than stand on). A material NOT named here at all falls
+        back to `default_material` instead - matched by the same
+        material_name load_mesh_groups_by_material/Scene.add_static's
+        own alpha_mode_overrides use (the glTF material's own authored
+        name, or an opaque id() for an unnamed one).
+
+        default_material: physical_material for every material NOT
+        named in material_overrides at all, AND whose own name doesn't
+        match anything in footstep_materials.guess_physical_material
+        either (see that function's own docstring - checked first, for
+        every material not explicitly named, before falling back to
+        this) - None (footstep_materials.DEFAULT_FOOTSTEP_MATERIAL, same
+        fallback every other add_static_* method here already uses) if
+        not given. NOT the same thing as explicitly overriding a
+        material to None in material_overrides, which skips collision
+        for it entirely rather than just picking a default sound.
+
+        No exclude_local_bounds support (unlike add_static_mesh) - carve
+        the unwanted region out at the material/export level instead
+        (or give it its own material_overrides entry) if this is ever
+        needed; not worth the added complexity for a case with no
+        current caller.
+
+        Returns the list of node paths actually created - one per
+        material that got a real collider; a material overridden to
+        None contributes none at all.
+
+        recalculate_shadows: see add_static_mesh's own docstring - same
+        policy, applied independently to EACH material's own cached
+        shape (one per group, not one for the whole file)."""
+        groups = load_mesh_groups_by_material(model_path, scale=scale)
+        node_paths = []
+        for material_name, vertices, faces in groups:
+            if material_overrides and material_name in material_overrides:
+                physical_material = material_overrides[material_name]
+                if physical_material is None:
+                    continue
+            else:
+                physical_material = guess_physical_material(material_name) or default_material
+
+            shape = _build_or_load_triangle_mesh_shape(
+                model_path, material_name, scale, vertices, faces, recalculate_shadows,
+            )
+            node_paths.append(
+                self._add_body(
+                    shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
+                )
+            )
+        return node_paths
+
+    def add_static_mesh_by_object(self, model_path, position=None, rotation=None,
+                                   scale=None, collision_mask=CollisionGroup.ALL,
+                                   object_overrides=None, default_material=None,
+                                   recalculate_shadows=True):
+        """Like add_static_mesh_by_material, but splits/matches by each
+        mesh's own OBJECT/NODE name (Blender's "Object name" - see
+        model_loader.py's load_mesh_groups_by_object) instead of its
+        material - use this instead when collision decisions are
+        naturally per-OBJECT rather than per-material, e.g. a level
+        built from a handful of shared trim materials reused across many
+        distinct objects, where "this ONE object should have no
+        collision" can't be expressed by naming a material at all
+        (naming that material in add_static_mesh_by_material's own
+        material_overrides would affect EVERY object using it, not just
+        the one intended).
+
+        object_overrides: optional {node_name: str_or_None} - per-object
+        physical_material, or explicitly None to build no collider at
+        all for that object - same shape/semantics as add_static_mesh_
+        by_material's own material_overrides, just matched by node name
+        instead of material name. An object NOT named here at all still
+        gets a guess from its own underlying glTF MATERIAL's name first
+        (see load_mesh_groups_by_object/footstep_materials.guess_
+        physical_material) before falling back to default_material - a
+        node's own name is often not descriptive (mainmap.glb's "Windows"
+        turning out to be sheet metal roofing, say), but what it's
+        actually rendered with usually is. default_material: same as
+        add_static_mesh_by_material's own.
+
+        Returns the list of node paths actually created - one per object
+        that got a real collider; an object overridden to None
+        contributes none at all.
+
+        recalculate_shadows: see add_static_mesh's own docstring - same
+        policy, applied independently to EACH object's own cached shape."""
+        groups = load_mesh_groups_by_object(model_path, scale=scale)
+        node_paths = []
+        for node_name, material_name, vertices, faces in groups:
+            if object_overrides and node_name in object_overrides:
+                physical_material = object_overrides[node_name]
+                if physical_material is None:
+                    continue
+            else:
+                physical_material = guess_physical_material(material_name) or default_material
+
+            shape = _build_or_load_triangle_mesh_shape(
+                model_path, node_name, scale, vertices, faces, recalculate_shadows,
+            )
+            node_paths.append(
+                self._add_body(
+                    shape, 0.0, position, rotation, collision_mask, "static_mesh", material=physical_material,
+                )
+            )
+        return node_paths
+
+    def add_static_box(self, half_extents, position=None, rotation=None,
+                        collision_mask=CollisionGroup.ALL, material=None):
+        """Cheaper approximate collider - an oriented box. Useful for
+        simple blocking volumes (invisible walls, primitive-shaped
+        props) where exact per-triangle collision isn't needed.
+
+        Example - a trigger-style volume only the player should enter,
+        that other dynamic debris passes straight through:
+            physics.add_static_box(
+                (2, 3, 2), position=(0, 1.5, 0),
+                collision_mask=CollisionGroup.TRIGGER | CollisionGroup.PLAYER,
+            )
+        and give the player capsule collision_mask=CollisionGroup.ALL
+        (the default) so it still shares the TRIGGER bit; ordinary
+        debris left at CollisionGroup.ALL shares STATIC/DYNAMIC/PLAYER
+        bits but not TRIGGER's, so (debris.mask & box.mask) == 0."""
+        shape = BulletBoxShape(to_physics_extent(half_extents))
+        return self._add_body(shape, 0.0, position, rotation, collision_mask, "static_box", material=material)
+
+    # ---------------------------------------------------------------
+    # DYNAMIC COLLIDERS (mass > 0 - pushed around by the simulation)
+    # ---------------------------------------------------------------
+
+    def add_dynamic_box(self, half_extents, position=None, rotation=None,
+                         mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                         material=None):
+        shape = BulletBoxShape(to_physics_extent(half_extents))
+        return self._add_body(
+            shape, mass, position, rotation, collision_mask, "dynamic_box",
+            gravity=gravity, kinematic=kinematic, material=material,
+        )
+
+    def add_dynamic_sphere(self, radius, position=None, mass=1.0,
+                            collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                            material=None):
+        shape = BulletSphereShape(float(radius))
+        return self._add_body(
+            shape, mass, position, None, collision_mask, "dynamic_sphere",
+            gravity=gravity, kinematic=kinematic, material=material,
+        )
+
+    def add_dynamic_mesh(self, model_path, position=None, rotation=None,
+                          scale=None, mass=1.0, collision_mask=CollisionGroup.ALL,
+                          gravity=True, kinematic=False, material=None):
+        """Convex-hull collision built from model_path's vertices -
+        Bullet doesn't allow exact triangle-mesh shapes on moving
+        bodies, so this is the closest a dynamic prop can get to its
+        actual visual shape."""
+        vertices, _ = _load_mesh(model_path, scale)
+
+        shape = BulletConvexHullShape()
+        for v in vertices:
+            shape.addPoint(to_physics_pos(v))
+
+        return self._add_body(
+            shape, mass, position, rotation, collision_mask, "dynamic_mesh",
+            gravity=gravity, kinematic=kinematic, material=material,
+        )
+
+    def make_hull_shape(self, points):
+        """A convex-hull collision shape from (N, 3) render-space points (relative to
+        the body's origin). Shapes can be shared by any number of bodies."""
+        shape = BulletConvexHullShape()
+        for v in points:
+            shape.addPoint(to_physics_pos(v))
+        return shape
+
+    def add_dynamic_shape(self, shape, position, rotation_quat, mass, collision_mask,
+                           restitution=0.3, friction=0.7, linear_damping=0.05,
+                           angular_damping=0.1, ccd_radius=None, name="dynamic_shape"):
+        """A dynamic body from a ready-made shape (see make_hull_shape), with the
+        contact settings a debris chunk wants. rotation_quat: glm.quat. ccd_radius
+        turns on continuous collision so fast small chunks can't tunnel through thin
+        floors. Returns its node path (remove with remove_body)."""
+        node_path = self._add_body(shape, mass, position, None, collision_mask, name)
+        node_path.setQuat(to_physics_quat(rotation_quat))
+        node = node_path.node()
+        node.setRestitution(restitution)
+        node.setFriction(friction)
+        node.setLinearDamping(linear_damping)
+        node.setAngularDamping(angular_damping)
+        if ccd_radius:
+            node.setCcdMotionThreshold(1e-7)
+            node.setCcdSweptSphereRadius(float(ccd_radius))
+        return node_path
+
+    def set_body_velocity(self, node_path, linear, angular=None):
+        """Sets a dynamic body's velocity (render-space m/s, and rad/s about the
+        render axes)."""
+        node = node_path.node()
+        node.setLinearVelocity(to_physics_vec(glm.vec3(linear)))
+        if angular is not None:
+            node.setAngularVelocity(to_physics_vec(glm.vec3(angular)))
+
+    def get_body_pose(self, node_path):
+        """(position, rotation) of a body in render space - glm.vec3 and glm.quat - without
+        get_transform's euler-angle conversion (which a per-frame caller doesn't want)."""
+        return to_render_pos(node_path.getPos()), to_render_quat(node_path.getQuat())
+
+    def get_body_quat(self, node_path):
+        """The body's rotation as a render-space glm.quat."""
+        return to_render_quat(node_path.getQuat())
+
+    def remove_body(self, node_path):
+        """Takes a rigid body out of the world for good."""
+        node = node_path.node()
+        if isinstance(node, BulletRigidBodyNode):
+            try:
+                self.world.removeRigidBody(node)
+            except Exception:
+                pass
+        node_path.removeNode()
+        try:
+            self._node_paths.remove(node_path)
+        except ValueError:
+            pass
+
+    # ---------------------------------------------------------------
+    # BOUNDS-DERIVED COLLIDERS (box/sphere sized automatically from a
+    # model's own vertex bounds - convenient when a cheap collider just
+    # needs to roughly match an object's size, without hand-measuring
+    # half_extents/radius yourself)
+    # ---------------------------------------------------------------
+
+    def _bounds_center_and_half_extents(self, model_path, position, rotation, scale):
+        vertices, _ = _load_mesh(model_path, scale)
+        mins, maxs = vertices.min(axis=0), vertices.max(axis=0)
+        half_extents = glm.vec3((maxs - mins) / 2.0)
+        local_center = glm.vec3((maxs + mins) / 2.0)
+
+        rotated_center = _euler_to_quat(rotation) * local_center if rotation is not None else local_center
+        world_center = (glm.vec3(position) if position is not None else glm.vec3(0.0)) + rotated_center
+        return world_center, half_extents
+
+    def add_static_box_from_bounds(self, model_path, position=None, rotation=None,
+                                    scale=None, collision_mask=CollisionGroup.ALL, material=None):
+        """Like add_static_box, but derives half_extents (and re-centers
+        for an off-origin mesh) automatically from model_path's own
+        vertex bounds."""
+        center, half_extents = self._bounds_center_and_half_extents(model_path, position, rotation, scale)
+        return self.add_static_box(
+            half_extents, position=center, rotation=rotation, collision_mask=collision_mask, material=material,
+        )
+
+    def add_dynamic_box_from_bounds(self, model_path, position=None, rotation=None, scale=None,
+                                     mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                                     material=None):
+        """Like add_dynamic_box, but derives half_extents automatically
+        from model_path's own vertex bounds."""
+        center, half_extents = self._bounds_center_and_half_extents(model_path, position, rotation, scale)
+        return self.add_dynamic_box(
+            half_extents, position=center, rotation=rotation, mass=mass,
+            collision_mask=collision_mask, gravity=gravity, kinematic=kinematic, material=material,
+        )
+
+    def add_dynamic_sphere_from_bounds(self, model_path, position=None, scale=None,
+                                        mass=1.0, collision_mask=CollisionGroup.ALL, gravity=True, kinematic=False,
+                                        material=None):
+        """Like add_dynamic_sphere, but derives a radius automatically
+        from model_path's own vertex bounds (the largest half-extent
+        across the 3 axes - errs on the side of a slightly-too-big
+        sphere for a non-cubic mesh rather than clipping through it)."""
+        center, half_extents = self._bounds_center_and_half_extents(model_path, position, None, scale)
+        radius = max(half_extents.x, half_extents.y, half_extents.z)
+        return self.add_dynamic_sphere(
+            radius, position=center, mass=mass, collision_mask=collision_mask,
+            gravity=gravity, kinematic=kinematic, material=material,
+        )
+
+    # ---------------------------------------------------------------
+
+    def _add_body(self, shape, mass, position, rotation, collision_mask, name, gravity=True, kinematic=False,
+                   material=None):
+        node = BulletRigidBodyNode(name)
+        node.addShape(shape)
+
+        if material is not None:
+            # Read back by CharacterController._categorize_position()
+            # off whatever body the player's ground trace hits, so
+            # footstep sounds (see footstep_materials.py) can vary per
+            # surface without the movement code needing any notion of
+            # "which object is this" beyond the Bullet node it already
+            # traces against.
+            node.setPythonTag("physical_material", material)
+
+        if kinematic:
+            # A kinematic body is immovable by any physical force or
+            # collision impulse - completely unlike gravity=False
+            # (still a normal mass-having dynamic body that anything
+            # can shove around, which is exactly why a "spin in place"
+            # object built that way flew off the moment it touched
+            # anything). Its transform is instead driven entirely by
+            # the application every frame (see PhysicsWorld.
+            # set_transform / Scene.update's handling of a _kinematic
+            # object) - Bullet reads that transform for collision
+            # purposes but never writes to it. Conventionally mass=0,
+            # same as a static body, but flagged kinematic so Bullet
+            # still treats it as capable of moving (a mass=0 body
+            # without this flag is assumed permanently fixed).
+            node.setMass(0.0)
+            node.setKinematic(True)
+            node.setDeactivationEnabled(False)
+        else:
+            node.setMass(mass)
+            if mass > 0.0:
+                # Dynamic bodies here are typically just a handful of
+                # props, not enough to need sleep/wake bookkeeping -
+                # always simulating avoids "why did that stop
+                # responding" surprises.
+                node.setDeactivationEnabled(False)
+        node.setIntoCollideMask(collision_mask)
+
+        node_path = self._root.attachNewNode(node)
+        node_path.setPos(to_physics_pos(position) if position is not None else Point3(0, 0, 0))
+        if rotation is not None:
+            node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+        self.world.attachRigidBody(node)
+
+        if not kinematic and mass > 0.0 and not gravity:
+            # A per-body override (BulletRigidBodyNode.setGravity), not
+            # the world's own gravity - this body still has mass and
+            # full contact response (things can push it, it can push
+            # them), it just isn't pulled down by gravity. Meaningless
+            # for mass=0 (static/kinematic) bodies, which gravity never
+            # affects anyway. Set AFTER attachRigidBody, not before -
+            # confirmed empirically that attachRigidBody overwrites any
+            # gravity set beforehand with the world's own, silently
+            # discarding a pre-attach override.
+            node.setGravity(Vec3(0, 0, 0))
+
+        self._node_paths.append(node_path)
+        return node_path
+
+    def get_transform(self, node_path):
+        """Returns (position, rotation) in render space - glm.vec3
+        position, glm.vec3 XYZ-radians rotation - call after step() to
+        sync a dynamic Scene object's transform to wherever physics
+        moved it (see Scene.update)."""
+        return to_render_pos(node_path.getPos()), glm.eulerAngles(to_render_quat(node_path.getQuat()))
+
+    def set_transform(self, node_path, position, rotation):
+        """The inverse of get_transform() - pushes a render-space
+        position/rotation (glm.vec3 position, glm.vec3 XYZ-radians
+        rotation) ONTO a physics node_path, rather than reading physics
+        state off of it. For a KINEMATIC body (see add_dynamic_box's
+        kinematic parameter): unlike a normal dynamic body, whose
+        transform the simulation itself owns and Scene.update() reads
+        FROM every frame, a kinematic body's transform is driven by the
+        application - Bullet reads it back out each step to know where
+        the body is for collision purposes, but never writes to it
+        itself. Call this every frame for a kinematic body instead of
+        get_transform()."""
+        node_path.setPos(to_physics_pos(position))
+        node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+    # ---------------------------------------------------------------
+    # HITBOXES (query-only - never physically solid, never pushed or
+    # pushes anything; groundwork for a future damage system)
+    # ---------------------------------------------------------------
+
+    def add_hitbox(self, half_extents, position=None, rotation=None,
+                    owner=None, collision_mask=CollisionGroup.HITBOX):
+        """A BulletGhostNode box, not a rigid body - unlike every other
+        add_* method here, this deliberately never calls
+        attachRigidBody, so it can never physically collide with
+        anything (push or be pushed) no matter what collision_mask says;
+        Bullet only consults a ghost's mask for manual overlap/sweep
+        queries a future damage system would run against it, never for
+        the main simulation step. owner is tagged onto the node via
+        setPythonTag (same pattern _add_body uses for
+        "physical_material") so a future query can read back whose
+        hitbox it hit - e.g. a remote player's steam_id. Position/
+        rotation follow update_hitbox every frame after this; there is
+        no kinematic flag to set since a ghost was never dynamic to
+        begin with."""
+        shape = BulletBoxShape(to_physics_extent(half_extents))
+        node = BulletGhostNode("hitbox")
+        node.addShape(shape)
+        node.setPythonTag("owner", owner)
+        node.setIntoCollideMask(collision_mask)
+
+        node_path = self._root.attachNewNode(node)
+        node_path.setPos(to_physics_pos(position) if position is not None else Point3(0, 0, 0))
+        if rotation is not None:
+            node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+        self.world.attachGhost(node)
+        self._node_paths.append(node_path)
+        return node_path
+
+    def add_sphere_trigger(self, radius, position=None, owner=None, collision_mask=CollisionGroup.ALL):
+        """A BulletGhostNode sphere - same non-solid, query-only shape as
+        add_hitbox (never attachRigidBody, so it can never physically
+        collide with or block anything in the simulation step - but note a
+        sweepTestClosest (CharacterController's movement) DOES hit a ghost
+        whose mask overlaps the sweep's, so the default ALL mask makes it
+        act as a wall for the player: pass CollisionGroup.PLAYER (a bit the
+        sweep excludes) for a trigger that only needs to detect the player).
+        Meant to be queried with world.contactTest(result_node_path.node())
+        (see CharacterController._can_stand for the exact pattern - an
+        immediate, on-demand narrow-phase check, not the separately-cached,
+        can-go-stale getOverlappingNodes()) and the contact's own "owner"
+        python tag (same convention add_hitbox/CharacterController's own
+        owner param use) to identify WHOSE body is actually overlapping,
+        rather than trying to pre-filter by collision_mask alone - a plain
+        rigid body (a wall, the floor) would also satisfy a mask-only
+        filter, so the real "is this a player" check happens by tag
+        presence in Python instead (see Modules/Actors/actor_base.py's own
+        update())."""
+        shape = BulletSphereShape(float(radius))
+        node = BulletGhostNode("sphere_trigger")
+        node.addShape(shape)
+        node.setPythonTag("owner", owner)
+        node.setIntoCollideMask(collision_mask)
+
+        node_path = self._root.attachNewNode(node)
+        node_path.setPos(to_physics_pos(position) if position is not None else Point3(0, 0, 0))
+
+        self.world.attachGhost(node)
+        self._node_paths.append(node_path)
+        return node_path
+
+    def update_hitbox(self, node_path, position, rotation):
+        """Repositions a hitbox created by add_hitbox - identical to
+        set_transform's own body (a ghost's transform is externally
+        driven exactly like a kinematic rigid body's, physics never
+        writes back to either), kept as its own named method so hitbox
+        call sites don't need to reason about set_transform's kinematic-
+        body-flavored docstring."""
+        node_path.setPos(to_physics_pos(position))
+        node_path.setQuat(to_physics_quat(_euler_to_quat(rotation)))
+
+    def remove_hitbox(self, node_path):
+        """Explicit teardown for one add_hitbox result - needed because
+        destroy()'s bulk cleanup loop below only calls removeRigidBody
+        (guarded by an isinstance(node, BulletRigidBodyNode) check), so
+        it silently skips ghost nodes entirely. Call this promptly on
+        whatever event ends a hitbox's owner (e.g. a peer disconnecting)
+        rather than waiting for scene teardown, or it leaks in the
+        Bullet world for the rest of the process."""
+        self.world.removeGhost(node_path.node())
+        node_path.removeNode()
+        if node_path in self._node_paths:
+            self._node_paths.remove(node_path)
+
+    def remove_body(self, node_path):
+        """Generic teardown for ANY node_path this class returned - a rigid
+        body (add_static_mesh/add_static_box_from_bounds/add_dynamic_*,
+        mass 0 or not) OR a ghost (add_hitbox/add_sphere_trigger) - checks
+        which kind it actually is first, unlike remove_hitbox above (ghost-
+        only despite sharing most of this same body). For an actor that
+        needs to fully disappear mid-game (see Modules/Actors/actor_base.py's
+        own destroy()) rather than only ever being torn down in bulk by
+        destroy() below at process exit."""
+        node = node_path.node()
+        if isinstance(node, BulletRigidBodyNode):
+            self.world.removeRigidBody(node)
+        else:
+            self.world.removeGhost(node)
+        node_path.removeNode()
+        if node_path in self._node_paths:
+            self._node_paths.remove(node_path)
+
+    def destroy(self):
+        for node_path in self._node_paths:
+            node = node_path.node()
+            if isinstance(node, BulletRigidBodyNode):
+                try:
+                    self.world.removeRigidBody(node)
+                except Exception:
+                    pass
+            node_path.removeNode()
+        self._node_paths.clear()

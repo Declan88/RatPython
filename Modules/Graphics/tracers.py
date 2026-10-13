@@ -24,7 +24,7 @@ from Modules.Graphics.tracer_styles import get_style
 HALF_WIDTH = 0.0035  # base ribbon half-width, as a fraction of the screen height (constant on screen)
 MAX_TRACERS = 96
 NEAR_MARGIN = 0.15     # metres in front of the camera a streak is trimmed to
-_FLOATS_PER_VERTEX = 12   # pos 3, other end 3, uv 2, metres 1, fade 1, total 1, seed 1
+_FLOATS_PER_VERTEX = 13   # pos 3, other end 3, uv 2, metres 1, fade 1, total 1, seed 1, end 1
 
 # Additive blending (see render()'s own ctx.blend_func) only ADDS a tracer's color on top of
 # whatever's already drawn - it never darkens or replaces the background. Far away, the beam's
@@ -52,12 +52,21 @@ in float in_metres;          // distance along the path from the muzzle
 in float in_fade;            // intensity 0..1 (a fading tracer also gets thinner)
 in float in_total;           // the whole path's length in metres
 in float in_seed;            // random per shot
+in float in_end;             // 0 at the ribbon's tail end, 1 at its head end
 out vec2 v_uv;
 out float v_fade;
 out float v_metres;
 out float v_total;
 out float v_seed;
 out vec3 v_world_pos;
+// Screen-linear (noperspective) distance along the ribbon from its tail, and the ribbon's whole
+// on-screen length, both in ribbon half-widths (the same unit as uv.y) - for a style whose
+// pattern should look the same size all along a shot however perspective squeezes the metres.
+// v_ribbon_y is the across coordinate (uv.y, -1..1) interpolated the same screen-linear way: uv.y itself is
+// perspective-corrected, which skews badly across a ribbon whose two ends are at very different depths.
+noperspective out float v_ribbon_x;
+noperspective out float v_ribbon_y;
+out float v_ribbon_len;
 void main() {
     v_uv = in_uv;
     v_fade = in_fade;
@@ -69,6 +78,10 @@ void main() {
     vec4 o = u_view_proj * vec4(in_other, 1.0);
     vec2 dir = (o.xy / o.w - c.xy / c.w) * u_aspect;
     float len = length(dir);
+    float ribbon_len = len / max(u_width * u_half_px.y, 1e-6);
+    v_ribbon_len = ribbon_len;
+    v_ribbon_x = in_end * ribbon_len;
+    v_ribbon_y = in_uv.y;
     dir = len > 1e-6 ? dir / len : vec2(1.0, 0.0);
     vec2 normal = vec2(-dir.y, dir.x) / u_aspect;
     // Expanded in screen space so the streak is the same thickness along its
@@ -86,6 +99,9 @@ in float v_metres;
 in float v_total;
 in float v_seed;
 in vec3 v_world_pos;
+noperspective in float v_ribbon_x;   // see the vertex shader: screen-linear, in uv.y units
+noperspective in float v_ribbon_y;   // uv.y, screen-linear
+in float v_ribbon_len;
 uniform vec3 u_cam_pos;
 uniform float u_dist_boost;
 uniform float u_dist_boost_max;
@@ -128,7 +144,7 @@ class Tracers:
             # A style that doesn't use an input (e.g. no noise -> no seed) has it
             # optimised out of the program, so that slot is skipped as padding.
             layout = (("in_pos", "3f"), ("in_other", "3f"), ("in_uv", "2f"), ("in_metres", "1f"),
-                      ("in_fade", "1f"), ("in_total", "1f"), ("in_seed", "1f"))
+                      ("in_fade", "1f"), ("in_total", "1f"), ("in_seed", "1f"), ("in_end", "1f"))
             formats = [fmt if name in program else f"{fmt[0]}x4" for name, fmt in layout]
             names = [name for name, _ in layout if name in program]
             vao = self.ctx.vertex_array(program, [(self.buffer, " ".join(formats), *names)])
@@ -176,13 +192,13 @@ class Tracers:
                 a, u0 = a + (b - a) * k, u0 + (u1 - u0) * k
             p0 = t.start + t.direction * a
             p1 = t.start + t.direction * b
-            # (this end, the other end, u, metres, side) for the four corners.
-            corners = ((p0, p1, u0, a, -1.0), (p0, p1, u0, a, 1.0),
-                       (p1, p0, u1, b, 1.0), (p1, p0, u1, b, -1.0))
+            # (this end, the other end, u, metres, side, 0 tail/1 head) for the four corners.
+            corners = ((p0, p1, u0, a, -1.0, 0.0), (p0, p1, u0, a, 1.0, 0.0),
+                       (p1, p0, u1, b, 1.0, 1.0), (p1, p0, u1, b, -1.0, 1.0))
             verts = by_style.setdefault(t.style.name, (t.style, []))[1]
             for i in (0, 1, 2, 0, 2, 3):
-                p, o, u, m, v = corners[i]
-                verts.extend((p.x, p.y, p.z, o.x, o.y, o.z, u, v, m, fade, t.distance, t.seed))
+                p, o, u, m, v, end = corners[i]
+                verts.extend((p.x, p.y, p.z, o.x, o.y, o.z, u, v, m, fade, t.distance, t.seed, end))
         self.active = alive
         if not by_style:
             return

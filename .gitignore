@@ -12,3 +12,8 @@ build_nuitka/
 py_steam_net-main/target/
 py_steam_net-main/.venv/
 py_steam_net-main/dist/
+
+# Packed-asset encryption key (tools/pack_assets.py). NEVER commit; back it up - losing it means every player
+# re-downloads everything on the next update, and old packs can no longer be read.
+asset_key.bin
+Modules/Assets/_asset_key.py

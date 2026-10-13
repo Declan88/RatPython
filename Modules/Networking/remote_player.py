@@ -237,6 +237,7 @@ class RemotePlayer:
         self._kill_seen = None
         self.kills = 0    # kills this player has been credited for (see NetworkManager.local_kills)
         self.deaths = 0   # times this player has died
+        self.mode_values = {}   # game-mode-specific values (e.g. {"cheese": 12.5}) - see NetworkManager.local_mode_values
         self._pending_death = False
         self._alive_wanted = True
         self._dissolving = False    # currently animating a Zap death's dissolve - see _set_dead/update
@@ -308,6 +309,8 @@ class RemotePlayer:
         kills = int(state.get("ki", 0))
         self._kill_seen = kills
         self.kills = kills
+        mode_values = state.get("mv")
+        self.mode_values = {str(k): float(v) for k, v in mode_values.items()} if isinstance(mode_values, dict) else {}
         self._alive_wanted = bool(state.get("a", 1))
         if state.get("n"):
             self.name = str(state["n"])[:32]

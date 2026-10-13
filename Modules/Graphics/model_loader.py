@@ -6,6 +6,8 @@ from PIL import Image
 import trimesh
 
 from Modules.Graphics.lightmap_uv_generator import generate_lightmap_uvs
+from Modules.Physics.ladders import is_ladder_node
+from Modules.Graphics.lightmap_uv_cache_io import load_uv_cache, save_uv_cache
 
 DEFAULT_CREASE_ANGLE_DEG = 30.0
 
@@ -39,7 +41,8 @@ NO_COLLISION_PREFIX = "nocollision_"
 
 
 def _is_no_collision_node(node_name):
-    return node_name.lower().startswith(NO_COLLISION_PREFIX)
+    # (a ladder volume - Modules/Physics/ladders.py - is a marker, so it never collides either)
+    return node_name.lower().startswith(NO_COLLISION_PREFIX) or is_ladder_node(node_name)
 
 def _has_attribute(prog, name):
     try: return prog[name] is not None
@@ -486,7 +489,7 @@ def _flatten_scene(scene):
     all_vertices, all_faces, all_normals, all_uvs, representative, vertex_offset = [], [], [], [], None, 0
     used_node_names = []
     for node_name in scene.graph.nodes_geometry:
-        if _is_collision_only_node(node_name): continue
+        if _is_collision_only_node(node_name) or is_ladder_node(node_name): continue   # a ladder volume is never drawn
         transform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)
         if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0: continue
@@ -572,7 +575,32 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             # vertex array has to be rebuilt to match via the same
             # vertex_remap before anything below reads len(vertices)
             # again.
-            faces, lightmap_uvs, vertex_remap = generate_lightmap_uvs(vertices, faces)
+            #
+            # Cached to disk (lightmap_uv_cache_io.py) keyed on (path,
+            # node_order, vertex/face count) - this chart-building +
+            # packing pass is real per-triangle work that otherwise
+            # reran from scratch on every single scene load for every
+            # mesh shipped without an authored lightmap UV channel
+            # (confirmed as the dominant remaining load-time cost once
+            # recalculate_shadows=False already skips the lighting bake
+            # itself). node_order can be empty for a non-Scene input
+            # (see _flatten_scene's own docstring) - no stable per-node
+            # key to cache against in that case, so this just always
+            # regenerates, same as before this cache existed.
+            orig_vertex_count, orig_face_count = len(vertices), len(faces)
+            cached = (
+                load_uv_cache(path, node_order, orig_vertex_count, orig_face_count)
+                if node_order else None
+            )
+            if cached is not None:
+                faces, lightmap_uvs, vertex_remap = cached
+            else:
+                faces, lightmap_uvs, vertex_remap = generate_lightmap_uvs(vertices, faces)
+                if node_order:
+                    save_uv_cache(
+                        path, node_order, orig_vertex_count, orig_face_count,
+                        faces, lightmap_uvs, vertex_remap,
+                    )
             vertices = vertices[vertex_remap]
             normals = normals[vertex_remap]
             uvs = uvs[vertex_remap]
@@ -709,7 +737,7 @@ def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only
     groups = {}
     order = []
     for node_name in scene.graph.nodes_geometry:
-        if exclude_collision_only and _is_collision_only_node(node_name): continue
+        if exclude_collision_only and (_is_collision_only_node(node_name) or is_ladder_node(node_name)): continue
         if extra_exclude is not None and extra_exclude(node_name): continue
         transform, geom_name = scene.graph[node_name]
         geom = scene.geometry.get(geom_name)

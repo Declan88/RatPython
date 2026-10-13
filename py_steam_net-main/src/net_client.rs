@@ -245,6 +245,19 @@ impl PySteamClient {
         }
     }
 
+    /// The Steam ID of the lobby's current owner (ISteamMatchmaking::GetLobbyOwner), as a u64 -
+    /// 0 if the lobby isn't known yet. Authoritative and cheap (reads Steam's local state), unlike
+    /// guessing from whether a set_lobby_data call "succeeds", which says nothing reliable about
+    /// ownership. Steam hands ownership to another member when the owner leaves.
+    pub fn get_lobby_owner(&self, lobby_id: u64) -> PyResult<u64> {
+        if let Some((client, _)) = &self.client {
+            let matchmaking = client.matchmaking();
+            Ok(matchmaking.lobby_owner(LobbyId::from_raw(lobby_id)).raw())
+        } else {
+            Err(PyRuntimeError::new_err("Client not initialized"))
+        }
+    }
+
     /// Reads one lobby data key (see set_lobby_data). Returns None if the
     /// key isn't set. Works on any lobby whose data this client has cached -
     /// i.e. every lobby a get_lobby_list result just returned, or one it's in.

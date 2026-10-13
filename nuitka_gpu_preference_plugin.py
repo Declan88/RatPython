@@ -70,12 +70,21 @@ class NuitkaPluginGpuPreference(NuitkaPluginBase):
         return sys.platform == "win32"
 
     def getExtraCodeFiles(self):
-        # "onefile_" in the key is required - see this module's own
-        # docstring, point 1, for exactly why a key without it silently
-        # ends up in the wrong binary (the standalone DLL, not the
-        # bootstrap .exe).
+        # "onefile_" in the key is required for a --onefile build - see this
+        # module's own docstring, point 1, for exactly why a key without it
+        # silently ends up in the wrong binary (the standalone DLL, not the
+        # bootstrap .exe). The opposite holds for a plain --standalone build:
+        # there is no bootstrap, and Nuitka drops any "onefile_" key from the
+        # real program, so the symbols would be missing from the .exe and a
+        # switchable-graphics laptop would run the game on its integrated GPU.
+        # Hence the key depends on the mode. After building standalone, check
+        # the .exe's export table (see the docstring's pefile snippet) for both
+        # symbols.
+        from nuitka.options.Options import isOnefileMode      # Nuitka 4.x location (older: nuitka.Options)
+
+        key = "onefile_gpu_preference.c" if isOnefileMode() else "gpu_preference.c"
         return {
-            "onefile_gpu_preference.c": (
+            key: (
                 "// NVIDIA Optimus - see NVIDIA's own published guidance\n"
                 "// on this exact mechanism (\"Enabling High Performance "
                 "Graphics Rendering on Optimus Systems\").\n"

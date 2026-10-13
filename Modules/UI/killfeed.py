@@ -14,7 +14,8 @@ from .widgets import Anchor, Image, Label, Panel
 
 ROW_HEIGHT = 48
 ROW_SPACING = 6
-ICON_SIZE = 32
+ICON_SIZE = 32                  # icon height; the headshot icon is square, weapon icons 2:1
+WEAPON_ICON_ASPECT = 2          # weapon icons are 1024x512
 NAME_FONT_SIZE = 26
 MAX_ROWS = 5   # older rows past this are dropped immediately, not just faded
 PANEL_WIDTH = 460
@@ -105,7 +106,7 @@ class KillFeed(Panel):
         name_label(killer_name, killer_mine)
         icon = weapon_icon(weapon_name)
         if icon:
-            row.add(Image(icon, size=(ICON_SIZE, ICON_SIZE)))
+            row.add(Image(icon, size=(ICON_SIZE * WEAPON_ICON_ASPECT, ICON_SIZE)))
         if headshot:
             row.add(Image(HEADSHOT_ICON, size=(ICON_SIZE, ICON_SIZE)))
         name_label(victim_name, victim_mine)

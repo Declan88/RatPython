@@ -39,6 +39,11 @@ except ImportError:
 
 import numpy as np
 
+from Modules.Graphics.lightmap_uv_cache_io import UV_LAYOUT_VERSION
+
+
+DWA_COMPRESSION_LEVEL = 100.0     # higher = smaller + lossier; see save_lightmap_cache
+
 
 def lightmap_cache_path(lightmap_dir, name):
     """The primary cache file path for a given object name (e.g.
@@ -55,9 +60,18 @@ def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolutio
                          directional_shadow_resolution):
     """array: (H, W, 3) float16 numpy array."""
     if HAS_OPENEXR:
-        # DWAA is lossy but visually identical for smooth baked lighting (mean error
-        # under 1% of the average brightness) and about 2.3x smaller than ZIP.
-        header = {"compression": OpenEXR.DWAA_COMPRESSION, "type": OpenEXR.scanlineimage}
+        # DWAB over DWAA specifically - same lossy-but-visually-identical
+        # tier for smooth baked lighting (DCT-based, same as DWAA), just
+        # a bigger compression block (256 scanlines vs 32) - confirmed
+        # directly against this project's own real baked lightmaps as a
+        # free ~10% smaller than DWAA with no visible quality difference.
+        #
+        # dwaCompressionLevel: OpenEXR's default is 45 (measured identical to
+        # leaving it unset). 100 measured ~20% smaller than 45 on the largest and
+        # on a typical map here, for mean abs error ~0.001 (peak ~0.06 on values
+        # up to ~1.7). 200 was ~40% smaller but peak error ~7% - not used.
+        header = {"compression": OpenEXR.DWAB_COMPRESSION, "type": OpenEXR.scanlineimage,
+                  "dwaCompressionLevel": DWA_COMPRESSION_LEVEL}
         channels = {"RGB": array.astype(np.float16)}
         with OpenEXR.File(header, channels) as outfile:
             outfile.write(str(path))
@@ -65,6 +79,7 @@ def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolutio
             "lightmap_resolution": lightmap_resolution,
             "point_shadow_resolution": point_shadow_resolution,
             "directional_shadow_resolution": directional_shadow_resolution,
+            "uv_layout": UV_LAYOUT_VERSION,
         }))
     else:
         np.savez_compressed(
@@ -72,6 +87,7 @@ def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolutio
             lightmap_resolution=lightmap_resolution,
             point_shadow_resolution=point_shadow_resolution,
             directional_shadow_resolution=directional_shadow_resolution,
+            uv_layout=UV_LAYOUT_VERSION,
         )
 
 
@@ -95,8 +111,8 @@ def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution,
         meta = json.loads(meta_path.read_text())
         if meta.get("lightmap_resolution") != lightmap_resolution or \
            meta.get("point_shadow_resolution") != point_shadow_resolution or \
-           meta.get("directional_shadow_resolution") != directional_shadow_resolution:
-            return None
+           meta.get("directional_shadow_resolution") != directional_shadow_resolution or            meta.get("uv_layout") != UV_LAYOUT_VERSION:
+            return None       # (a cache from before UV layouts were versioned has no key: stale too)
         with OpenEXR.File(str(path)) as infile:
             return infile.channels()["RGB"].pixels.astype(np.float16)
     else:
@@ -105,6 +121,6 @@ def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution,
         with np.load(path) as npz:
             if int(npz["lightmap_resolution"]) != lightmap_resolution or \
                int(npz["point_shadow_resolution"]) != point_shadow_resolution or \
-               int(npz.get("directional_shadow_resolution", -1)) != directional_shadow_resolution:
+               int(npz.get("directional_shadow_resolution", -1)) != directional_shadow_resolution or                int(npz.get("uv_layout", -1)) != UV_LAYOUT_VERSION:
                 return None
             return npz["data"]

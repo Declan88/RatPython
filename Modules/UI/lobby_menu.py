@@ -1,16 +1,26 @@
 """
 The main menu's Host / Join flow.
 
-Host opens a settings panel (lobby name, map dropdown, optional password,
-player count 2-10); Create asks NetworkManager to host and then calls
-on_start(map_key). Join opens a searchable, scrollable list of open lobbies
-(auto-refreshing while open); picking one - after a password prompt if it
-has one - joins it and calls on_start with that lobby's map.
+Host opens a settings panel (lobby name, map dropdown, game mode dropdown,
+optional password, player count 2-10); Create asks NetworkManager to host
+and then calls on_lobby_ready(map_key, mode_key). Join opens a searchable,
+scrollable list of open lobbies (auto-refreshing while open); picking one -
+after a password prompt if it has one - joins it and calls on_lobby_ready
+with that lobby's own map/mode (read back from Steam lobby metadata - see
+NetworkManager.host_lobby/_lobby_info - not from this client's own
+dropdowns, which only exist in the Host panel).
+
+on_lobby_ready, NOT on_start, is what actually fires on a successful host/
+join now - it hands off to the waiting-room screen (Modules/UI/
+lobby_room.py), which is what calls on_start later, once the host presses
+Start there. _start_singleplayer is the one path that still calls on_start
+directly (no lobby, no other players, nothing to wait for).
 
 NetworkManager's on_result callbacks can run inside Steam's callback
 dispatch, so everything they reach here (_on_lobbies/_on_hosted/_on_joined)
-only updates widgets/flags - on_start itself is expected to defer the real
-work (app.py just records a pending start for its main loop).
+only updates widgets/flags - on_start/on_lobby_ready themselves are
+expected to defer the real work (app.py just records a pending start/
+pending lobby-room-entry for its main loop).
 """
 
 from .controls import Checkbox, ColorWheel, ScrollBox, Slider
@@ -35,18 +45,31 @@ def _button(text, on_click, **kw):
 
 class LobbyMenu:
     REFRESH_SECONDS = 6.0
-    MIN_PLAYERS = 2
     MAX_PLAYERS = 10
 
-    def __init__(self, ui, net, maps, on_start, on_hat_change=None, on_color_change=None):
-        """maps: [(display name, scene key), ...]; on_start(scene_key);
-        on_hat_change(hat name or None) fires when the wardrobe pick changes;
-        on_color_change((r, g, b) 0-1 or None) when the fur color does."""
+    def __init__(self, ui, net, maps, modes, on_start, on_lobby_ready=None,
+                 on_hat_change=None, on_color_change=None):
+        """maps: [(display name, scene key), ...]; modes: [(display name,
+        game mode id), ...] - see Modules.GameModes.registry; on_start(
+        scene_key, mode_id); on_hat_change(hat name or None) fires when the
+        wardrobe pick changes; on_color_change((r, g, b) 0-1 or None) when
+        the fur color does.
+
+        on_lobby_ready(map_key, mode_id): fires in place of on_start the
+        instant hosting/joining a REAL lobby succeeds (see _on_hosted/
+        _on_joined) - takes you to the waiting-room screen (Modules/UI/
+        lobby_room.py) instead of straight into gameplay; on_start itself
+        only fires later, once the host presses Start there. None (the
+        default) falls back to on_start directly, same as before this
+        existed - _start_singleplayer never goes through either of these,
+        since there's no lobby/other players to wait for at all."""
         self.ui = ui
         self.net = net
         self.maps = maps
+        self.modes = modes
         self._map_names = {key: name for name, key in maps}
         self.on_start = on_start
+        self.on_lobby_ready = on_lobby_ready or on_start
         self.on_hat_change = on_hat_change
         self.on_color_change = on_color_change
         self.lobbies = []
@@ -65,10 +88,11 @@ class LobbyMenu:
         # the Host/Join flow; the right side is left open for the 3D rat.
         sidebar = root.add(Panel(color=theme.SIDEBAR, size=(theme.SIDEBAR_WIDTH, 0), size_frac=(0, 1),
                                  anchor=Anchor.TOP_LEFT))
+        self._sidebar = sidebar     # hidden while the join panel is up - see _set_join_visible
         sidebar.add(Panel(color=theme.ACCENT, size=(4, 0), size_frac=(0, 1), anchor=Anchor.TOP_RIGHT))
         column = sidebar.add(Panel(anchor=Anchor.TOP_LEFT, offset=(80, 50), layout="vertical",
                                    spacing=14, fit_content=True))
-        column.add(Label("RATWAR", font_size=132, color=theme.ACCENT, font=theme.title_font_path()))
+        column.add(Label("RAT KING", font_size=132, color=theme.ACCENT, font=theme.title_font_path()))
         self._build_profile(column)
         column.add(Panel(size=(1, 18)))  # spacer
         # Multiplayer needs Steam; without it there's nothing HOST/JOIN could actually do
@@ -76,17 +100,26 @@ class LobbyMenu:
         # straight into the main map with no lobby at all. Both live in the same slot,
         # toggled by _update_play_buttons rather than one replacing the other, so this
         # doesn't have to rebuild anything if Reconnect later succeeds mid-session.
-        self.mp_buttons = column.add(Panel(layout="horizontal", spacing=16, fit_content=True))
-        self.mp_buttons.add(_button("HOST", self.toggle_host, size=((_W + 36 - 16) // 2, 84), font_size=40))
-        self.mp_buttons.add(_button("JOIN", self.toggle_join, size=((_W + 36 - 16) // 2, 84), font_size=40))
-        self.sp_button = column.add(_button(
+        # Vertically centred stack. The status line and join list hang below it as their
+        # own widgets (pivot at their top), so showing them never shifts the buttons.
+        middle = sidebar.add(Panel(anchor=Anchor.MIDDLE_LEFT, offset=(80, 0), layout="vertical",
+                                   spacing=14, fit_content=True))
+        self.mp_buttons = middle.add(Panel(layout="vertical", spacing=14, fit_content=True))
+        self.mp_buttons.add(_button("HOST", self.toggle_host, size=(_W + 36, 84), font_size=40))
+        self.mp_buttons.add(_button("JOIN", self.toggle_join, size=(_W + 36, 84), font_size=40))
+        self.sp_button = middle.add(_button(
             "START SINGLEPLAYER", self._start_singleplayer, size=(_W + 36, 84), font_size=36))
-        self.status = column.add(Label("", font_size=26, color=_WARN))
-        self.host_panel = column.add(self._build_host_panel())
-        self.join_panel = column.add(self._build_join_panel())
-        self._update_play_buttons()
+        self.status = sidebar.add(Label("", font_size=26, color=_WARN, anchor=Anchor.MIDDLE_LEFT,
+                                        pivot=(0, 0), offset=(80, 105)))
 
         self._build_wardrobe(root)
+
+        # Fullscreen join window, added last so it covers the sidebar and the rat preview.
+        self.join_panel = root.add(Panel(color=theme.SIDEBAR, size_frac=(1, 1), visible=False))
+        self.join_panel.add(self._build_join_panel())
+        self.join_panel.add(_button("Back", self.toggle_join, size=(160, 60), font_size=30,
+                                    anchor=Anchor.TOP_LEFT, offset=(40, 40)))
+        self._update_play_buttons()     # needs join_panel (and the buttons above), so only now
         return root
 
     def _build_profile(self, column):
@@ -138,14 +171,16 @@ class LobbyMenu:
         self.mp_buttons.visible = available
         self.sp_button.visible = not available
         if not available:
-            self.host_panel.visible = False
-            self.join_panel.visible = False
+            self._set_join_visible(False)
 
     def _start_singleplayer(self):
         """Straight into the main map, no lobby, no Steam needed at all - see maps' own
-        order (main_menu_scene.py builds this from app.py's MAPS, "Main Map" first)."""
+        order (main_menu_scene.py builds this from app.py's MAPS, "Main Map" first).
+        Defaults to "deathmatch" the same way - no mode picker exists outside the
+        Host panel, and this path never touches it."""
         default_map = next((key for name, key in self.maps if key == "mainmap"), self.maps[0][1])
-        self.on_start(default_map)
+        default_mode = next((key for name, key in self.modes if key == "deathmatch"), self.modes[0][1])
+        self.on_start(default_map, default_mode)
 
     def _build_wardrobe(self, root):
         """A card under the 3D rat with the hat dropdown. The choice lives on
@@ -154,6 +189,7 @@ class LobbyMenu:
         shown on the preview rat right away via on_hat_change."""
         hats = available_hats()
         stage = root.add(Panel(anchor=Anchor.TOP_RIGHT, size=(-theme.SIDEBAR_WIDTH, 0), size_frac=(1, 1)))
+        self._stage = stage         # hidden while the join panel is up - see _set_join_visible
         card = stage.add(Panel(color=theme.CARD, anchor=(0.5, 0.84), pivot=(0.5, 0.0),
                               layout="vertical", spacing=10, padding=22, align="center",
                               fit_content=True))
@@ -271,39 +307,26 @@ class LobbyMenu:
         return Panel(color=theme.CARD, layout="vertical", spacing=10, padding=18,
                      fit_content=True, size=(_W + 36, 0), visible=False)
 
-    def _build_host_panel(self):
-        p = self._panel()
-        p.add(Label("Lobby name", font_size=24, color=_MUTED))
-        self.name_input = p.add(TextInput("RatWar Lobby", max_length=24, size=(_W, 54), font_size=26))
-        p.add(Label("Map", font_size=24, color=_MUTED))
-        self.map_dropdown = p.add(Dropdown([name for name, _ in self.maps], size=(_W, 54), font_size=26))
-        p.add(Label("Password (optional)", font_size=24, color=_MUTED))
-        self.pass_input = p.add(TextInput(password=True, placeholder="No password",
-                                          max_length=24, size=(_W, 54), font_size=26))
-        self.players_label = p.add(Label("", font_size=24, color=_MUTED))
-        self.players_slider = p.add(Slider(4, self.MIN_PLAYERS, self.MAX_PLAYERS, step=1,
-                                           size=(_W, 36), on_change=self._on_players))
-        self._on_players(4)
-        p.add(_button("Create lobby", self._create, size=(_W, 68), font_size=34))
-        return p
-
     def _build_join_panel(self):
-        p = self._panel()
-        search = p.add(Panel(layout="horizontal", spacing=10, fit_content=True))
+        # Fills the fullscreen overlay (below the Back button), not _panel()'s fixed card.
+        p = Panel(color=theme.CARD, layout="vertical", spacing=10, padding=18,
+                  size=(-160, -240), size_frac=(1, 1), anchor=Anchor.CENTER)
+        search = p.add(Panel(layout="horizontal", spacing=10, fit_content=True, size_frac=(1, 0)))
         self.search_input = search.add(TextInput(placeholder="Search lobby name...",
-                                                 max_length=24, size=(_W - 160, 54), font_size=26,
+                                                 max_length=24, size=(-170, 54), size_frac=(1, 0),
+                                                 font_size=26,
                                                  on_change=lambda _t: self._rebuild_rows()))
         search.add(_button("Refresh", self.refresh, size=(150, 54), font_size=26))
 
         # Header columns line up with _make_row's label anchors: the list's
         # rows sit 6px in (ScrollBox padding) and are 502 wide (524 minus
         # padding and the scrollbar).
-        header = p.add(Panel(size=(_W - 22, 26), offset=(6, 0)))
+        header = p.add(Panel(size=(-22, 26), size_frac=(1, 0), offset=(6, 0)))
         header.add(Label("Lobby", font_size=22, color=_MUTED, anchor=(0, 0.5), offset=(12, 0)))
         header.add(Label("Map", font_size=22, color=_MUTED, anchor=(0.56, 0.5), pivot=(0, 0.5)))
         header.add(Label("Players", font_size=22, color=_MUTED, anchor=(0.86, 0.5), pivot=(0, 0.5)))
 
-        self.list = p.add(ScrollBox(size=(_W, 330), padding=6, spacing=8))
+        self.list = p.add(ScrollBox(size=(0, -150), size_frac=(1, 1), padding=6, spacing=8))
         self.list_status = p.add(Label("", font_size=24, color=_MUTED))
 
         self.password_panel = p.add(Panel(layout="vertical", spacing=8, fit_content=True,
@@ -319,14 +342,22 @@ class LobbyMenu:
 
     # ---- panel toggles ------------------------------------------------
 
+    def _set_join_visible(self, show):
+        """Shows/hides the join window - and hides the rest of the menu (the sidebar's title and
+        buttons, the wardrobe and fur/settings cards) while it is up, the way the lobby room
+        hides the whole menu. The join window is translucent (so the 3D scene shows through),
+        which would otherwise let all of that bleed through it."""
+        self.join_panel.visible = show
+        self._sidebar.visible = not show
+        self._stage.visible = not show
+
     def _steam_ready(self):
         """Hosting and joining both need Steam - checked up front, before
         either panel opens, so nobody fills in a lobby's settings only to
         be told it can't be created."""
         if self.net.available:
             return True
-        self.host_panel.visible = False
-        self.join_panel.visible = False
+        self._set_join_visible(False)
         self._cancel_password()
         self.status.text = "Steam isn't running - start Steam, then restart the game"
         return False
@@ -334,41 +365,40 @@ class LobbyMenu:
     def toggle_host(self):
         if not self._steam_ready():
             return
-        show = not self.host_panel.visible
-        self.host_panel.visible = show
-        self.join_panel.visible = False
+        self._set_join_visible(False)
+        self._cancel_password()
         self.status.text = ""
+        self._create()
 
     def toggle_join(self):
         if not self._steam_ready():
             return
         show = not self.join_panel.visible
-        self.join_panel.visible = show
-        self.host_panel.visible = False
+        self._set_join_visible(show)
         self.status.text = ""
         self._cancel_password()
         if show:
             self.refresh()
-
-    def _on_players(self, value):
-        self.players_label.text = f"Players: {int(value)}"
 
     # ---- host ---------------------------------------------------------
 
     def _create(self):
         if self._busy:
             return
-        name = self.name_input.text.strip() or "RatWar Lobby"
-        map_key = self.maps[self.map_dropdown.selected][1]
+        name = "Rat King Lobby"
+        map_key = next((key for _, key in self.maps if key == "mainmap"), self.maps[0][1])
+        mode_key = next((key for _, key in self.modes if key == "cheese_war"), self.modes[0][1])
         self._busy = True
         self.status.text = "Creating lobby..."
-        self.net.host_lobby(name, map_key, int(self.players_slider.value), self.pass_input.text,
-                            lambda ok, info: self._on_hosted(ok, info, map_key))
+        self.net.host_lobby(name, map_key, self.MAX_PLAYERS, "",
+                            lambda ok, info: self._on_hosted(ok, info, map_key, mode_key),
+                            mode_key=mode_key)
 
-    def _on_hosted(self, ok, info, map_key):
+    def _on_hosted(self, ok, info, map_key, mode_key):
         self._busy = False
         if ok:
-            self.on_start(map_key)
+            self.status.text = ""
+            self.on_lobby_ready(map_key, mode_key)
         else:
             self.status.text = f"Couldn't create lobby: {info}"
 
@@ -436,6 +466,7 @@ class LobbyMenu:
             self.password_prompt.text = f"Password for {info['name']}"
             self.join_pass_input.set_text("", notify=False)
             self.password_panel.visible = True
+            self.list.size = (0, -256)  # make room for the prompt
             self.ui.set_focus(self.join_pass_input)
         else:
             self._join(info)
@@ -454,6 +485,7 @@ class LobbyMenu:
     def _cancel_password(self):
         self._selected = None
         self.password_panel.visible = False
+        self.list.size = (0, -150)
         self.ui.set_focus(None)
 
     def _join(self, info):
@@ -464,7 +496,7 @@ class LobbyMenu:
     def _on_joined(self, ok, result, info):
         self._busy = False
         if ok:
-            self.on_start(info["map"])
+            self.on_lobby_ready(info["map"], info["mode"])
         else:
             self.status.text = f"Couldn't join: {result}"
 

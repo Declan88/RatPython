@@ -33,7 +33,9 @@ class Laser(TracerStyle):
     }
 
     vec3 shade(vec2 uv, float fade, float metres, float total, float seed) {
-        float across = 1.0 - abs(uv.y);
+        // Clamped: interpolation can leave |uv.y| a hair over 1 at the ribbon's edge, and
+        // pow() of a negative is NaN - which some GPUs draw as a dark blue pixel.
+        float across = clamp(1.0 - abs(uv.y), 0.0, 1.0);
         // Faded near the beginning and the end (in metres, so a long beam isn't
         // mostly fade).
         float end = min(metres, total - metres);

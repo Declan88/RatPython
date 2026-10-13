@@ -64,6 +64,7 @@ Passing resolution in as a uniform instead would remove this last
 manual-sync point, if that's ever worth doing.
 """
 
+import math
 import struct
 
 import glm
@@ -226,12 +227,92 @@ void main() {
 }
 """
 
+MORPH_VERTEX_SHADER = """
+#version 330
+// Identical to VERTEX_SHADER above except for the morph-target offset
+// applied to in_position/in_normal right at the top of main(), before
+// ANY other transform - see create_morph_program's own docstring for why
+// this needs to be a wholly separate compiled program rather than just
+// an optional attribute on the ordinary one.
+uniform mat4 u_object[3];
+// Not clamped to [0, 1] on either the GLSL or the Python binding side
+// (scene_base.py's set_morph_weight) - glTF's own spec default for a
+// mesh's weights array isn't clamped either (confirmed directly:
+// Cheesepile.glb's own mesh.weights is authored as [-1], past the
+// "normal" 0-1 a shape key slider usually implies), and overshooting
+// past 1.0 or past 0.0 into negative is a completely ordinary way to
+// exaggerate or invert a shape key's own delta - there's nothing to
+// "support" on top of that other than not clamping it ourselves.
+uniform float u_morph_weight;
+
+in vec3 in_position;
+in vec3 in_normal;
+in vec3 in_color;
+in vec2 in_uv;
+in vec2 in_lightmap_uv;
+in vec4 in_tangent;
+// Per-vertex delta (target position/normal MINUS base position/normal -
+// glTF's own morph target convention, see gltf_morph.py) for exactly ONE
+// morph target. A mesh with more than one target would need more
+// in_morph_delta_position_N/in_morph_delta_normal_N pairs and a matching
+// u_morph_weight array - not needed yet (every morph-bearing model in
+// this project so far has exactly one), so this stays a single pair
+// until a second one is actually authored.
+in vec3 in_morph_delta_position;
+in vec3 in_morph_delta_normal;
+
+out vec3 v_position;
+out vec3 v_normal;
+out vec3 v_color;
+out vec2 v_uv;
+out vec2 v_lightmap_uv;
+out vec4 v_tangent;
+
+invariant gl_Position;
+void main() {
+    vec3 morphed_position = in_position + in_morph_delta_position * u_morph_weight;
+    // Position uses the FULL u_morph_weight (including negative,
+    // past-the-"normal"-0-1-range values - see Scene.set_morph_weight's
+    // own docstring on why that's intentional) - but the NORMAL delta
+    // is clamped to >= 0 here specifically. glTF/Blender's own morph
+    // NORMAL delta is only a valid linear approximation going TOWARD
+    // the authored target (weight 0 -> 1); extrapolating it BACKWARD
+    // past the basis (weight < 0) isn't something the delta was ever
+    // computed to support, and confirmed directly (Cheesepile.glb's own
+    // "Empty" target): at weight=-1, 162 of 169 vertex normals end up
+    // pointing on the WRONG side of their own base normal (dot < 0) -
+    // visibly broken/inverted shading, even though the POSITION delta
+    // extrapolates completely fine the same direction. Clamping just
+    // this one term means a negative weight still squashes/stretches
+    // the geometry exactly as requested, just with shading that falls
+    // back toward the rest pose's own normals instead of flipping
+    // inside-out.
+    vec3 morphed_normal = in_normal + in_morph_delta_normal * max(u_morph_weight, 0.0);
+    v_position = (u_object[1] * vec4(morphed_position, 1.0)).xyz;
+    mat3 normal_matrix = mat3(u_object[2]);
+    v_normal = normal_matrix * normalize(morphed_normal);
+    v_color = in_color;
+    v_uv = in_uv;
+    v_lightmap_uv = in_lightmap_uv;
+    v_tangent = vec4(normal_matrix * in_tangent.xyz, in_tangent.w);
+    gl_Position = u_object[0] * vec4(morphed_position, 1.0);
+}
+"""
+
 FRAGMENT_SHADER_BODY = """
 uniform vec3 u_light_dir;
 uniform vec3 u_light_color;
 uniform float u_light_intensity;
 uniform vec3 u_eye_pos;
 uniform mat4 u_view_matrix;
+
+// Source-engine-style fog (env_fog_controller) - see Scene.set_fog and bind_fog. Linear in view depth:
+// clear up to u_fog_start, fading to u_fog_color by u_fog_end, never more than u_fog_max_density.
+// u_fog_color is what you SEE at full density (display space, applied after the tonemap).
+uniform int u_fog_enabled;
+uniform vec3 u_fog_color;
+uniform vec2 u_fog_range;           // x: start, y: end (metres)
+uniform float u_fog_max_density;
 
 // Every one of these 9 factors is FIXED per object (read once from
 // the glTF material at load time - see model_loader.py's _extract_
@@ -428,6 +509,25 @@ uniform sampler2D u_sun_lightmap;
 // Scene.add_equirect_skybox/add_skybox for where these come from.
 uniform vec3 u_sky_color;
 uniform vec3 u_ground_color;
+
+// Opt-in replacement for the two colours above (Scene.use_environment_sh): the skybox's own diffuse
+// lighting as 9 spherical-harmonic coefficients (skybox.py's irradiance_sh_from_equirect), so a surface
+// is lit by the sky's real light and its directions - a glow on one side lights that side - instead of
+// a sky/ground average. u_env_yaw turns the sky the same way the equirect skybox itself is turned.
+uniform int u_use_env_sh;
+uniform vec3 u_env_sh[9];
+uniform float u_env_yaw;
+
+vec3 env_sh_ambient(vec3 n) {
+    float c = cos(u_env_yaw), s = sin(u_env_yaw);
+    n = vec3(c * n.x + s * n.z, n.y, -s * n.x + c * n.z);
+    vec3 e = u_env_sh[0] * 0.282095
+           + u_env_sh[1] * (0.488603 * n.y) + u_env_sh[2] * (0.488603 * n.z) + u_env_sh[3] * (0.488603 * n.x)
+           + u_env_sh[4] * (1.092548 * n.x * n.y) + u_env_sh[5] * (1.092548 * n.y * n.z)
+           + u_env_sh[6] * (0.315392 * (3.0 * n.z * n.z - 1.0))
+           + u_env_sh[7] * (1.092548 * n.x * n.z) + u_env_sh[8] * (0.546274 * (n.x * n.x - n.y * n.y));
+    return max(e, vec3(0.0));
+}
 
 // The scene's own equirectangular skybox texture (Scene.
 // add_equirect_skybox), reused as a crude environment reflection source
@@ -1223,7 +1323,9 @@ void main() {
     // the ground's, and a vertical wall gets an even mix. N.y is in
     // WORLD space here (v_normal is transformed by u_model, not view),
     // so this stays correct regardless of camera orientation.
-    vec3 hemisphere_ambient = mix(u_ground_color, u_sky_color, N.y * 0.5 + 0.5);
+    vec3 hemisphere_ambient = (u_use_env_sh == 1)
+        ? env_sh_ambient(N)
+        : mix(u_ground_color, u_sky_color, N.y * 0.5 + 0.5);
     vec3 ambient = hemisphere_ambient * albedo;
 
     // Environment reflection - what actually reads as "shiny/mirror-
@@ -1309,6 +1411,14 @@ void main() {
 
     color = color / (color + vec3(1.0));
     color = pow(color, vec3(1.0 / 2.2));
+    if (u_fog_enabled == 1) {
+        // Depth along the view direction, not distance from the eye: the same as Source's fog, so
+        // things off to the side of the screen are not fogged more than things straight ahead.
+        float fog_depth = -(u_view_matrix * vec4(v_position, 1.0)).z;
+        float fog = clamp((fog_depth - u_fog_range.x) / max(u_fog_range.y - u_fog_range.x, 0.001), 0.0, 1.0)
+                    * u_fog_max_density;
+        color = mix(color, u_fog_color, fog);
+    }
     // OPAQUE/MASK always output full alpha (MASK's own transparency is
     // the discard above, a binary cutout - not a blended edge) - only
     // BLEND actually writes a partial alpha, which only visually blends
@@ -1336,6 +1446,24 @@ def bind_material_block(prog):
 def create_program(ctx):
     return bind_material_block(
         ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
+    )
+
+
+def create_morph_program(ctx):
+    """A SEPARATE compiled GL program (own uniform/attribute locations,
+    reusing FRAGMENT_SHADER verbatim - same reasoning skeletal_shader.py's
+    create_skeletal_program already uses) for any object with a glTF
+    morph target ("shape key") - see gltf_morph.py for extraction and
+    Scene._render_scene's own morph_program binding block for why a
+    second full program, not an optional attribute on the ordinary
+    pbr_program, is how this is wired in: every object rendered through
+    pbr_program's VAO must supply every attribute pbr_program's vertex
+    shader declares, so adding morph attributes there would force EVERY
+    static/dynamic object (the overwhelming majority, with no shape key
+    at all) to carry dummy zero-filled morph VBOs just to satisfy a
+    program they never otherwise use."""
+    return bind_material_block(
+        ctx.program(vertex_shader=MORPH_VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
     )
 
 
@@ -1774,14 +1902,36 @@ def bind_transform_only(prog, model_matrix, view_proj):
     _write_object_uniforms(prog, None, model_matrix, view_proj)
 
 
-def bind_environment(prog, sky_color, ground_color):
+def bind_environment(prog, sky_color, ground_color, env_sh=None, env_yaw_degrees=0.0):
     """Binds the hemisphere ambient uniforms - see Scene.
     environment_sky_color/environment_ground_color (set by
     add_equirect_skybox/add_skybox) and the fragment shader's
     hemisphere_ambient computation. Call this once per frame, same as
-    bind_point_lights - this doesn't vary between objects."""
+    bind_point_lights - this doesn't vary between objects.
+
+    env_sh: None (the sky/ground colours above light the scene, as always) or the 9 spherical-
+    harmonic coefficients to light it with instead (Scene.environment_sh), turned by
+    env_yaw_degrees to follow a rotating skybox."""
     _write_uniform(prog, "u_sky_color", tuple(sky_color))
     _write_uniform(prog, "u_ground_color", tuple(ground_color))
+    if env_sh is None:
+        _write_uniform(prog, "u_use_env_sh", 0)
+        return
+    _write_uniform(prog, "u_use_env_sh", 1)
+    _write_uniform(prog, "u_env_sh", tuple(tuple(float(v) for v in row) for row in env_sh))
+    _write_uniform(prog, "u_env_yaw", math.radians(float(env_yaw_degrees)))
+
+
+def bind_fog(prog, fog):
+    """Binds Scene.fog (see Scene.set_fog) - or turns fog off for this program when it is None,
+    so a scene that never sets any is untouched. Once per frame per program, like bind_environment."""
+    if fog is None:
+        _write_uniform(prog, "u_fog_enabled", 0)
+        return
+    _write_uniform(prog, "u_fog_enabled", 1)
+    _write_uniform(prog, "u_fog_color", tuple(fog["color"]))
+    _write_uniform(prog, "u_fog_range", (float(fog["start"]), float(fog["end"])))
+    _write_uniform(prog, "u_fog_max_density", float(fog["max_density"]))
 
 
 def bind_reflection_environment(prog, texture, exposure=1.0, is_hdr=False):

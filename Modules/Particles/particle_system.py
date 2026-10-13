@@ -228,6 +228,7 @@ class Effect:
         self.follow_frame = options.get("follow_frame")
         self.inherit_velocity = float(options.get("inherit_velocity", 0.0))
         self.anchor_velocity = np.zeros(3, "f4")
+        self._synced_delta = np.zeros(3, "f4")   # movement already applied by sync_followers
         # anchors=callable -> (N, 3) positions of several things the effect emits from at once
         # (five gibs' wounds): one effect instead of N, so one update and one draw batch.
         self.anchors = options.get("anchors")
@@ -324,10 +325,15 @@ class Effect:
         self._previous_points = points
         self.anchor_points = points
 
-    def _follow_anchor(self, dt):
+    def _follow_anchor(self, dt, sync=False):
         """Moves the effect (origin and every live particle) by however far
         its anchor has moved since last frame, so it stays attached to it.
-        Translation only - its facing is fixed at spawn."""
+        Translation only - its facing is fixed at spawn.
+
+        sync=True is ParticleManager.sync_followers: a mid-frame catch-up between
+        simulation steps (which only run SIM_RATE times a second). It moves the
+        particles the same way but leaves the anchor velocity to the next real
+        step, which then sees the distance covered by both."""
         if self.follow is None:
             return
         anchor = self.follow()
@@ -337,8 +343,13 @@ class Effect:
         anchor = np.array((anchor[0], anchor[1], anchor[2]), "f4")
         delta = anchor - self.origin
         self.origin = anchor
-        if dt > 1e-6:
-            self.anchor_velocity = delta / dt
+        if sync:
+            self._synced_delta = self._synced_delta + delta
+            self._packed_tick = -1      # the draw rows are cached per simulation step: repack for the new positions
+        else:
+            if dt > 1e-6:
+                self.anchor_velocity = (delta + self._synced_delta) / dt
+            self._synced_delta = np.zeros(3, "f4")
         if self.count and self.follow_particles:
             self.pos[:self.count] += delta
         if self.follow_frame is not None:
@@ -831,8 +842,17 @@ _INITIALIZERS = {
     "remap initial scalar": _init_remap_initial_scalar,
     "Lifetime Pre-Age Noise": _init_preage,
 }
+def _op_movement_lock_to_control_point(fx, p, sl, n, dt):
+    """Pins a particle to where it was born relative to the effect's origin (the control point -
+    the muzzle). Movement Basic has already moved it by its velocity this step; undo that, and
+    the effect following its anchor (Effect._follow_anchor) carries it along. Without this a
+    muzzle flash's smoke and glow fly forward and are left behind as ghosts when the gun moves."""
+    fx.pos[sl] -= fx.vel[sl] * dt
+
+
 _OPERATORS = {
     "Movement Basic": _op_movement_basic,
+    "Movement Lock to Control Point": _op_movement_lock_to_control_point,
     "Alpha Fade and Decay": _op_alpha_fade_and_decay,
     "Rotation Basic": _op_rotation_basic,
     "Radius Scale": _op_radius_scale,
@@ -1299,6 +1319,32 @@ class ParticleManager:
         self.effects.clear()
 
     # ---- per frame ----
+
+    def lock_to_control_point(self, *system_names):
+        """Gives the named systems (already loaded) the Movement Lock to Control Point operator, for
+        a system the source effect leaves free (the Gouda flash's shock ring) that should ride the
+        muzzle like its other parts."""
+        from .pcf import Function
+
+        def visit(definition):
+            if definition.name in system_names and not any(
+                    f.name == "Movement Lock to Control Point" for f in definition.operators):
+                definition.operators.append(Function("Movement Lock to Control Point", {"control_point_number": 0}))
+            for child in definition.children:
+                visit(next(part for part in child if hasattr(part, "params")))
+
+        for definition in self.definitions.values():     # (a child system is only reachable via its parent)
+            visit(definition)
+
+    def sync_followers(self):
+        """Snaps every overlay effect that follows something (the first-person muzzle
+        flash) to where its anchor is NOW. Call right before drawing overlay effects:
+        the simulation only steps SIM_RATE times a second and runs after the scene is
+        drawn, so without this the flash would sit where the gun was up to a frame
+        (or several, at hundreds of fps) ago."""
+        for effect in self.effects:
+            if effect.overlay and effect.follow is not None and effect.time >= effect.delay:
+                effect._follow_anchor(0.0, sync=True)
 
     def update(self, dt):
         if not self.effects:

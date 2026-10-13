@@ -14,7 +14,7 @@ import importlib
 import pkgutil
 
 from .base import TracerStyle
-from . import default as _default, laser as _laser
+from . import default as _default, laser as _laser, lightning as _lightning
 
 STYLES = {}
 
@@ -29,7 +29,7 @@ def get_style(name):
 
 
 def _discover():
-    for module in (_default, _laser):
+    for module in (_default, _laser, _lightning):
         register_style(module.STYLE)
     for module_info in pkgutil.iter_modules(__path__):
         if module_info.name == "base" or module_info.name.startswith("_"):

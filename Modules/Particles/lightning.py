@@ -148,15 +148,10 @@ def _bolt_trunk():
 def _bolt_sky():
     """The rest of the same column, ~18-90m up (real, ÷0.0254) - sparser than
     _bolt_trunk, purely for the "reaches toward the sky" scale; see _bolt_segment's own
-    docstring. Height capped at a real ~90m, not literally "the sky" - Camera's own far
-    clip plane (Modules/Camera/camera.py, far=100.0, never overridden anywhere - grepped)
-    is a hard render-distance ceiling nothing in this engine currently exceeds, and
-    shadow_module.py's own far distance follows camera.far too, so pushing THAT out
-    instead to go taller would soften every shadow in the game just for this one admin
-    command's spectacle. 90m leaves a margin under 100 for a smiter standing off to the
-    side of the strike (distance to the bolt's top is then slightly more than its height)
-    - about as close to "reaches the sky" as the current render distance allows without a
-    global, permanent trade-off elsewhere."""
+    docstring. Height capped at a real ~90m, not literally "the sky". (This cap dates from when
+    Camera's far clip plane was 100m. It is 400m now and shadow_module.MAX_DISTANCE keeps the
+    shadow cascades at 100m regardless, so a taller bolt would no longer cost anything - the
+    height is just an art choice that has not been revisited.)"""
     return _bolt_segment("smite_bolt_sky", max_particles=50, num_to_emit=40, z_min=700.0, z_max=3543.0)
 
 

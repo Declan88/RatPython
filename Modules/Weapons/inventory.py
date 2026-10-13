@@ -11,6 +11,7 @@ is the game's job (app.py's switch_weapon), driven by the `on_added`/`on_removed
 callbacks.
 """
 
+from .recoil import Recoil
 from .registry import create_weapon, get_weapon_class
 
 
@@ -23,6 +24,10 @@ class Inventory:
         self.capacity = capacity
         self.on_added = None       # callback(weapon) after a weapon is added
         self.on_removed = None     # callback(weapon) after one is removed
+        # The player's camera recoil - ONE for the whole inventory, shared by every weapon in it
+        # (see recoil.py): a kick keeps settling when you switch guns, because it belongs to the
+        # player's camera, not to the gun that fired it. app.py applies it every frame.
+        self.recoil = Recoil()
         for weapon_id in loadout:
             self.add(weapon_id)
 
@@ -45,6 +50,7 @@ class Inventory:
         if self.capacity is not None and len(self.weapons) >= self.capacity:
             return None
         weapon = cls()
+        weapon.recoil = self.recoil
         self.weapons.append(weapon)
         if self.on_added is not None:
             self.on_added(weapon)

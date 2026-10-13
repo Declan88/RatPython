@@ -2,7 +2,7 @@ import glm
 import pygame
 
 class Camera:
-    def __init__(self, position=(0.0, 0.0, 3.0), fov=45.0, aspect=800/600, near=0.1, far=100.0):
+    def __init__(self, position=(0.0, 0.0, 3.0), fov=45.0, aspect=800/600, near=0.1, far=400.0):
         self.position = glm.vec3(position)
         self.pitch = 0.0
         self.yaw = -90.0

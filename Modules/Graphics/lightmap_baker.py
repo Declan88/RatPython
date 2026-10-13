@@ -47,6 +47,8 @@ temporary per-light point shadow cubes - same depth-only program
 already used for real-time shadows, just fed different light_mvps.
 """
 
+import math
+
 import moderngl
 import numpy as np
 
@@ -401,6 +403,144 @@ def dilate_lightmap(ctx, dilate_program, quad_vao, texture, iterations=6):
         ctx.copy_framebuffer(dst_fbo, src_fbo)
         src_fbo.release()
         dst_fbo.release()
+
+    scratch.release()
+    texture.filter = original_filter
+
+
+# Separable Gaussian blur, applied BEFORE dilate_lightmap: it only ever reads covered
+# texels that are not on a chart's edge (see BLUR_FRAGMENT_SHADER's interior()), so the empty
+# padding gap can't bleed dark in, and edge texels that picked up light from the wrong side
+# of a seam are replaced from the chart's interior instead of being smeared inward. It runs
+# BEFORE the cache-save loop (so a cache reload gets the
+# already-blurred result too, same reasoning dilate's own call site
+# docstring already gives for its own ordering).
+#
+# Exists because this project's baked lighting had no soft-shadow/blur
+# step at all despite generate_lightmap_uvs' own docstring explicitly
+# describing the goal as "soft, blurry static lighting" - confirmed via
+# direct measurement that the sharp, unblurred bake this produced was
+# ALSO the dominant cause of this project's huge (several-MB-per-object)
+# baked lightmap files: DWA's DCT-based EXR compression is built for
+# smooth gradients and compresses noisy/high-frequency content (sharp
+# raw shadow edges) far worse - a sigma=2 blur cut one representative
+# 4.8MB lightmap down to 2.2MB (DWAB) with no visible quality loss, soft
+# shadows being the explicit design target anyway.
+_MAX_BLUR_RADIUS = 8
+
+BLUR_VERTEX_SHADER = """
+#version 330
+in vec2 in_position;
+out vec2 v_uv;
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+BLUR_FRAGMENT_SHADER = f"""
+#version 330
+uniform sampler2D u_source;
+uniform vec2 u_texel_step;
+uniform vec2 u_texel_size;
+uniform float u_weights[{_MAX_BLUR_RADIUS + 1}];
+in vec2 v_uv;
+out vec4 fragColor;
+
+// A texel is a trustworthy blur SOURCE only if it and all 8 neighbors are covered by a chart
+// (alpha > 0). A chart's outermost texels are baked from sample points that can lie just
+// outside the real surface (the other side of a wall, past a seam), so they can hold light
+// that belongs elsewhere; blurring spreads that inward, which read as light leaking along
+// every seam. They are never used as a source - only ever overwritten from the interior.
+bool interior(vec2 uv) {{
+    for (int dx = -1; dx <= 1; dx++) {{
+        for (int dy = -1; dy <= 1; dy++) {{
+            if (texture(u_source, uv + vec2(float(dx), float(dy)) * u_texel_size).a <= 0.0) return false;
+        }}
+    }}
+    return true;
+}}
+
+void main() {{
+    vec4 center = texture(u_source, v_uv);
+    // Never touch a texel no chart covers (alpha 0): nothing meaningful to blur toward.
+    if (center.a <= 0.0) {{
+        fragColor = center;
+        return;
+    }}
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    if (interior(v_uv)) {{
+        sum = center.rgb * u_weights[0];
+        wsum = u_weights[0];
+    }}
+    for (int i = 1; i <= {_MAX_BLUR_RADIUS}; i++) {{
+        vec2 offset = u_texel_step * float(i);
+        float w = u_weights[i];
+        vec4 a = texture(u_source, v_uv + offset);
+        vec4 b = texture(u_source, v_uv - offset);
+        if (a.a > 0.0 && interior(v_uv + offset)) {{ sum += a.rgb * w; wsum += w; }}
+        if (b.a > 0.0 && interior(v_uv - offset)) {{ sum += b.rgb * w; wsum += w; }}
+    }}
+    // A chart too small to have any interior keeps its own values.
+    fragColor = wsum > 0.0 ? vec4(sum / wsum, center.a) : center;
+}}
+"""
+
+
+def create_blur_program(ctx):
+    return ctx.program(vertex_shader=BLUR_VERTEX_SHADER, fragment_shader=BLUR_FRAGMENT_SHADER)
+
+
+def create_blur_quad_vao(ctx, blur_program):
+    """A fullscreen triangle-strip quad, same geometry as create_dilate_
+    quad_vao's own - kept as an independent VBO/VAO rather than sharing
+    dilate's, since a moderngl VertexArray is permanently bound to the
+    ONE program it was built against (confirmed elsewhere in this
+    project - see pbr_shader.py's morph_program/create_morph_program)."""
+    vertices = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype="f4")
+    vbo = ctx.buffer(vertices.tobytes())
+    vao = ctx.vertex_array(blur_program, [(vbo, "2f", "in_position")])
+    return vao, vbo
+
+
+def blur_lightmap(ctx, blur_program, quad_vao, texture, sigma=2.0):
+    """Blurs `texture` in place (two passes - horizontal then vertical,
+    landing back in `texture` itself, same "caller's dict entry never
+    needs to change identity" guarantee dilate_lightmap gives) with a
+    Gaussian of the given sigma (texels). sigma<=0 is a no-op - some
+    caller might legitimately want sharp, unblurred lighting for a
+    specific object/scene.
+
+    NEAREST-filtered for the duration, same reasoning dilate_lightmap's
+    own docstring gives (bilinear sampling mid-pass would blend toward
+    not-yet-processed neighbors, compounding incorrectly across the two
+    passes) - restored to whatever `texture` had before, after."""
+    if sigma <= 0.0:
+        return
+    resolution = texture.size
+    scratch = ctx.texture(resolution, 4, dtype="f2")
+    scratch.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    original_filter = texture.filter
+    texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+    weights = [math.exp(-0.5 * (i / sigma) ** 2) for i in range(_MAX_BLUR_RADIUS + 1)]
+    # Whole-array uniform write - see pbr_shader.py's own IMPORTANT note
+    # on why moderngl requires this (per-index "name[3]" writes silently
+    # no-op for an array uniform here).
+    blur_program["u_weights"].value = tuple(weights)
+    blur_program["u_texel_size"].value = (1.0 / resolution[0], 1.0 / resolution[1])
+
+    texel = (1.0 / resolution[0], 1.0 / resolution[1])
+    for direction, dst in (((texel[0], 0.0), scratch), ((0.0, texel[1]), texture)):
+        src = texture if dst is scratch else scratch
+        fbo = ctx.framebuffer(color_attachments=[dst])
+        fbo.use()
+        src.use(location=0)
+        blur_program["u_source"].value = 0
+        blur_program["u_texel_step"].value = direction
+        quad_vao.render(moderngl.TRIANGLE_STRIP)
+        fbo.release()
 
     scratch.release()
     texture.filter = original_filter

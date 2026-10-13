@@ -4,7 +4,7 @@ from Modules.Scenes.scene_base import Scene
 
 class MainMapScene(Scene):
     def __init__(self, ctx):
-        super().__init__(ctx, recalculate_shadows=True)
+        super().__init__(ctx, recalculate_shadows=False)
 
         # Falling off the map (through the water, off a ledge into the void) kills the
         # local player instead of letting them fall forever - see Scene.min_height's own
@@ -29,6 +29,18 @@ class MainMapScene(Scene):
         # too dark/flat without a stronger ambient term to fill them in.
         # Tune to taste in-engine.
         self.set_ambient_intensity(2.5)
+
+        # Distance fog, Source-style (see Scene.set_fog): clear for the first 40 m, thickening to the
+        # sky's own horizon colour (borealis.png's horizon averages (13, 26, 25)) and solid by 380 m. The
+        # camera's far plane is 400 m (Camera's default), past which the level is simply cut off - fully
+        # closing the fog just inside that means the far end dissolves into the sky and the cut-off is
+        # never seen (as Source maps set fogend just inside their far clip). The whole map is under ~150 m
+        # across, so this is a gentle depth haze, not a wall: it must not hide parts of the map. sky_density
+        # hazes the sky a little near the horizon so there is no hard line where level meets sky.
+        # Keep `end` just under Camera.far if you change that. Remove this call for no fog.
+        self.set_fog(
+            color=(13, 26, 25), start=40.0, end=380.0, max_density=1.0, sky_density=0.35
+        )
 
         self.add_static(
             "Assets/Models/Map/mainmap.glb",
@@ -61,11 +73,19 @@ class MainMapScene(Scene):
             # (confirmed via a raw glTF dump: alpha ranges across the full
             # 0-255 range, not a flat/unused channel) already has a real
             # glow mask baked into its alpha, same trick as Vending_machine.
-            self_illum_overrides={"Vending_machine": True, "Light_shop2": True},
+            self_illum_overrides={
+                "Vending_machine": True,
+                "Light_shop2": True,
+                "tides_light_streetlight": True,
+            },
             # 1.0 = fully opaque, 0.0 = fully invisible - only has any
             # visible effect because Watermat is BLEND now (see above).
             # Tune to taste in-engine.
             base_alpha_overrides={"Watermat": 0.8},
+            # The streetlight fixture shouldn't shadow its own light.
+            # Cast-only - it still receives shadows. Baked, so needs a
+            # re-bake (this scene already has recalculate_shadows=True).
+            cast_shadow_overrides={"tides_light_streetlight": False},
             specular_strength_overrides={"Watermat": 5},
             water_overrides={
                 "Watermat": {
@@ -175,6 +195,13 @@ class MainMapScene(Scene):
             intensity_multiplier=1,
         )
 
+        # "actor_<id>" marker nodes (empties, no geometry needed under them)
+        # placed anywhere in mainmap.glb spawn a registered Modules.Actors
+        # instance there - see Scene.add_actors_from_glb's own docstring.
+        self.add_actors_from_glb("Assets/Models/Map/mainmap.glb")
+        # "ladder" Empties in the same file become climbable volumes (see Scene.add_ladders_from_glb).
+        self.add_ladders_from_glb("Assets/Models/Map/mainmap.glb")
+
         self.sound_manager.add_sound(
             "Assets/Audio/crucial_urban_rooftop_ambloop01.wav",
             position=(0.0, 3.0, 0.0),
@@ -185,4 +212,8 @@ class MainMapScene(Scene):
             universal=True,
         )
 
-        self.bake_static_lighting(lightmap_resolution=2048)
+        # 2048 is the cap, held by the largest material group; smaller ones get proportionally
+        # smaller lightmaps (down to 1024) - see Scene.bake_static_lighting's auto_lightmap_resolution.
+        self.bake_static_lighting(
+            lightmap_resolution=2048, auto_lightmap_resolution=True
+        )

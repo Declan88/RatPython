@@ -370,6 +370,11 @@ class ViewModel:
             self.play("idle")
         self._update_sway(camera, dt)
         local = self._local
+        offset = self._weapon.viewmodel_offset if self._weapon is not None else None
+        if offset and any(offset):
+            # This weapon's own camera-space shift (see WeaponsBase.viewmodel_offset), before
+            # sway and the scope zoom below so both just work on the already-shifted gun.
+            local = glm.translate(glm.mat4(1.0), glm.vec3(*offset)) * local
         if abs(self._sway_yaw) > _SWAY_EPSILON_DEG or abs(self._sway_pitch) > _SWAY_EPSILON_DEG:
             # translate(+pivot) * rotate * translate(-pivot): the standard "rotate around an
             # arbitrary point" sandwich - shifts _SWAY_PIVOT to the origin, applies the sway

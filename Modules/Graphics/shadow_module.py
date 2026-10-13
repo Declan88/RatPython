@@ -73,9 +73,15 @@ class CascadedShadowMap:
             fc - right * fw + up * fh,
         ]
 
+    # Real-time shadows only reach this far from the camera, however far the camera itself can see:
+    # the cascades split [near, far] between them, so stretching them over a longer view distance
+    # would spread the same shadow maps thinner and soften every shadow near the player. (Beyond
+    # this, static geometry still has its baked lightmap shadows; only moving things go unshadowed.)
+    MAX_DISTANCE = 100.0
+
     def update(self, camera, light_dir):
         self.near = max(float(getattr(camera, "near", 0.1)), 0.01)
-        self.far = max(float(getattr(camera, "far", 100.0)), self.near + 1.0)
+        self.far = max(min(float(getattr(camera, "far", self.MAX_DISTANCE)), self.MAX_DISTANCE), self.near + 1.0)
 
         lambda_val = 0.75
         cascade_splits = []

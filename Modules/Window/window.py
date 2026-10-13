@@ -118,7 +118,7 @@ if sys.platform == "win32":
 
 
 class WindowManager:
-    def __init__(self, width=800, height=600, title="RatWar", fullscreen=True):
+    def __init__(self, width=800, height=600, title="Rat King", fullscreen=True):
         pygame.init()
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)

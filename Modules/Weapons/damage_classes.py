@@ -28,14 +28,21 @@ class Bullet(DamageClass):
 
 
 class Zap(DamageClass):
-    """Electrical damage - dies with a dissolve instead of gibs. /smite's own damage class;
-    nothing else currently deals it, but any weapon can opt in via its own damage_class."""
+    """Electrical damage - dies with a dissolve instead of gibs, and nothing more. Any
+    weapon can opt in via its own damage_class (see the Corroder)."""
     name = "zap"
     death_effect = DISSOLVE
     dissolve_color = (120, 210, 255)   # cool electric blue-cyan - the glowing edge's colour
 
 
-_registry = {cls.name: cls for cls in (Bullet, Zap)}
+class Smite(Zap):
+    """/smite's own damage class: the Zap dissolve PLUS the lightning strike where the victim
+    stood (app.py keys the strike, and muting the kill sound under it, on this name). Only
+    /smite deals it - a weapon that just wants the dissolve uses Zap."""
+    name = "smite"
+
+
+_registry = {cls.name: cls for cls in (Bullet, Zap, Smite)}
 
 
 def get_damage_class(name):

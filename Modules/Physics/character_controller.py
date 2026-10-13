@@ -81,6 +81,13 @@ from Modules.Physics.physics_world import (
     CollisionGroup, to_physics_pos, to_render_pos, to_physics_extent, to_render_vec,
 )
 from Modules.Audio.footstep_materials import get_footstep_volume
+from Modules.Physics.ladders import (
+    CLIMB_SPEED as _LADDER_CLIMB_SPEED, JUMP_OFF_SPEED as _LADDER_JUMP_OFF_SPEED,
+    STEP_INTERVAL as _LADDER_STEP_INTERVAL, GRAB_DOT as _LADDER_GRAB_DOT,
+    TOP_DISMOUNT_REACH as _LADDER_TOP_DISMOUNT_REACH, TOP_HOP_FORWARD as _LADDER_TOP_HOP_FORWARD,
+    TOP_HOP_UP as _LADDER_TOP_HOP_UP, REGRAB_COOLDOWN as _LADDER_REGRAB_COOLDOWN,
+    STANDOFF_SPEED as _LADDER_STANDOFF_SPEED,
+)
 
 # Time constant (seconds) for the vertical-only low-pass filter in
 # _on_pre_substep - see its comment. Short enough that stairs/slopes
@@ -205,7 +212,7 @@ class CharacterController:
                  jump_speed=6.0, collision_mask=CollisionGroup.ALL,
                  crouch_height_ratio=0.5, crouch_speed_multiplier=0.34,
                  crouch_transition_time=0.25, eye_height=None, crouch_eye_height=None,
-                 max_slope_degrees=75, gravity=None):
+                 max_slope_degrees=75, gravity=None, owner=None):
         """ground_speed/sprint_speed: target ground move speed (m/s),
         walk vs. sprint (see set_sprinting). ground_accel/air_accel:
         sv_accelerate/sv_airaccelerate-equivalent - higher snaps to
@@ -223,7 +230,12 @@ class CharacterController:
         max_slope_degrees: a ground contact steeper than this counts as
         a wall, not floor (Source's default is 45.57 degrees, i.e. a
         ground-normal.y cutoff of ~0.7). gravity defaults to matching
-        physics_world's own gravity if not given."""
+        physics_world's own gravity if not given. owner is tagged onto
+        self.node via setPythonTag (same "owner" convention PhysicsWorld.
+        add_hitbox already uses for a remote player's own hitbox) - the
+        local player's own steam_id, so a contactTest-based query can
+        identify them the same way it already identifies a remote player
+        via their hitbox's own owner tag."""
         self.radius = float(radius)
         self.height = float(height)
         self.ground_speed = float(ground_speed)
@@ -269,7 +281,12 @@ class CharacterController:
         # PLAYER (contactTest's exclusion-by-identity-check, for
         # instance, is unaffected), it just can never satisfy our own
         # movement sweeps' mask.
-        self._sweep_mask = self.collision_mask & ~(CollisionGroup.PLAYER | CollisionGroup.GIB)
+        # BULLET excluded too - an actor's own real mesh, set up purely
+        # for weapon hit-scan (see CollisionGroup.BULLET's own
+        # docstring), should never also physically block the player's
+        # movement - that's PLAYER_CLIP's job instead (left IN this
+        # mask, same as everything else not explicitly excluded here).
+        self._sweep_mask = self.collision_mask & ~(CollisionGroup.PLAYER | CollisionGroup.GIB | CollisionGroup.BULLET)
 
         self._standing_shape = BulletBoxShape(to_physics_extent((self.radius, self.height / 2.0, self.radius)))
         self._crouch_shape = BulletBoxShape(to_physics_extent((self.radius, self._crouch_height / 2.0, self.radius)))
@@ -296,6 +313,13 @@ class CharacterController:
         self.node = BulletGhostNode("player")
         self.node.addShape(self._standing_shape)
         self.node.setIntoCollideMask(CollisionGroup.PLAYER)
+        # Same "owner" python-tag convention PhysicsWorld.add_hitbox/
+        # add_sphere_trigger already use for a remote player's own hitbox -
+        # lets a contactTest-based query (e.g. Modules/Actors/actor_base.py's
+        # own player-proximity trigger) identify the LOCAL player the exact
+        # same way it already identifies a remote one, rather than needing a
+        # separate "is this literally player.node" special case.
+        self.node.setPythonTag("owner", owner)
         self.node_path = physics_world._root.attachNewNode(self.node)
         self.node_path.setPos(to_physics_pos(position))
         physics_world.world.attachGhost(self.node)
@@ -363,6 +387,11 @@ class CharacterController:
         # reset to the next interval.
         self._step_sound_timer = 0.0
         self._pending_footstep = None
+        # Ladder climbing (see ladders.py and _update_ladder).
+        self._on_ladder = False
+        self._ladder = None
+        self._ladder_normal = glm.vec3(0.0, 0.0, 1.0)   # horizontal, from the ladder out toward the player
+        self._ladder_cooldown = 0.0                     # after leaving one, how long until one can be grabbed
         # Grounded state as of the END of the previous tick's footstep
         # update - used only to detect a landing edge (see
         # _update_footsteps' just_landed).
@@ -913,6 +942,8 @@ class CharacterController:
         self._smoothed_position = glm.vec3(self._prev_position)
         self._grounded = False
         self._jumping = False
+        self._leave_ladder()
+        self._ladder_cooldown = 0.0
 
     def toggle_debug_log(self):
         """Flips the per-physics-tick console dump on/off (see self._debug_log's own
@@ -924,6 +955,11 @@ class CharacterController:
 
     def is_on_ground(self):
         return self._grounded
+
+    def is_on_ladder(self):
+        """True while climbing a ladder (see ladders.py) - not 'on the ground' (is_on_ground stays
+        False), but not falling either: callers choosing a pose should treat it as supported."""
+        return self._on_ladder
 
     def is_sprinting(self):
         """Whether set_sprinting(True) is the current input state - the
@@ -1017,8 +1053,15 @@ class CharacterController:
         for i in range(result.getNumContacts()):
             contact = result.getContact(i)
             other = contact.getNode1() if contact.getNode0() == self._stand_check_ghost else contact.getNode0()
-            if other != self.node:
-                return False
+            if other == self.node:
+                continue
+            # Ghosts are non-solid trigger volumes (an actor's proximity "detector", ladder
+            # volumes, other players' hulls) - they carry the PLAYER bit this probe shares so
+            # they can notice the player, but they never physically block standing up. Only
+            # solid bodies (static level geometry, rigid bodies) count as a ceiling.
+            if isinstance(other, BulletGhostNode):
+                continue
+            return False
         return True
 
     def _position_stand_check_ghost(self):
@@ -1241,20 +1284,23 @@ class CharacterController:
             # here.
             self.velocity.y = 0.0
 
-        if self._jump_requested and self._grounded:
-            self.velocity.y = self.jump_speed
-            self._grounded = False
-            self._jumping = True
-            self._pending_jump_event = True
-        self._jump_requested = False
+        self._update_ladder(dt)
 
-        wishdir, wishspeed = self._wish()
-        if self._grounded:
-            self._apply_friction(dt)
-            self._accelerate(wishdir, wishspeed, self.ground_accel, dt)
-        else:
-            self.velocity.y -= self.gravity * dt
-            self._air_accelerate(wishdir, wishspeed, self.air_accel, dt)
+        if not self._on_ladder:
+            if self._jump_requested and self._grounded:
+                self.velocity.y = self.jump_speed
+                self._grounded = False
+                self._jumping = True
+                self._pending_jump_event = True
+            self._jump_requested = False
+
+            wishdir, wishspeed = self._wish()
+            if self._grounded:
+                self._apply_friction(dt)
+                self._accelerate(wishdir, wishspeed, self.ground_accel, dt)
+            else:
+                self.velocity.y -= self.gravity * dt
+                self._air_accelerate(wishdir, wishspeed, self.air_accel, dt)
 
         self._step_slide_move(dt)
 
@@ -1284,6 +1330,95 @@ class CharacterController:
 
         self._update_footsteps(dt)
 
+    def _leave_ladder(self, cooldown=0.0):
+        self._on_ladder = False
+        self._ladder = None
+        self._ladder_cooldown = max(self._ladder_cooldown, cooldown)
+
+    def _update_ladder(self, dt):
+        """Source-style ladder movement (CGameMovement::LadderMove, with func_ladder volumes - see
+        ladders.py): touching a ladder volume while moving into it grabs it; then gravity and ground
+        movement are off and the hull moves ONLY as the keys say - toward the ladder climbs up, away
+        climbs down, strafing goes sideways along it, no keys hangs in place - at Source's climb speed.
+        Jump leaps off backwards; reaching the bottom steps off; climbing past the top hops onto
+        whatever is up there. The move itself still goes through _step_slide_move, so walls are solid."""
+        self._ladder_cooldown = max(0.0, self._ladder_cooldown - dt)
+        ladders = self._physics_world.ladders
+        if not self._on_ladder and (not ladders or self._ladder_cooldown > 0.0):
+            return
+
+        position = to_render_pos(self.node_path.getPos())
+        half_y = self._current_height / 2.0
+        wishdir, _wishspeed = self._wish()
+
+        if not self._on_ladder:
+            if glm.length(wishdir) < 1e-6:
+                return
+            for ladder in ladders:
+                if not ladder.overlaps(position, self.radius, half_y):
+                    continue
+                normal = ladder.facing(position)
+                toward = glm.dot(wishdir, -normal)
+                # Already up at the top of the volume there is nothing above to climb, so walking at it
+                # from there does not grab it (you'd only be thrown over the lip); and going the other
+                # way - moving AWAY from it - grabs only while airborne: that is how you step or fall off
+                # an edge onto a ladder and climb down it.
+                near_top = position.y - half_y >= ladder.top - _LADDER_TOP_DISMOUNT_REACH - 0.1
+                grab_up = toward > _LADDER_GRAB_DOT and not near_top
+                grab_down = toward < -_LADDER_GRAB_DOT and not self._grounded
+                if grab_up or grab_down:
+                    self._on_ladder = True
+                    self._ladder = ladder
+                    self._ladder_normal = normal
+                    self._grounded = False
+                    self._jumping = False
+                    self.velocity = glm.vec3(0.0)
+                    break
+            if not self._on_ladder:
+                return
+
+        ladder, normal = self._ladder, self._ladder_normal
+        if not ladder.overlaps(position, self.radius, half_y):
+            self._leave_ladder()                     # slid off the edge / fell below it
+            self._jump_requested = False
+            return
+
+        toward = glm.dot(wishdir, -normal)           # +1 straight into the ladder, -1 straight away
+        along = glm.normalize(glm.cross(glm.vec3(0.0, 1.0, 0.0), normal))
+        side = max(-1.0, min(1.0, glm.dot(wishdir, along)))
+        climb = 1.0 if toward > 0.3 else (-1.0 if toward < -0.3 else 0.0)
+
+        if self._jump_requested:                     # leap off, away from the ladder (Source: plane normal * 270)
+            self._jump_requested = False
+            self.velocity = normal * _LADDER_JUMP_OFF_SPEED
+            self._jumping = True
+            self._pending_jump_event = True
+            self._leave_ladder(_LADDER_REGRAB_COOLDOWN)
+            return
+        self._jump_requested = False
+
+        feet_y = position.y - half_y
+        if climb > 0.0 and feet_y >= ladder.top - _LADDER_TOP_DISMOUNT_REACH:
+            # Over the top: hop onto whatever is up there rather than stalling at the edge.
+            self.velocity = -normal * _LADDER_TOP_HOP_FORWARD + glm.vec3(0.0, _LADDER_TOP_HOP_UP, 0.0)
+            self._jumping = True
+            self._leave_ladder(_LADDER_REGRAB_COOLDOWN)
+            return
+
+        if self._grounded:
+            if climb <= 0.0:                         # reached the floor: step off
+                self._leave_ladder()
+                return
+            self._grounded = False                   # climbing up from the floor: not "on the ground" any more
+
+        speed = _LADDER_CLIMB_SPEED * (0.5 if self._is_crouched else 1.0)
+        self.velocity = glm.vec3(0.0, climb * speed, 0.0) + along * (side * speed)
+        # Sit flat against the volume's face (its thickness plus the hull's own reach, a hair inside so it
+        # still counts as touching) - eased there, never snapped.
+        distance = glm.dot(position - ladder.center, normal)
+        target = ladder.face_half + self.radius * (abs(normal.x) + abs(normal.z)) - 0.02
+        self.velocity += normal * max(-_LADDER_STANDOFF_SPEED, min(_LADDER_STANDOFF_SPEED, (target - distance) * 8.0))
+
     def _update_footsteps(self, dt):
         """Direct port of Source's CBasePlayer::UpdateStepSound (see the
         module-level constants above for exactly where these numbers
@@ -1308,6 +1443,21 @@ class CharacterController:
         # tick. Using the stale self._grounded here would mean bunny-
         # hopping (airborne almost the entire time, "grounded" for
         # under one tick between hops) never registers a landing at all.
+        if self._on_ladder:
+            # Rung sounds (the "ladder" material - Assets/Audio/footsteps/ladder1-4.wav): one every
+            # STEP_INTERVAL while actually moving, at Source's fixed ladder volume. Never a landing:
+            # stepping off the bottom is not a fall, so the ground-contact bookkeeping is held "grounded".
+            self._was_grounded = True
+            if self._step_sound_timer > 0.0:
+                self._step_sound_timer = max(self._step_sound_timer - dt, 0.0)
+            if self._step_sound_timer <= 0.0 and glm.length(self.velocity) > 0.5:
+                volume = get_footstep_volume("ladder", walking=True)
+                if self._is_crouched:
+                    volume *= _STEP_VOLUME_DUCK_MULT
+                self._step_sound_timer = _LADDER_STEP_INTERVAL
+                self._pending_footstep = ("ladder", volume)
+            return
+
         just_landed = (
             self._touched_ground and not self._was_grounded
             and self._fall_speed_on_touch >= _MIN_LANDING_FALL_SPEED

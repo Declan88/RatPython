@@ -27,23 +27,41 @@ NAME_MIN_FONT_SIZE = 14
 YOU_TAG_WIDTH = 56    # reserved out of NAME_COLUMN_WIDTH for "(you)", mine only
 
 NAME_X = AVATAR_PAD + AVATAR_SIZE + 14
-_STAT_AREA_WIDTH = STAT_INSET + 3 * STAT_COLUMN_WIDTH + 2 * STAT_COLUMN_GAP
-ROW_WIDTH = NAME_X + NAME_COLUMN_WIDTH + _STAT_AREA_WIDTH
-ROW_SIZE = (ROW_WIDTH, 60)
+# Extra columns a game mode adds after KD (GameMode.stat_columns), e.g. Cheese.
+EXTRA_COLUMN_WIDTH = 72
+BASE_COLUMNS = 3   # K / D / KD
 
-# Right-edge offset of each stat column's own box (KD closest to the row's
-# edge, then D, then K) - shared by the header row and every player row so
-# their columns land in exactly the same place regardless of how wide the
-# name ends up. Each box is a fixed STAT_COLUMN_WIDTH regardless of its
-# text's own length (see _stat_box) - a bare right-anchored label here (the
-# very first version of this) put a 1-digit "3" and a 2-digit "12" at the
-# same RIGHT edge, so the gap in front of each varied with its digit count -
-# visually uneven, which is what actually looked ugly. A fixed box with the
-# text CENTERED in it fixes that: every column keeps the same pitch no
-# matter what's actually printed in it.
-_KD_OFFSET = -STAT_INSET
-_D_OFFSET = _KD_OFFSET - STAT_COLUMN_WIDTH - STAT_COLUMN_GAP
-_K_OFFSET = _D_OFFSET - STAT_COLUMN_WIDTH - STAT_COLUMN_GAP
+
+def _row_size(extra_columns):
+    stat_area = (STAT_INSET + BASE_COLUMNS * STAT_COLUMN_WIDTH + extra_columns * EXTRA_COLUMN_WIDTH
+                 + (BASE_COLUMNS + extra_columns - 1) * STAT_COLUMN_GAP)
+    return (NAME_X + NAME_COLUMN_WIDTH + stat_area, 60)
+
+
+# Right-edge offset of each stat column's own box, rightmost column first -
+# shared by the header row and every player row so their columns land in
+# exactly the same place regardless of how wide the name ends up. Returns
+# (k, d, kd, [extra, ...]) with the extras laid out left-to-right after KD,
+# so the row only gets wider as more mode columns are added. Each box is a
+# fixed width regardless of its text's own length (see _stat_box) - a bare
+# right-anchored label here (the very first version of this) put a 1-digit
+# "3" and a 2-digit "12" at the same RIGHT edge, so the gap in front of each
+# varied with its digit count - visually uneven, which is what actually
+# looked ugly. A fixed box with the text CENTERED in it fixes that: every
+# column keeps the same pitch no matter what's actually printed in it.
+def _column_offsets(extra_columns):
+    offset = -STAT_INSET
+    extras = []
+    for _ in range(extra_columns):
+        extras.append(offset)
+        offset -= EXTRA_COLUMN_WIDTH + STAT_COLUMN_GAP
+    extras.reverse()
+    kd = offset
+    d = kd - STAT_COLUMN_WIDTH - STAT_COLUMN_GAP
+    k = d - STAT_COLUMN_WIDTH - STAT_COLUMN_GAP
+    return k, d, kd, extras
+
+
 # See the nudge comment at its own two call sites in _row.
 _VALUE_NUDGE = 4
 
@@ -72,7 +90,7 @@ def _line_height(manager, font_size):
 def _stat_box(text, color, font_size, right_offset, manager, box_width=STAT_COLUMN_WIDTH):
     """A fixed-width, height-matched-to-text box whose text is CENTERED
     within it (align="center") and whose RIGHT edge sits at right_offset -
-    see the module-level comment above _KD_OFFSET for why a fixed box
+    see the module-level comment above _column_offsets for why a fixed box
     instead of a bare right-anchored label. size is set explicitly (rather
     than left at Label's own auto-measure default), so its height must be
     supplied too, or Y-centering (anchor/pivot (·, 0.5)) would center
@@ -127,36 +145,47 @@ class Scoreboard:
                 standings.append((steam_id, player.name or f"Player {steam_id % 10000}",
                                   player.kills, player.deaths))
             standings.sort(key=lambda row: (-row[2], row[3]))
+        # Mode-specific columns (e.g. Cheese) - defined by the active GameMode
+        # (GameMode.stat_columns), so this file never needs to know which mode it is.
+        columns = tuple(getattr(game_mode, "stat_columns", ()))
         rows = [
-            (i, name, i == net_mgr.local_steam_id, kills, deaths, net_mgr.avatar_rgba(i))
+            (i, name, i == net_mgr.local_steam_id, kills, deaths, net_mgr.avatar_rgba(i),
+             [int(round(game_mode.get_stat(i, key))) for key, _ in columns])
             for i, name, kills, deaths in standings
         ]
 
-        signature = tuple((i, name, kills, deaths, avatar is not None) for i, name, _, kills, deaths, avatar in rows)
+        signature = (columns, tuple((i, name, kills, deaths, avatar is not None, tuple(extras))
+                                    for i, name, _, kills, deaths, avatar, extras in rows))
         if signature == self._signature:
             return
         self._signature = signature
         self.card.clear_children()
         manager = self.card.manager
+        row_size = _row_size(len(columns))
+        k_offset, d_offset, kd_offset, extra_offsets = _column_offsets(len(columns))
         self.card.add(Label(f"Players ({len(rows)})", font_size=26, color=theme.ACCENT))
         # Same width and right-edge offsets as each row below's stat boxes
         # (see _row/_stat_box), so K/D/KD sit directly above the values they
         # label, each centered over its own column rather than at its edge.
-        header = self.card.add(Panel(size=(ROW_SIZE[0], 22)))
-        header.add(_stat_box("K", theme.MUTED, 16, _K_OFFSET, manager))
-        header.add(_stat_box("D", theme.MUTED, 16, _D_OFFSET, manager))
-        header.add(_stat_box("KD", theme.MUTED, 16, _KD_OFFSET, manager))
-        for _, name, mine, kills, deaths, avatar in rows:
-            self.card.add(self._row(name, mine, kills, deaths, avatar))
+        header = self.card.add(Panel(size=(row_size[0], 22)))
+        header.add(_stat_box("K", theme.MUTED, 16, k_offset, manager))
+        header.add(_stat_box("D", theme.MUTED, 16, d_offset, manager))
+        header.add(_stat_box("KD", theme.MUTED, 16, kd_offset, manager))
+        for (_, label), offset in zip(columns, extra_offsets):
+            header.add(_stat_box(label, theme.MUTED, 16, offset, manager, EXTRA_COLUMN_WIDTH))
+        for _, name, mine, kills, deaths, avatar, extras in rows:
+            self.card.add(self._row(name, mine, kills, deaths, avatar, extras))
 
-    def _row(self, name, mine, kills, deaths, avatar):
+    def _row(self, name, mine, kills, deaths, avatar, extras=()):
+        row_size = _row_size(len(extras))
+        k_offset, d_offset, kd_offset, extra_offsets = _column_offsets(len(extras))
         # NOT layout="horizontal" - that stacks children left-to-right at
         # explicit positions and ignores their own anchor entirely (see
         # Panel._arrange_children), which is exactly what a right-aligned K/D
         # column needs. Plain absolute anchor placement instead, same as the
         # header row above already uses successfully.
         row = Panel(color=(34, 38, 56, 240) if mine else (24, 27, 42, 240),
-                    padding=6, size=ROW_SIZE)
+                    padding=6, size=row_size)
         if avatar:
             pic = row.add(Image(size=(AVATAR_SIZE, AVATAR_SIZE), anchor=(0, 0.5), offset=(AVATAR_PAD, 0)))
             pic.set_rgba(AVATAR_PIXELS, avatar)
@@ -179,7 +208,9 @@ class Scoreboard:
         # glyphs reading slightly left of the letter labeling them above, a
         # numeral's own side bearings being narrower than a capital letter's -
         # confirmed by pixel-measuring rendered text, not just eyeballing it.
-        row.add(_stat_box(str(kills), theme.TEXT, STAT_FONT_SIZE, _K_OFFSET + _VALUE_NUDGE, manager))
-        row.add(_stat_box(str(deaths), theme.MUTED, STAT_FONT_SIZE, _D_OFFSET + _VALUE_NUDGE, manager))
-        row.add(_stat_box(_kd_ratio(kills, deaths), theme.ACCENT, STAT_FONT_SIZE, _KD_OFFSET + _VALUE_NUDGE, manager))
+        row.add(_stat_box(str(kills), theme.TEXT, STAT_FONT_SIZE, k_offset + _VALUE_NUDGE, manager))
+        row.add(_stat_box(str(deaths), theme.MUTED, STAT_FONT_SIZE, d_offset + _VALUE_NUDGE, manager))
+        row.add(_stat_box(_kd_ratio(kills, deaths), theme.ACCENT, STAT_FONT_SIZE, kd_offset + _VALUE_NUDGE, manager))
+        for value, offset in zip(extras, extra_offsets):
+            row.add(_stat_box(str(value), theme.TEXT, STAT_FONT_SIZE, offset + _VALUE_NUDGE, manager, EXTRA_COLUMN_WIDTH))
         return row

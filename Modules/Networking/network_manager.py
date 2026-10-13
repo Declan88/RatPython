@@ -19,6 +19,10 @@ from .remote_player import RemotePlayer
 from Modules.Player.rat_colors import encode_color
 
 
+# The game's own Steam App ID (was 480, Spacewar). Keep steam_appid.txt in sync for dev runs.
+STEAM_APP_ID = 5436290
+
+
 class NetworkManager:
     """
     Ported from a Panda3D-based version. Two things had to change:
@@ -45,9 +49,13 @@ class NetworkManager:
     scene.add_skeletal/scene.physics, and there's no Panda3D-style
     global scene graph it could reach that through on its own.
     """
+    _ROUND_REFRESH = 2.0          # seconds between lobby reads of the round timer once it exists
+    _ROUND_REFRESH_UNSET = 0.5    # ... while it doesn't exist yet (so it appears promptly)
+
 
     # Movement packets: at most this often, plus a heartbeat when idle.
     SEND_INTERVAL = 1.0 / 30.0
+    CALLBACK_INTERVAL = 1.0 / 60.0   # min seconds between Steam run_callbacks pumps
     RECEIVE_BATCH = 256  # max packets read per frame - drains a backlog after a map load
     HEARTBEAT_INTERVAL = 0.25
 
@@ -60,6 +68,16 @@ class NetworkManager:
         self.in_game = False
         self.remote_players = {}
         self.current_lobby_id = None
+        # Fallback for start_round_timer/get_round_remaining when there's
+        # no lobby at all (singleplayer - see lobby_menu.py's own
+        # _start_singleplayer, which never calls host_lobby/join_lobby) -
+        # nothing to share the timestamp with over Steam in that case, so
+        # it's just tracked locally instead. None means "no round timer
+        # started" - see both methods below.
+        self._local_round_start = None
+        self._local_round_duration = None
+        self._last_callbacks_time = 0.0
+        self._round_cache = None    # (lobby_id, start, duration, fetched_at) - see get_round_remaining
         self._local_state = None
         self.local_hat = None   # short hat name from the main menu, or None
         self.local_weapon = None   # id (Modules/Weapons/registry.py) of the weapon in our hands, sent so others draw it
@@ -71,6 +89,11 @@ class NetworkManager:
         self._death_push = None   # explosion shove for our death gibs (see notify_death)
         self._death_damage_class = "bullet"   # see notify_death - what killed us last, by name
         self._kill_count = 0    # kills WE'VE been credited for - see notify_death/_send_kill_credit
+        # Game-mode-specific values for the local player ({"cheese": 12.5}), owned and
+        # written by the active GameMode (see GameMode.set_local_stat) and replicated
+        # to every peer in each state packet as "mv" - read back per remote player off
+        # RemotePlayer.mode_values.
+        self.local_mode_values = {}
         # Who last damaged us, and when (perf_counter seconds) - notify_death
         # credits a kill to whoever this points at, if they're still "recent"
         # enough (see KILL_CREDIT_WINDOW), same idea as a real shooter's own
@@ -84,7 +107,7 @@ class NetworkManager:
         self._recent_shot_ends = []   # end points of our last few shots (tracers), oldest first
         self.on_death = None    # callback(feet_position, velocity, fur colour, damage_class) when another player dies (gibs, or dissolves for Zap)
         self.on_tracer = None   # callback(start, end, follow, shooter_weapon) to draw another player's tracer, flash and impact
-        self.on_footstep = None  # callback(material, position, volume) to play another player's footstep
+        self.on_footstep = None  # callback(material, position, volume, steam_id) to play another player's footstep
         self.on_dissolve_spark = None  # callback(position) - a Zap-dissolving remote player's periodic spark/glow burst
         self.on_dissolve_arc = None    # callback(position) - a Zap-dissolving remote player's periodic tesla-arc burst
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name, headshot, push, damage_class, origin) when someone shoots us - origin: (x,y,z) or None, see send_damage's own docstring
@@ -94,6 +117,9 @@ class NetworkManager:
         # feed UI built off this is the same for every player, CS:GO-style.
         self.on_killfeed = None
         self.on_chat = None      # callback(sender_steam_id, text) for a chat message from someone else
+        self.on_player_joined = None   # callback(steam_id, name): someone joined the lobby mid-game
+        self.on_player_left = None     # callback(steam_id, name): someone left it
+        self._known_members = None     # members as of the last in-game check; None until the first
         self.on_admin_kill = None  # callback(sender_steam_id) - see send_admin_kill; verify sender is the admin yourself
         self.local_name = ""    # our Steam persona name, sent in every packet
         self.local_steam_id = 0
@@ -117,6 +143,9 @@ class NetworkManager:
         self._deferred = []  # list of (fire_time, func) - replaces taskMgr.doMethodLater
         self._pending_host = None
         self._pending_join = None
+        self._owns_lobby = None       # see _probe_lobby_owner: None until it has been checked
+        self._owner_id = None         # the lobby owner's Steam id when Steam has told us (get_lobby_owner)
+        self._owner_probed = 0.0
 
         self._init_steam()
 
@@ -128,7 +157,7 @@ class NetworkManager:
         reconnect() itself, which does want to know whether THIS attempt worked."""
         try:
             self.client = py_steam_net.PySteamClient()
-            self.client.init(480)
+            self.client.init(STEAM_APP_ID)
             print(f"Steam P2P initialized successfully. Ready: {self.client.is_ready()}")
 
             self.local_steam_id = self.client.own_steam_id()
@@ -200,24 +229,96 @@ class NetworkManager:
         self._failed_logged.clear()
         self._last_sent_state = None
         self._pending_host = self._pending_join = None
+        self._owns_lobby = None
+        self._owner_id = None
+        self._known_members = None
         self.local_alive = True
 
     @property
     def is_host(self):
-        """Whether this player owns the lobby (the first member)."""
+        """Whether this player owns the lobby. Steam decides that (it hands ownership to someone
+        else when the owner leaves - and the former owner who comes back is NOT the owner
+        again), so it is asked for rather than guessed from the member list's order, which
+        can still put a returning former host first."""
+        if self._owns_lobby is not None:
+            return self._owns_lobby
         return bool(self._member_order) and self._member_order[0] == self.local_steam_id
+
+    @property
+    def host_steam_id(self):
+        """Who owns the lobby: this player if is_host, else whoever the owner announced
+        (the "host" lobby key), else the first member."""
+        if self.is_host:
+            return self.local_steam_id
+        if self._owner_id and self._owner_id in self._members:
+            return self._owner_id
+        try:
+            announced = int(self.client.get_lobby_data(self.current_lobby_id, "host") or 0)
+        except Exception:
+            announced = 0
+        if announced and announced in self._members and announced != self.local_steam_id:
+            return announced
+        return self._member_order[0] if self._member_order else None
+
+    def _probe_lobby_owner(self, force=False):
+        """Whether this client owns the current lobby, found out the one way the Steam binding
+        allows: only the owner can write lobby data, so the write succeeds for the owner alone.
+        The owner also announces itself under "host" for everyone else's player list. Re-checked
+        when the member list changes and every few seconds, not on every call (Steam rate-limits
+        lobby data writes)."""
+        now = time.perf_counter()
+        get_owner = getattr(self.client, "get_lobby_owner", None)
+        if get_owner is not None:
+            # Steam's own answer (GetLobbyOwner, py_steam_net >= 0.1.13): authoritative, free (local
+            # state), and never writes anything - so a client that isn't the owner can't be mistaken
+            # for one, and can't scribble on its own copy of the lobby settings by "probing".
+            try:
+                owner_id = int(get_owner(self.current_lobby_id))
+            except Exception:
+                return
+            if not owner_id:
+                return              # Steam doesn't know the owner yet - keep whatever we had
+            self._owner_id = owner_id
+            self._owns_lobby = owner_id == self.local_steam_id
+            if self._owns_lobby and (force or now - self._owner_probed >= 5.0):
+                self._owner_probed = now
+                try:
+                    if self.client.get_lobby_data(self.current_lobby_id, "host") != str(self.local_steam_id):
+                        self.client.set_lobby_data(self.current_lobby_id, "host", str(self.local_steam_id))
+                except Exception:
+                    pass
+            return
+        # Older py_steam_net without get_lobby_owner: infer it from whether a write "succeeds".
+        if not force and self._owns_lobby is not None and now - self._owner_probed < 5.0:
+            return
+        self._owner_probed = now
+        try:
+            owner = bool(self.client.set_lobby_data(self.current_lobby_id, "host_probe", str(self.local_steam_id)))
+            if owner and self.client.get_lobby_data(self.current_lobby_id, "host") != str(self.local_steam_id):
+                self.client.set_lobby_data(self.current_lobby_id, "host", str(self.local_steam_id))
+        except Exception:
+            return
+        self._owns_lobby = owner
 
     def update(self):
         if not self.client:
             return
         prof = self.profiler if self.profiler is not None and self.profiler.enabled else None
         t = time.perf_counter() if prof else 0.0
-        self.client.run_callbacks()
+        # Steam only needs its callbacks pumped regularly, not once per rendered frame (hundreds a
+        # second here) - every call is a lock + IPC round trip with the Steam client, which now and
+        # then stalls ~100 ms. 60 Hz is plenty for lobby/connection events.
+        now_cb = time.perf_counter()
+        if now_cb - self._last_callbacks_time >= self.CALLBACK_INTERVAL:
+            self._last_callbacks_time = now_cb
+            self.client.run_callbacks()
+            if prof:
+                t2 = time.perf_counter(); prof.add("  net: run_callbacks", t2 - t); t = t2
         self._run_deferred()
         if self.current_lobby_id:
             self._send_hellos(time.perf_counter())
         if prof:
-            t2 = time.perf_counter(); prof.add("  net: callbacks+hellos", t2 - t); t = t2
+            t2 = time.perf_counter(); prof.add("  net: deferred+hellos", t2 - t); t = t2
         if self.in_game:
             # handle_data only ever runs from here: py_steam_net hands over
             # incoming packets when (and only when) they're polled for. Nothing
@@ -317,14 +418,18 @@ class NetworkManager:
             return True
         return cls.hash_password(lobby_info["pw_salt"], password) == lobby_info["pw_hash"]
 
-    def host_lobby(self, name, map_key, max_players, password, on_result):
+    def host_lobby(self, name, map_key, max_players, password, on_result, mode_key="deathmatch"):
         """Creates a public lobby tagged with its settings. on_result(ok,
-        info) is called once - info is the lobby id, or an error string."""
+        info) is called once - info is the lobby id, or an error string.
+        mode_key: a Modules.GameModes.registry id (see its own module
+        docstring) - written into lobby metadata the same way map_key
+        already is (see on_lobby_created below), so a joining client ends
+        up in the same game mode as the host, not just the same map."""
         if not self.client:
             on_result(False, "Steam isn't running")
             return
         self._pending_host = {
-            "name": name, "map": map_key, "max_players": max_players,
+            "name": name, "map": map_key, "mode": mode_key, "max_players": max_players,
             "password": password, "on_result": on_result,
         }
         self._schedule(0, lambda: self.client.create_lobby(2, max_players, self.on_lobby_created))
@@ -339,6 +444,21 @@ class NetworkManager:
             return
         self.current_lobby_id = lobby_id
         print(f"\n--> SUCCESS! Lobby Created ID: {self.current_lobby_id}")
+        # Populates _member_order/_members immediately, rather than
+        # waiting for the FIRST _refresh_members() call that normally
+        # only ever happens once self.in_game is True (_prune_remote_
+        # players/_is_lobby_member, both gated on it) - that gating left
+        # _member_order empty the entire time a freshly hosted lobby's
+        # own start_game was running (in_game is only set True at the
+        # very END of it), so is_host read False for the genuine host at
+        # exactly the moment app.py's own start_game checks it to decide
+        # whether to call start_round_timer - confirmed as why the round
+        # timer never actually started on a freshly hosted lobby. We ARE
+        # this lobby's only member right now (we just created it), so
+        # this is always correct immediately, with no round trip to wait
+        # on either - get_lobby_members reads Steam's own already-synced
+        # local state, not a fresh network request.
+        self._refresh_members()
 
         if pending:
             # GameIdentity is what py_steam_net's own get_lobby_list
@@ -348,6 +468,7 @@ class NetworkManager:
                 "GameIdentity": "Rat King",
                 "lobby_name": pending["name"],
                 "map": pending["map"],
+                "mode": pending["mode"],
                 "max_players": str(pending["max_players"]),
                 "has_password": "1" if pending["password"] else "0",
             }
@@ -368,7 +489,7 @@ class NetworkManager:
 
     def request_lobbies(self, on_result):
         """Searches for open lobbies. on_result(lobbies, error): lobbies
-        is a list of dicts (id, name, map, players, max_players,
+        is a list of dicts (id, name, map, mode, players, max_players,
         has_password, pw_salt, pw_hash), error is None or a string."""
         if not self.client:
             on_result([], "Steam isn't running")
@@ -398,12 +519,166 @@ class NetworkManager:
             "id": lobby_id,
             "name": get("lobby_name") or "Unnamed lobby",
             "map": get("map"),
+            # Falls back to "deathmatch" for a lobby created before this
+            "mode": get("mode") or "deathmatch",
             "players": players,
             "max_players": max_players,
             "has_password": get("has_password") == "1",
             "pw_salt": get("pw_salt"),
             "pw_hash": get("pw_hash"),
         }
+
+    def current_lobby_info(self):
+        """_lobby_info for the lobby we're actually IN right now, or None
+        with no lobby at all - the lobby room polls this to show/refresh
+        the host's own settings for everyone, since they can change
+        after creation now (see update_lobby_setting) and this is the
+        one place that already knows how to read every key back."""
+        if not self.client or not self.current_lobby_id:
+            return None
+        return self._lobby_info(self.current_lobby_id)
+
+    def update_lobby_setting(self, key, value):
+        """Host-only LIVE update to one of host_lobby's own lobby-
+        metadata keys ("lobby_name"/"map"/"mode"/"max_players") - same
+        set_lobby_data mechanism on_lobby_created's own one-time write
+        already uses, just callable again afterward so the lobby room's
+        host-editable settings actually take effect for everyone else
+        immediately, not just at the moment of creation. No-op without a
+        real lobby (singleplayer never has one - see lobby_menu.py's own
+        _start_singleplayer)."""
+        if not self.client or not self.current_lobby_id:
+            return
+        if not self.is_host:
+            return          # only the owner's writes reach anyone; a member's would just change its own copy
+        try:
+            self.client.set_lobby_data(self.current_lobby_id, key, str(value))
+        except Exception as e:
+            print(f"[Net] update_lobby_setting({key!r}) failed: {e}")
+
+    def start_round_timer(self, duration):
+        """Starts (or restarts) a round timer that stays correct for
+        every peer regardless of who's connected later, including a
+        full host handoff - see get_round_remaining's own docstring for
+        why. Writes two lobby-metadata keys, same mechanism/permissions
+        as "map"/"mode" (on_lobby_created above): "round_start" (this
+        machine's own time.time(), a Unix timestamp) and
+        "round_duration" (seconds, as given). Call this ONCE, when a
+        round actually begins (not at lobby creation - a lobby can sit
+        around with nobody ready for a while first) - app.py's own
+        start_game calls this exactly once, gated on net_mgr.is_host at
+        that moment, purely to avoid every peer stomping the shared
+        timestamp with their own slightly different clock reading; it
+        is NOT required for correctness afterward (the timestamp is
+        read-only data attached to the LOBBY itself from here on, not
+        tied to any specific member's continued presence - unlike
+        broadcasting a live countdown over the regular per-frame
+        network messages, which WOULD break the instant whoever was
+        sending it disconnects).
+
+        No lobby at all (singleplayer - lobby_menu.py's own
+        _start_singleplayer never calls host_lobby/join_lobby, so
+        current_lobby_id stays None): tracked as plain local attributes
+        instead - there's nobody else to share a Steam-backed timestamp
+        with anyway, and a single-player session has no "host" to
+        leave in the first place."""
+        if not self.client or not self.current_lobby_id:
+            self._local_round_start = time.time()
+            self._local_round_duration = duration
+            return
+        self._round_cache = None        # re-read the (new) timestamp on the next get_round_remaining
+        if not self.is_host:
+            return          # owner-only, like every lobby write (see update_lobby_setting)
+        try:
+            self.client.set_lobby_data(self.current_lobby_id, "round_start", str(time.time()))
+            self.client.set_lobby_data(self.current_lobby_id, "round_duration", str(duration))
+        except Exception as e:
+            print(f"[Net] start_round_timer failed: {e}")
+
+    def get_round_remaining(self):
+        """Seconds left in the current round, computed FRESH from lobby
+        metadata every call - deliberately not cached/ticked locally,
+        so every peer (including one that joined after the round
+        started, or one whose previous "host" has since left) always
+        agrees with everyone else without needing anything broadcast
+        over the per-frame network messages at all. Returns None if no
+        round timer has been started yet (start_round_timer never
+        called this lobby, or the lobby data hasn't propagated to this
+        peer yet) - a caller should treat that as "no timer configured/
+        not ready yet", not "0 seconds left".
+
+        No lobby at all (singleplayer): reads the local fallback
+        start_round_timer sets in that case instead of lobby metadata -
+        see its own docstring."""
+        if not self.client or not self.current_lobby_id:
+            if self._local_round_start is None or self._local_round_duration is None:
+                return None
+            return max(0.0, self._local_round_duration - (time.time() - self._local_round_start))
+        # The lobby metadata is read through Steam (two IPC-backed calls) and this runs EVERY
+        # FRAME from the HUD timer - which showed up as occasional 7-100 ms stalls when Steam
+        # was slow to answer. The timestamps only change when a round is (re)started, so they're
+        # re-read at most every _ROUND_REFRESH seconds (sooner while no timer exists yet) and
+        # the countdown itself is computed locally from the cached start/duration each call.
+        now = time.perf_counter()
+        cache = self._round_cache
+        if cache is None or cache[0] != self.current_lobby_id or now - cache[3] >= (
+                self._ROUND_REFRESH if cache[1] is not None else self._ROUND_REFRESH_UNSET):
+            try:
+                start = self.client.get_lobby_data(self.current_lobby_id, "round_start")
+                duration = self.client.get_lobby_data(self.current_lobby_id, "round_duration")
+            except Exception:
+                return None
+            try:
+                parsed = (float(start), float(duration)) if start and duration else (None, None)
+            except ValueError:
+                parsed = (None, None)
+            cache = self._round_cache = (self.current_lobby_id, parsed[0], parsed[1], now)
+        _, start, duration, _ = cache
+        if start is None:
+            return None
+        return max(0.0, duration - (time.time() - start))
+
+    def start_the_game(self):
+        """The host presses Start in the lobby room - writes the one
+        flag every peer polls for (see is_game_started), via the exact
+        same "write once to lobby metadata, everyone reads fresh, no
+        broadcast" mechanism as start_round_timer/map/mode above. No
+        special host-only network message needed - a value every peer
+        already knows how to read for itself is enough. No-op without a
+        real lobby (singleplayer skips the lobby room entirely)."""
+        if not self.client or not self.current_lobby_id or not self.is_host:
+            return
+        try:
+            self.client.set_lobby_data(self.current_lobby_id, "game_started", "1")
+        except Exception as e:
+            print(f"[Net] start_the_game failed: {e}")
+
+    def is_game_started(self):
+        """True once start_the_game has been called by whoever's
+        hosting - every peer (host included, for symmetry) polls this
+        from the lobby room to know when to leave the waiting room and
+        actually start playing. False, not an error, with no lobby at
+        all."""
+        if not self.client or not self.current_lobby_id:
+            return False
+        try:
+            return self.client.get_lobby_data(self.current_lobby_id, "game_started") == "1"
+        except Exception:
+            return False
+
+    def clear_game_started(self):
+        """Resets the flag is_game_started polls for - the lobby room
+        calls this once, right when it's first shown, defensively: not
+        something the current flow actually does, but cheap insurance
+        against a stale "1" left over from an earlier match making a
+        brand new wait skip straight into gameplay if this exact lobby
+        id were ever reused."""
+        if not self.client or not self.current_lobby_id or not self.is_host:
+            return          # (a member's copy of this key is not theirs to reset)
+        try:
+            self.client.set_lobby_data(self.current_lobby_id, "game_started", "0")
+        except Exception as e:
+            print(f"[Net] clear_game_started failed: {e}")
 
     def join_lobby(self, lobby_id, on_result):
         """on_result(ok, info) is called once - info is the lobby id, or
@@ -423,6 +698,10 @@ class NetworkManager:
             return
         self.current_lobby_id = lobby_id
         print(f"\n--> SUCCESS! Joined Lobby ID: {self.current_lobby_id}")
+        # Same reasoning as on_lobby_created's own identical call - don't
+        # wait for the in_game-gated refresh, so is_host/_member_order
+        # are already correct the instant start_game runs.
+        self._refresh_members()
         self._schedule(0.5, self.print_session_roster)
         if on_result:
             on_result(True, lobby_id)
@@ -516,6 +795,10 @@ class NetworkManager:
                     self.client.send_message_to(member_id, self.HELLO_FLAGS, 0, payload)
         except Exception:
             pass
+        # The loop above skips us, so the victim would be the one client without
+        # the entry - show it locally too (same callback every receiver fires).
+        if self.on_killfeed is not None:
+            self.on_killfeed(killer_id, self.local_steam_id, weapon_name, headshot)
 
     def notify_respawn(self):
         self.local_alive = True
@@ -676,7 +959,7 @@ class NetworkManager:
         every client can check for itself against that same hardcoded
         constant, so a non-admin spoofing this message accomplishes nothing.
 
-        damage_class: whether to die smite-self's way (Zap - the lightning effect and a
+        damage_class: whether to die smite-self's way (Smite - the lightning effect and a
         dissolve instead of gibs, see app.py's own smite_self) or a plain kill (Bullet,
         the default) - carried in the same message rather than a separate one, since it's
         still exactly one "you should die right now, this way" request either way."""
@@ -757,6 +1040,8 @@ class NetworkManager:
             "a": int(self.local_alive),
             "n": self.local_name,
         }
+        if self.local_mode_values:
+            self._local_state["mv"] = {k: round(v, 2) for k, v in self.local_mode_values.items()}
         if self._death_push is not None:
             self._local_state["b"] = self._death_push
 
@@ -852,7 +1137,13 @@ class NetworkManager:
         if not self._relay_ready():
             return  # Steam's relay network isn't up yet - a send now just fails
         self._last_hello_time = now
-        members = self._refresh_members()
+        # The member list is refreshed on every lobby-changed callback and once a second in-game
+        # (_prune_remote_players); re-querying Steam every hello tick (twice a second) on top of
+        # that was one more IPC call per tick for no new information.
+        if self._members and now - self._members_checked < 1.0:
+            members = self._members
+        else:
+            members = self._refresh_members()
         if not members:
             return
         state = self._local_state if self.in_game and self._local_state is not None else {"hello": 1}
@@ -889,7 +1180,12 @@ class NetworkManager:
 
         payload = json.dumps(self._local_state, separators=(",", ":")).encode("utf-8")
         try:
-            for member_id in self.client.get_lobby_members(self.current_lobby_id):
+            # The cached member list (_refresh_members: on every lobby-changed callback and at
+            # least once a second in-game), NOT a live Steam query: this runs ~30x/s from the main
+            # thread, and get_lobby_members is an IPC call to the Steam client that sometimes stalls
+            # 25-120 ms (measured as `net: send state` hitches, even alone in a lobby with nobody to send to).
+            members = self._member_order or self.client.get_lobby_members(self.current_lobby_id)
+            for member_id in members:
                 if (member_id != self.local_steam_id and
                         (member_id in self.remote_players or member_id in self._heard_from)):
                     # 1 = Steam's UnreliableNoNagle: movement is a stream
@@ -912,26 +1208,60 @@ class NetworkManager:
         members = self._refresh_members()
         if members is None:
             return
+        self._announce_member_changes(members)
         for steam_id in list(self.remote_players):
             if steam_id not in members:
                 print(f"\n--> Peer left the lobby: {steam_id}")
                 self.remote_players.pop(steam_id).destroy()
+
+    def _announce_member_changes(self, members):
+        """Tells on_player_joined/on_player_left about everyone who came or went since the last
+        in-game check. The first check only records who is already here (the whole lobby is
+        "arriving" as the match starts - no announcements for that)."""
+        previous, self._known_members = self._known_members, set(members)
+        if previous is None:
+            return
+        for steam_id in sorted(members - previous):
+            if steam_id != self.local_steam_id and self.on_player_joined is not None:
+                self.on_player_joined(steam_id, self._friend_name(steam_id) or "Someone")
+        for steam_id in sorted(previous - members):
+            if steam_id != self.local_steam_id and self.on_player_left is not None:
+                remote = self.remote_players.get(steam_id)
+                self.on_player_left(steam_id, (remote.name if remote is not None and remote.name else None)
+                                    or self._friend_name(steam_id) or "Someone")
 
     def _refresh_members(self):
         """Re-reads the current lobby's member ids. Returns the set, or None
         if it couldn't be read (left as-is in that case)."""
         try:
             order = list(self.client.get_lobby_members(self.current_lobby_id))
+            changed = order != self._member_order
             self._member_order = order
             self._members = set(order)
         except Exception:
             return None
+        prof = self.profiler if self.profiler is not None and self.profiler.enabled else None
+        t0 = time.perf_counter() if prof else 0.0
+        self._probe_lobby_owner(force=changed)
+        if prof:
+            prof.add("  net: lobby owner probe", time.perf_counter() - t0)
         self._members_checked = time.perf_counter()
         return self._members
 
+    def refresh_members(self):
+        """Public wrapper around _refresh_members - the lobby room
+        (Modules/UI/lobby_room.py) polls this directly on its own timer,
+        bypassing update()'s own in_game gate: the normal per-frame
+        refresh (_prune_remote_players, above) only ever runs once
+        actual gameplay has begun, which is exactly what hasn't
+        happened yet while sitting in the waiting room - _member_order
+        would otherwise just be whatever it was the instant the lobby
+        was created/joined, never seeing anyone else arrive."""
+        self._refresh_members()
+
     def _is_lobby_member(self, steam_id):
         """py_steam_net accepts every incoming Steam session (see its
-        session_request_callback), and App 480 is shared by countless
+        session_request_callback), and a shared test App ID (480) was used by countless
         unrelated test projects - so only trust packets from people who are
         actually in OUR lobby. Refreshed at most once a second, so a stranger
         spamming packets can't make this a per-packet lobby query."""
@@ -983,7 +1313,7 @@ class NetworkManager:
                 self.remote_players[sender_id].on_tracer = (
                     lambda *args: self.on_tracer(*args) if self.on_tracer else None)
                 self.remote_players[sender_id].on_footstep = (
-                    lambda *args: self.on_footstep(*args) if self.on_footstep else None)
+                    lambda *args, sid=sender_id: self.on_footstep(*args, sid) if self.on_footstep else None)
                 self.remote_players[sender_id].on_dissolve_spark = (
                     lambda *args: self.on_dissolve_spark(*args) if self.on_dissolve_spark else None)
                 self.remote_players[sender_id].on_dissolve_arc = (

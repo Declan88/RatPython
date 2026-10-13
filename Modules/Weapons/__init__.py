@@ -15,9 +15,10 @@ from .gouda_gun import GoudaGun
 # reference Nuitka needs). Harmless alongside registry.py's own dynamic import of the
 # same module - that just finds this one already loaded.
 from .pencil import Pencil
+from .corroder import Corroder      # static import: same Nuitka reason as Pencil above
 
 from .inventory import Inventory
 from .registry import create_weapon, get_weapon_class, weapon_ids
 
-__all__ = ["WeaponsBase", "FireMode", "USP", "GoudaGun", "Pencil", "Inventory",
+__all__ = ["WeaponsBase", "FireMode", "USP", "GoudaGun", "Pencil", "Corroder", "Inventory",
            "create_weapon", "get_weapon_class", "weapon_ids"]

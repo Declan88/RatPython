@@ -36,6 +36,12 @@ def _chdir_for_frozen_build():
 
 _chdir_for_frozen_build()
 
+# Packed (encrypted) assets: when the build ships Assets/pack.idx instead of plain asset files, this makes every
+# read under Assets/ come from the pack - see Modules/Assets/pack_runtime.py. It must run before anything
+# that reads an asset at import time (e.g. the footstep sound index), and does nothing in a source-tree run.
+from Modules.Assets import pack_runtime
+pack_runtime.install()
+
 
 def _disable_window_ghosting():
     """Loading blocks the main thread for seconds at a time, and OpenGL only works from that
@@ -96,13 +102,16 @@ from Modules.Particles.lightning import register_lightning
 from Modules.Particles.dissolve_sparks import register_dissolve_sparks
 from Modules.Gore import GibManager
 from Modules.Debug import FrameProfiler
+from Modules.Window.cpu_affinity import (
+    pin_main_thread_to_fast_cores, CpuTuner, apply_process_cpu_mask_from_env, apply_priority_from_env,
+    cpu_affinity_label)
 from Modules.Particles.impacts import (IMPACT_FILE, IMPACT_GROUP, MATERIAL_ALIASES, LIFETIME_SCALE, MAX_IMPACT_EFFECTS,
                                        RADIUS_SCALE, keep_frame, spawn_impact, play_impact_sound)
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
 
-SPAWN_POSITION = (0.0, 2.0, 3.0)   # where the player (re)spawns: hull centre, metres
+SPAWN_POSITION = (0.0, 2.5, 6.0)   # where the player (re)spawns: hull centre, metres
 RESPAWN_SECONDS = 3.0
 # A standing, shootable target near spawn purely for testing the kill feed/
 # sound without a second PC - see setup_game/the shooting code's own dummy
@@ -112,7 +121,7 @@ TEST_DUMMY_STEAM_ID = 1
 TEST_DUMMY_OFFSET = (3.0, 0.0, -2.0)   # metres from SPAWN_POSITION, feet-height
 TEST_DUMMY_RESPAWN_SECONDS = 1.5
 TEST_DUMMY_HEALTH = 100.0
-STARTING_LOADOUT = ["usp", "gouda_gun", "pencil"]   # weapon ids (see Modules/Weapons/registry.py) everyone spawns with
+STARTING_LOADOUT = ["usp", "gouda_gun", "pencil", "corroder"]   # weapon ids (see Modules/Weapons/registry.py) everyone spawns with
 # Number-row keys 1-9 select inventory slots 0-8 directly (see on_key_down) - same
 # switch_weapon() the scroll wheel already uses, just jumping straight to a slot instead
 # of stepping by +-1. Only as many of these as the inventory actually has slots for are
@@ -134,7 +143,7 @@ WEAPON_SLOT_KEYS = {
 # falloff at all, GAIN=4.0 - see KILL_SOUND_GAIN) firing at the same instant for any admin kill
 # OTHER than a self-smite (no kill credit for suicide, so it never fires there), reliably
 # drowning out this pair regardless of range. Restored to the original conversion now that
-# show_kill_feed takes play_sound=False for a zap kill instead.
+# show_kill_feed takes play_sound=False for a smite kill instead.
 SMITE_EXPLOSION_SOUND = "Assets/Audio/Effects/Lightning/Explosion3.wav"
 SMITE_THUNDER_SOUND = "Assets/Audio/Effects/Lightning/Thunder1.wav"
 SMITE_EXPLOSION_RANGE = 16.0        # Minecraft: 16 blocks
@@ -219,12 +228,23 @@ load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
 from Modules.Networking.remote_player import RemotePlayer
-from Modules.GameModes import Deathmatch
+from Modules.GameModes import Deathmatch, create_game_mode, game_mode_ids, get_game_mode_class
 
 
 def main():
     print("Yo wsg")
-    window = WindowManager(800, 600, "RatWar")
+    # Keep the main thread off this machine's slow cores (hybrid CPUs: ~600 vs ~400 vs ~200 fps
+    # depending on where the OS happened to start it) - see Modules/Window/cpu_affinity.py.
+    # CPU placement. RATWAR_CPU_MASK (e.g. "16-19") confines the whole process, for experiments. The automatic
+    # pinning (RATWAR_AUTO_PIN=1) is OFF by default: logs showed it did not remove the fps variance and its
+    # in-game tuner sometimes settled the thread on one of the slow CPUs (see Modules/Window/cpu_affinity.py).
+    apply_priority_from_env()
+    cpu_mask = apply_process_cpu_mask_from_env()
+    if not cpu_mask and os.environ.get("RATWAR_AUTO_PIN"):
+        cpu_tuner = CpuTuner(pin_main_thread_to_fast_cores())
+    else:
+        cpu_tuner = CpuTuner(None)
+    window = WindowManager(800, 600, "Rat King")
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
     # The normal, hip-fire FOV - camera.fov itself gets temporarily narrowed while
     # scoping (see the main loop's own scope handling) and eased back to exactly this
@@ -308,7 +328,36 @@ def main():
     dummy_state = {"deaths": 0, "respawn_at": None, "pos": None, "yaw": 180.0, "health": 100.0}
 
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, test_dummy
+        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, test_dummy, paper_doll
+        # Every call here is now a brand-new lobby session (start_game no
+        # longer has a "reuse the scene we disconnected from" shortcut - see
+        # its own comment) - fully tear down whatever the LAST session built
+        # before constructing anything new, so stale actors (e.g. a
+        # cheesepile that already despawned itself last round), physics
+        # bodies and GL resources never carry over into a new lobby, even
+        # one that happens to reuse the same map. player.destroy()/
+        # local_player_model.destroy() release what THEY own; current_scene.
+        # destroy() releases everything else (statics/dynamics/skeletals/
+        # viewmodel parts/actors/physics/sounds) and is popped out of
+        # `scenes` so get_or_load_scene below can't hand back the dead
+        # instance - a fresh SCENE_CLASSES[...]() construction runs instead,
+        # same as visiting that key for the very first time.
+        if player is not None:
+            player.destroy()
+            player = None
+        if local_player_model is not None:
+            local_player_model.destroy()
+            local_player_model = None
+        if paper_doll is not None:
+            paper_doll.destroy()
+            paper_doll = None
+        if test_dummy is not None:
+            test_dummy.destroy()
+            test_dummy = None
+        if current_scene is not None:
+            current_scene.destroy()
+            scenes.pop(current_scene_key, None)
+            current_scene = None
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
@@ -337,6 +386,12 @@ def main():
             position=game_mode.choose_spawn_position(),
             height=player_height,
             max_slope_degrees=47.0,
+            # Tags the local player's own movement ghost with their steam_id
+            # (see CharacterController's own owner param docstring) - lets a
+            # contactTest-based query (Modules/Actors' own player-proximity
+            # trigger) identify the local player the same way it already
+            # identifies a remote one via their hitbox's own owner tag.
+            owner=net_mgr.local_steam_id,
         )
 
         # The local player's own visual body - shadow-only (visible_in_color
@@ -685,11 +740,9 @@ def main():
                 pass   # the RemotePlayer dissolve state machine (shared - test_dummy IS one) handles the body itself
             elif current_scene.gibs is not None:
                 current_scene.gibs.spawn(pos, vel, push=dummy_state.get("push"), tint=color)
-            if damage_class == "zap":
-                # Keyed on the damage class name directly, not a separate "was this a smite"
-                # flag - today Zap is ONLY ever dealt by /smite, so they're equivalent; if a
-                # future weapon deals Zap damage WITHOUT wanting the full lightning-strike
-                # fanfare, this is the place to split that back out into its own flag.
+            if damage_class == "smite":
+                # Only /smite's own damage class (Smite) gets the lightning strike - a plain
+                # Zap (a weapon's) is just the dissolve.
                 spawn_smite(pos)
         test_dummy.on_death = dummy_died
         test_dummy.on_dissolve_spark = spawn_dissolve_spark_burst
@@ -726,6 +779,21 @@ def main():
         fill_color=(90, 200, 110, 255),
     )
     ui.root.add(health_bar)
+    # Round countdown, top-right - see GameMode.round_remaining's own
+    # docstring (Steam-lobby-metadata-backed, so it stays correct even
+    # across a host handoff). Text is set every frame in the main loop
+    # below; this label's own .visible only covers "in a game at all"
+    # (same on/off points as health_bar) - the main loop ALSO hides it
+    # specifically whenever the active mode has no round_duration set
+    # (round_remaining() returns None), so it never sits there blank.
+    # No explicit pivot needed - Widget's own default pivot is just
+    # whatever anchor is (see widgets.py), which for TOP_RIGHT already
+    # means "the label's own top-right corner sits at the anchor point",
+    # i.e. it grows leftward/won't run off the right edge of the screen.
+    round_timer_label = ui.root.add(Label(
+        "", font_size=30, color=(255, 255, 255, 255), align="right",
+        anchor=Anchor.TOP_RIGHT, offset=(-16, 16), visible=False,
+    ))
     # Screen-centre crosshair; its gap is the current weapon's real spread.
     crosshair = ui.root.add(Crosshair(visible=False))
     # Current weapon + ammo, bottom-right, with the other weapon slots shown
@@ -798,13 +866,31 @@ def main():
     # behind its own loading frame) runs from the main loop, not inside
     # that callback, which can fire from inside Steam's callback dispatch.
     MAPS = [("Main Map", "mainmap"), ("Torus (test)", "torus")]
+    # (display name, id) for every registered Modules.GameModes class - built
+    # from the registry itself (game_mode_ids/get_game_mode_class), not a
+    # hand-maintained list like MAPS above, so a new mode shows up in the
+    # host-lobby mode dropdown (see lobby_menu.py) automatically just by
+    # existing (and being imported in Modules/GameModes/__init__.py - see
+    # registry.py's own module docstring on why that line is required).
+    # Cheese War first in the mode dropdown, the rest in registry order.
+    MODES = [(get_game_mode_class(mode_id).name, mode_id)
+             for mode_id in sorted(game_mode_ids(), key=lambda m: m != "cheese_war")]
     in_menu = True
+    # True while the lobby waiting room (Modules/UI/lobby_room.py) is
+    # showing - a third main-loop state alongside in_menu/gameplay, set
+    # by menu_scene.build_ui's own on_lobby_enter/on_lobby_leave hooks
+    # (see its own docstring). Every existing "not in_menu" gameplay-
+    # input gate below also excludes this, same reasoning as in_menu
+    # itself: no gameplay hotkey should fire while just waiting to start.
+    in_lobby = False
     pending_start = None
     net_mgr = NetworkManager(camera, None)
     # The active game mode: decides (re)spawn position and owns scoring's
-    # display (see Modules/GameModes/game_mode.py) - a single hardcoded
-    # spawn point, same as SPAWN_POSITION always was, until a map defines
-    # real spawn markers to hand it instead.
+    # display (see Modules/GameModes/game_mode.py). Deathmatch/SPAWN_POSITION
+    # here is only ever the PRE-LOBBY placeholder (scoreboard/on_kill etc. all
+    # read this variable even before any real match has started) - request_
+    # start/start_game below reassign it (via create_game_mode) to whichever
+    # mode the host actually picked, every time a real game starts.
     game_mode = Deathmatch(net_mgr, spawn_points=[SPAWN_POSITION])
 
     def dummy_or_display_name(steam_id):
@@ -822,7 +908,7 @@ def main():
         local-only target, not a real match kill.
 
         play_sound=False skips Kill.wav specifically - kill_dummy passes this for a smite
-        (damage_class == "zap"): KILL_SOUND_GAIN=4.0 and universal=True (always full volume,
+        (damage_class == "smite"): KILL_SOUND_GAIN=4.0 and universal=True (always full volume,
         no distance falloff at all) means it reliably drowns out spawn_smite's own positional
         explosion/thunder pair playing at the very same instant - confirmed by a smite on
         anyone OTHER than yourself (which routes through here) being effectively inaudible
@@ -847,6 +933,8 @@ def main():
         game_mode.on_kill(killer_id, victim_id, weapon_name)
     net_mgr.on_killfeed = on_killfeed
     net_mgr.on_chat = lambda sender_id, text: chatbox.push_message(net_mgr.display_name(sender_id), text)
+    net_mgr.on_player_joined = lambda steam_id, name: chatbox.push_system(f"{name} joined the game")
+    net_mgr.on_player_left = lambda steam_id, name: chatbox.push_system(f"{name} left the game")
     # An admin's /kill <player> targeting a REAL remote player (see
     # kill_player below) arrives here on THAT player's own client - we only
     # ever act on it if the sender really is the hardcoded admin (checked
@@ -854,7 +942,7 @@ def main():
     # NetworkManager.send_admin_kill's own docstring).
     net_mgr.on_admin_kill = (
         lambda sender_id, damage_class="bullet":
-            (smite_self() if damage_class == "zap" else kill_self()) if commands.is_admin(sender_id) else None)
+            (smite_self() if damage_class == "smite" else kill_self()) if commands.is_admin(sender_id) else None)
 
     def damage_dummy(amount, weapon_name="", headshot=False, push=None, damage_class="bullet"):
         """Hurts the test dummy like a real player: it has TEST_DUMMY_HEALTH and only
@@ -921,7 +1009,7 @@ def main():
         })
         dummy_state["respawn_at"] = time.perf_counter() + TEST_DUMMY_RESPAWN_SECONDS
         show_kill_feed(net_mgr.local_steam_id, TEST_DUMMY_STEAM_ID, weapon_name, headshot,
-                       play_sound=damage_class != "zap")
+                       play_sound=damage_class != "smite")
         return "Test dummy killed."
 
     def explode(source_weapon, hit):
@@ -980,14 +1068,14 @@ def main():
     def smite_self():
         """/smite's default (no argument) - same as kill_self but marks the death as a smite
         (begin_death reads death["smite"] and both shows the lightning locally and tells
-        notify_death to replicate it) and its damage class as Zap (dissolve instead of gibs -
+        notify_death to replicate it) and its damage class as Smite (a Zap dissolve instead of gibs -
         see begin_death/remote_death's own damage_class branch) - also what a remote
         /smite <player> (see net_mgr.on_admin_kill above) runs on the targeted player's own
         client."""
         if death["active"] or death["pending"]:
             return "You're already dead."
         death["smite"] = True
-        death["damage_class"] = "zap"
+        death["damage_class"] = "smite"
         change_health(-(health["max"] + 1.0))
         return "Smitten."
 
@@ -1030,10 +1118,10 @@ def main():
         if target in ("", "me", "you", "self", net_mgr.display_name(net_mgr.local_steam_id).lower()):
             return smite_self()
         if target in ("dummy", "test dummy"):
-            return kill_dummy("/smite", damage_class="zap")
+            return kill_dummy("/smite", damage_class="smite")
         for steam_id, player in net_mgr.remote_players.items():
             if (player.name or "").lower() == target:
-                if net_mgr.send_admin_kill(steam_id, damage_class="zap"):
+                if net_mgr.send_admin_kill(steam_id, damage_class="smite"):
                     return f"Smite request sent to {player.name}."
                 return f"Couldn't reach {player.name}."
         return f"No connected player named '{name}'."
@@ -1058,6 +1146,9 @@ def main():
     for weapon_id in weapon_ids():    # every weapon, not just carried ones: other players' guns too
         for pcf_path, system_names in get_weapon_class(weapon_id).particle_files.items():
             particles.load(pcf_path, only=system_names)
+    # The Gouda flash's ring is the one part of it the source effect doesn't lock to the muzzle: left
+    # free it drifts ahead of the gun and lingers as a ghost of the flash.
+    particles.lock_to_control_point("bo3_raygun_muzzleflash_ring")
     register_blood(particles)
     register_lightning(particles)
     register_dissolve_sparks(particles)
@@ -1083,20 +1174,20 @@ def main():
                     particles.spawn_surface(
                         shooter_weapon.impact_particle, hit.position, hit.normal,
                         colors=shooter_weapon.impact_color, size=shooter_weapon.impact_size, group=IMPACT_GROUP)
-                    play_impact_sound(current_scene.sound_manager, hit)
+                    play_impact_sound(current_scene.sound_manager, hit, gun=shooter_weapon)
                 else:
-                    spawn_impact(particles, hit, sound_manager=current_scene.sound_manager)
+                    spawn_impact(particles, hit, sound_manager=current_scene.sound_manager, gun=shooter_weapon)
             if shooter_weapon.muzzle_particle:
                 particles.spawn(shooter_weapon.muzzle_particle, start, forward=aim,
                                 colors=shooter_weapon.muzzle_color, size=shooter_weapon.muzzle_size,
                                 offset_scale=shooter_weapon.muzzle_offset_scale, follow=follow)
     net_mgr.on_tracer = remote_shot
 
-    def remote_footstep(material, position, volume):
+    def remote_footstep(material, position, volume, steam_id=None):
         """Another player's footstep, replicated the same way as their shots/jumps - see
         NetworkManager.notify_footstep/RemotePlayer's own docstrings."""
         if current_scene is not None:
-            current_scene.play_footstep_sound(material, position, volume=volume)
+            current_scene.play_footstep_sound(material, position, volume=volume, character=steam_id)
     net_mgr.on_footstep = remote_footstep
     net_mgr.on_dissolve_spark = spawn_dissolve_spark_burst
     net_mgr.on_dissolve_arc = spawn_dissolve_arc
@@ -1114,7 +1205,7 @@ def main():
             return
         if get_damage_class(damage_class).death_effect != DISSOLVE and current_scene.gibs is not None:
             current_scene.gibs.spawn(position, velocity, tint=color)
-        if damage_class == "zap":
+        if damage_class == "smite":
             spawn_smite(position)
     net_mgr.on_death = remote_death
     # Another player's shot hit us: the shooter decided that, we apply it.
@@ -1146,9 +1237,30 @@ def main():
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
     menu_scene = get_or_load_scene("mainmenu")
 
-    def request_start(map_key):
+    def request_start(map_key, mode_key=None):
         nonlocal pending_start
-        pending_start = map_key
+        pending_start = (map_key, mode_key)
+
+    def start_from_lobby(map_key, mode_key=None):
+        """The real "begin gameplay" signal menu_scene.build_ui's own
+        on_start param is wired to - covers BOTH the lobby room's Start
+        button (LobbyRoom.on_game_start) and singleplayer (LobbyMenu's
+        own _start_singleplayer, which never shows a lobby room at all,
+        so in_lobby is already False there - this clear is a harmless
+        no-op in that case, not something singleplayer needs to care
+        about)."""
+        nonlocal in_lobby
+        in_lobby = False
+        request_start(map_key, mode_key)
+
+    def on_lobby_enter():
+        nonlocal in_lobby
+        in_lobby = True
+
+    def on_lobby_leave():
+        nonlocal in_lobby, in_menu
+        in_lobby = False
+        in_menu = True
 
     paper_doll = None  # head of the local rat beside the health bar - built in start_game
 
@@ -1169,21 +1281,59 @@ def main():
         camera.yaw, camera.pitch = game_mode.choose_spawn_rotation()
         camera.update_vectors()
 
-    def start_game(map_key):
-        nonlocal in_menu, paper_doll
+    def start_game(map_key, mode_key=None):
+        nonlocal in_menu, paper_doll, game_mode
         menu_ui.visible = False
-        # Coming back to the map we disconnected from: everything for it is still built.
-        reuse = current_scene is not None and current_scene_key == map_key and player is not None
-        if reuse:
-            current_scene.sound_manager.resume_all()
-            player.teleport(game_mode.choose_spawn_position())
-            change_health(health["max"])
-            reset_weapon_ammo()
-            if weapon is not None:
-                weapon.recoil.reset()
-        else:
-            setup_game(map_key)
+        # Reassigned here, every real game start, now that a mode is actually
+        # known (see MODES/request_start's own comments - module-level
+        # construction above is only ever the pre-lobby placeholder). mode_key
+        # can be None (no mode chosen) or an id the registry doesn't recognize
+        # (stale/corrupted lobby metadata) - both fall back to Deathmatch
+        # rather than silently leaving game_mode as whatever a PREVIOUS match
+        # happened to be using.
+        game_mode = (
+            create_game_mode(mode_key, net_mgr, spawn_points=[SPAWN_POSITION])
+            or Deathmatch(net_mgr, spawn_points=[SPAWN_POSITION])
+        )
+        # Starts the shared, Steam-lobby-metadata-backed round clock
+        # (see NetworkManager.start_round_timer/GameMode.round_remaining's
+        # own docstrings) - gated on is_host purely so only one peer
+        # ever writes the starting timestamp (every peer reads it back
+        # fresh afterward, so this is the ONLY privileged step in the
+        # whole mechanism, and the round itself stays correct even if
+        # THIS peer later disconnects - nothing after this write depends
+        # on it staying connected). `or not net_mgr.current_lobby_id`:
+        # singleplayer (lobby_menu.py's own _start_singleplayer) never
+        # creates a lobby at all, so is_host reads False there (no
+        # members to be first among) even though there's trivially only
+        # one "player" - that's still who should start the (locally-
+        # tracked, see start_round_timer's own docstring) timer. A mode
+        # with no round_duration set at all (the default - see
+        # GameMode's own class attribute) skips this entirely, same as
+        # before this feature existed.
+        if (net_mgr.is_host or not net_mgr.current_lobby_id) and game_mode.round_duration is not None:
+            net_mgr.start_round_timer(game_mode.round_duration)
+        # Every lobby join/host is a COMPLETE reload now - no "coming back
+        # to the map we disconnected from, everything's still built"
+        # shortcut any more (see setup_game's own comment for why: that
+        # reuse path let stale actor/physics/GL state from a PREVIOUS
+        # lobby session leak into a new one just because it happened to
+        # pick the same map). setup_game always tears down whatever
+        # existed and builds everything - scene, player, weapons, paper
+        # doll - fresh.
+        setup_game(map_key)
+        # health/inventory ammo are module-level, not rebuilt by setup_game
+        # (loadout/cosmetics deliberately persist across games - see
+        # Inventory's own construction, once, outside setup_game) - reset
+        # both explicitly here so a fresh lobby always starts at full
+        # health/ammo regardless of how the LAST session ended, now that
+        # this runs on every single lobby join instead of only a true
+        # first-ever start (when both already happened to be full anyway).
+        change_health(health["max"])
+        reset_weapon_ammo()
+        inventory.recoil.reset()
         health_bar.visible = True
+        round_timer_label.visible = True
         crosshair.visible = True
         weapon_hud.visible = True
         name_tags.visible = True
@@ -1191,10 +1341,8 @@ def main():
             local_player_model.set_hat(net_mgr.local_hat)
             local_player_model.set_tint(net_mgr.local_color)
             viewmodel.set_tint(net_mgr.local_color)
-            if not reuse:
-                paper_doll = PaperDoll(window.ctx, local_player_model.obj)
-        if not reuse:
-            prime_effects()
+            paper_doll = PaperDoll(window.ctx, local_player_model.obj)
+        prime_effects()
         in_menu = False
         ui.set_cursor_free(False)
         apply_spawn_rotation()
@@ -1215,16 +1363,30 @@ def main():
         ui.set_cursor_free(on)
 
     def disconnect():
-        """Leaves the lobby and returns to the main menu (the map stays loaded in case it's picked again)."""
+        """Leaves the lobby and returns to the main menu. The scene/player/
+        weapons etc. are left alive here (just paused, via in_menu's own
+        `continue` in the main loop, which skips current_scene.update()
+        entirely - no physics step, no actor update, nothing) rather than
+        torn down on the spot - the NEXT start_game (see setup_game's own
+        comment) fully destroys and rebuilds everything from scratch
+        regardless of whether that next lobby reuses this same map, so
+        tearing down here too would just be redundant work for a session
+        that might end (app quit) without ever starting another game
+        anyway. net_mgr.leave_lobby() below already fully disconnects the
+        NETWORK side immediately - destroys every RemotePlayer, clears
+        remote_players/membership state, sets in_game=False - so no stale
+        peer or packet handling survives past this call either way."""
         nonlocal in_menu
         set_paused(False)
         net_mgr.leave_lobby()
+        net_mgr.scene = None
         if death["active"] or death["pending"]:
             death["active"] = death["pending"] = False
             death_screen.hide()
             set_local_body_visible(True)
         current_scene.sound_manager.pause_all()
         health_bar.visible = False
+        round_timer_label.visible = False
         crosshair.visible = False
         weapon_hud.visible = False
         name_tags.visible = False
@@ -1283,8 +1445,7 @@ def main():
         apply_spawn_rotation()
         change_health(health["max"])
         reset_weapon_ammo()
-        if weapon is not None:
-            weapon.recoil.reset()
+        inventory.recoil.reset()
         set_local_body_visible(True)
         crosshair.visible = True
         weapon_hud.visible = True
@@ -1322,7 +1483,7 @@ def main():
         current_scene.before_viewmodels = previous_hook
         particles.clear()
         player.teleport(SPAWN_POSITION)       # the frames above let it fall a little
-        weapon.recoil.reset()
+        inventory.recoil.reset()
 
     def prime_effects():
         """Warms everything a first death, shot or hit would load or compile lazily - gib
@@ -1357,7 +1518,10 @@ def main():
         gc.freeze()
         window.reset_frame_timer()
 
-    menu_ui = menu_scene.build_ui(ui, net_mgr, MAPS, on_start=request_start)
+    menu_ui = menu_scene.build_ui(
+        ui, net_mgr, MAPS, MODES, on_start=start_from_lobby,
+        on_lobby_enter=on_lobby_enter, on_lobby_leave=on_lobby_leave,
+    )
     ui.set_cursor_free(True)
 
     def toggle_ui_demo(key):
@@ -1382,7 +1546,7 @@ def main():
         """window.handle_events' event filter: counts left clicks (from the
         event queue, so none is lost between frames) and then lets the UI have
         the event as before."""
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and not in_menu:
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and not in_menu and not in_lobby:
             if chatbox.focused:
                 return ui.handle_event(event)   # let TextInput's own Escape close chat instead of pausing
             set_paused(not pause["on"])
@@ -1395,7 +1559,7 @@ def main():
         # KEYDOWN-only) - count_click, as the event_filter, is the one place that
         # sees raw KEYUP events before camera/key handling does.
         if (event.type == pygame.KEYDOWN and event.key == pygame.K_b
-                and not in_menu and not chatbox.focused and not pause["on"]):
+                and not in_menu and not in_lobby and not chatbox.focused and not pause["on"]):
             emote_wheel.open()
             ui.set_cursor_free(True)
             return True
@@ -1405,9 +1569,9 @@ def main():
             ui.set_cursor_free(False)
             return True
         if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
-                and not in_menu and not ui.cursor_free):
+                and not in_menu and not in_lobby and not ui.cursor_free):
             trigger_clicks[0] += 1
-        if event.type == pygame.MOUSEWHEEL and not in_menu and not ui.cursor_free:
+        if event.type == pygame.MOUSEWHEEL and not in_menu and not in_lobby and not ui.cursor_free:
             # Accumulated, not consumed here directly, in case several land in
             # one frame - the main loop turns the total into at most one
             # weapon switch (see wheel_delta below). Note: once the emote wheel
@@ -1420,7 +1584,7 @@ def main():
         return ui.handle_event(event)
 
     def on_key_down(key):
-        if in_menu:
+        if in_menu or in_lobby:
             return
         if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not pause["on"] and not chatbox.focused:
             chatbox.open()
@@ -1476,9 +1640,12 @@ def main():
             change_health(10.0)
 
     net_mgr.profiler = prof
+    prof.extra = lambda: f"drawn {len(getattr(current_scene, '_frame_opaque_visible', None) or ())} opaque"
     prof.header = lambda: (
         f"{'HOST' if net_mgr.is_host else 'CLIENT'}  other players: {len(net_mgr.remote_players)}  "
-        f"window {window.width}x{window.height}  vsync {window.vsync}")
+        f"window {window.width}x{window.height}  vsync {window.vsync}  "
+        f"gpu {window.ctx.info.get('GL_RENDERER', '?')}  "
+        f"{cpu_affinity_label(cpu_tuner)}")
 
     running = True
     while running:
@@ -1490,14 +1657,14 @@ def main():
         if pause["quit"]:
             break
         if pending_start is not None:
-            start_map, pending_start = pending_start, None
-            start_game(start_map)
+            (start_map, start_mode), pending_start = pending_start, None
+            start_game(start_map, start_mode)
         prof.mark("events")
 
-        if in_menu:
+        if in_menu or in_lobby:
             net_mgr.update()
             menu_scene.update(dt)
-            if menu_scene.menu is not None:
+            if in_menu and menu_scene.menu is not None:
                 menu_scene.menu.update(dt)
             menu_scene.apply_camera(camera)
             window.ctx.clear(0.1, 0.1, 0.1, 1.0)
@@ -1579,10 +1746,25 @@ def main():
         # Call update to drive scene animations (like the rotating
         # torus) and step physics - camera position then follows
         # wherever physics moved the player capsule to this frame.
-        current_scene.update(dt)
+        # player_positions feeds Modules/Actors' own proximity detection
+        # (see ActorBase.update's own docstring) - built fresh every frame
+        # here since player positions are an app.py-level concern Scene
+        # itself has no other access to; skips the local player entirely
+        # while dead, same "not really in the world" reasoning the existing
+        # me=None-while-dead check (see kill_targets) already applies.
+        player_positions = [
+            (steam_id, other.body_center) for steam_id, other in net_mgr.remote_players.items()
+        ]
+        if alive:
+            player_positions.append((net_mgr.local_steam_id, player.get_position()))
+        prof.mark("input")
+        current_scene.profiler = prof
+        current_scene.update(dt, player_positions=player_positions, game_mode=game_mode)
+        prof.mark("scene.update")
+        game_mode.update(dt)
         if current_scene.gibs is not None:
             current_scene.gibs.update(dt)     # before particles.update: the blood follows the gibs
-        prof.mark("input + scene.update")
+        prof.mark("game mode + gibs")
         # Fell out of the map (see Scene.min_height's own docstring) - same death path as
         # /kill (kill_self), just triggered by height instead of a command. alive-gated so
         # this can't re-fire every frame once death becomes active (death["pending"] already
@@ -1611,9 +1793,11 @@ def main():
             camera.position = eye_position
         # After the camera has its final position/look for this frame.
         # Recoil moves the camera a little further each frame (see Recoil) -
-        # after mouse look, before anything reads camera.front for this frame.
-        if weapon is not None and alive:
-            weapon.recoil.apply(camera, dt)
+        # after mouse look, before anything reads camera.front for this frame. The player's own
+        # (Inventory.recoil), applied whichever weapon - or none - is out, so a kick keeps settling
+        # after a weapon switch.
+        if alive:
+            inventory.recoil.apply(camera, dt)
         # Right-click: eases the VIEWMODEL (not the world camera - see ViewModel.
         # update's own scope_blend docstring for why moving camera.position has no
         # visible effect on a camera-space-rendered viewmodel at all) toward the active
@@ -1700,9 +1884,9 @@ def main():
                         particles.spawn_surface(
                             weapon.impact_particle, shot.hit.position, shot.hit.normal,
                             colors=weapon.impact_color, size=weapon.impact_size, group=IMPACT_GROUP)
-                        play_impact_sound(current_scene.sound_manager, shot.hit)
+                        play_impact_sound(current_scene.sound_manager, shot.hit, gun=weapon)
                     else:
-                        spawn_impact(particles, shot.hit, sound_manager=current_scene.sound_manager)
+                        spawn_impact(particles, shot.hit, sound_manager=current_scene.sound_manager, gun=weapon)
                     if weapon.explosion is not None and shot.hit is not None:
                         explode(weapon, shot.hit)
                     if weapon.muzzle_particle:
@@ -1770,7 +1954,7 @@ def main():
             camera.yaw,
             horiz_speed,
             is_crouched=player.is_crouched(),
-            is_grounded=player.is_on_ground(),
+            is_grounded=player.is_on_ground() or player.is_on_ladder(),
             # Walk-vs-run is now driven by the actual sprint key input,
             # not momentum - see PlayerModel.update()'s own is_sprinting
             # docstring for why (this was the real fix for the run
@@ -1812,7 +1996,7 @@ def main():
         # set_local_state for why this isn't just the camera position).
         net_mgr.set_local_state(
             feet_position, camera.yaw, camera.pitch, horiz_speed,
-            player.is_crouched(), player.is_on_ground(), player.is_sprinting(),
+            player.is_crouched(), player.is_on_ground() or player.is_on_ladder(), player.is_sprinting(),
             move_dir, just_jumped,
         )
 
@@ -1820,7 +2004,7 @@ def main():
         if footstep is not None:
             material, volume = footstep
             current_scene.play_footstep_sound(
-                material, player.get_position(), volume=volume
+                material, player.get_position(), volume=volume, character=net_mgr.local_steam_id
             )
             net_mgr.notify_footstep(material, volume)   # so other players hear it too
 
@@ -1833,6 +2017,18 @@ def main():
             if death_screen.finished:
                 end_death()
         kill_feed.update()
+        # Round countdown - see GameMode.round_remaining's own docstring.
+        # None (no round_duration on the active mode, or the shared
+        # timer just hasn't started/propagated yet) hides the label
+        # entirely rather than showing a blank/stale string.
+        _t_round = time.perf_counter() if prof.enabled else 0.0
+        remaining = game_mode.round_remaining()
+        if prof.enabled:
+            prof.add("  hud: round timer read", time.perf_counter() - _t_round)
+        round_timer_label.visible = remaining is not None
+        if remaining is not None:
+            minutes, seconds = divmod(int(remaining), 60)
+            round_timer_label.text = f"{minutes}:{seconds:02d}"
         chatbox.update()
         damage_indicator.update(camera)
         if (dummy_state["respawn_at"] is not None and time.perf_counter() >= dummy_state["respawn_at"]
@@ -1866,14 +2062,20 @@ def main():
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
         # First-person muzzle flashes (overlay effects) are drawn by the scene just
         # before the viewmodels, so the gun and arms sit in front of them.
-        current_scene.before_viewmodels = lambda: particles.render(camera, overlay=True)
+        def draw_overlay_particles():
+            particles.sync_followers()     # muzzle flash onto the gun's pose from this frame
+            particles.render(camera, overlay=True)
+        current_scene.before_viewmodels = draw_overlay_particles
         current_scene.render(camera, None)
         prof.mark("scene.render (CPU)")
         tracers.render(camera)
+        prof.mark("tracers")
         particles.update(dt)
+        prof.mark("particles.update")
         particles.render(camera, overlay=False)
+        prof.mark("particles.render")
         current_scene.present()      # copies an offscreen scene (SSR) to the window; a no-op otherwise
-        prof.mark("tracers + particles")
+        prof.mark("present")
         if prof.enabled:
             text = "\n".join(prof.lines)
             if text != profile_label.text:
@@ -1887,6 +2089,7 @@ def main():
         window.flip()
         prof.mark("flip (GPU wait / vsync)")
         prof.end_frame()
+        cpu_tuner.update()
 
     particles.destroy()
     tracers.destroy()

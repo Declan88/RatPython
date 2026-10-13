@@ -8,8 +8,11 @@ app.py's own scroll-wheel weapon-switching.
 from . import theme
 from .widgets import Anchor, Image, Label, Panel
 
-ICON_SIZE = 60
-SLOT_ICON_SIZE = 30
+# Weapon icons are 1024x512 (2:1) - Image stretches to its box, so every icon box is
+# (height * ICON_ASPECT, height) rather than a square.
+ICON_ASPECT = 2
+ICON_SIZE = 60                      # height of the current weapon's icon
+SLOT_ICON_SIZE = 30                 # height of each slot-strip icon
 SLOT_BORDER = 3
 DIM_TINT = (160, 160, 160, 140)
 
@@ -43,7 +46,7 @@ class WeaponHUD(Panel):
 
         self.card = self.add(Panel(color=theme.CARD, layout="horizontal", spacing=14,
                                    padding=14, align="center", fit_content=True))
-        self.icon = self.card.add(Image(size=(ICON_SIZE, ICON_SIZE)))
+        self.icon = self.card.add(Image(size=(ICON_SIZE * ICON_ASPECT, ICON_SIZE)))
         text_col = self.card.add(Panel(layout="vertical", spacing=2, fit_content=True, align="end"))
         self.name_label = text_col.add(Label("", font_size=20, color=theme.MUTED))
         self.ammo_label = text_col.add(Label("", font_size=34, color=theme.TEXT))
@@ -55,11 +58,12 @@ class WeaponHUD(Panel):
             # An accent-colored frame a few px bigger than the icon reads as
             # a border (Panel has no border concept of its own - see
             # inputs.TextInput's own focus outline for the same 4-rect
-            # trick, not worth pulling in here for one square icon).
+            # trick, not worth pulling in here for one icon).
             frame = self.slots_row.add(Panel(color=(0, 0, 0, 0), padding=SLOT_BORDER,
-                                             size=(SLOT_ICON_SIZE + 2 * SLOT_BORDER,) * 2))
+                                             size=(SLOT_ICON_SIZE * ICON_ASPECT + 2 * SLOT_BORDER,
+                                                  SLOT_ICON_SIZE + 2 * SLOT_BORDER)))
             icon = frame.add(Image(getattr(weapon, "icon", None),
-                                   size=(SLOT_ICON_SIZE, SLOT_ICON_SIZE), tint=DIM_TINT))
+                                   size=(SLOT_ICON_SIZE * ICON_ASPECT, SLOT_ICON_SIZE), tint=DIM_TINT))
             self._slot_frames.append((frame, icon))
 
     def update(self, weapon, slots, current_index):

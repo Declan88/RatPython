@@ -105,7 +105,7 @@ def impact_effect_name(material):
     return SURFACE_IMPACTS.get(str(material).lower(), DEFAULT_IMPACT)
 
 
-def play_impact_sound(sound_manager, hit):
+def play_impact_sound(sound_manager, hit, gun=None):
     """Plays a random bullet-impact sound (see bullet_impact_sounds.py)
     for hit.material, positioned at the hit with reasonable attenuation
     (IMPACT_SOUND_MIN_DISTANCE/MAX_DISTANCE above). Separate from
@@ -121,7 +121,11 @@ def play_impact_sound(sound_manager, hit):
     is "replicated" the same way the particle effects already are: no
     new networking of its own, just reusing the two call sites every
     client already goes through for the particles. Hits on players
-    (hit.owner set) play nothing, same as spawn_impact."""
+    (hit.owner set) play nothing, same as spawn_impact.
+
+    gun: the weapon INSTANCE that fired (the local player's, or a remote player's own copy).
+    Each gun gets one impact sound slot (see SoundManager.add_sound's slot): its next impact
+    takes over the channel of its previous one instead of holding a new channel per bullet."""
     if sound_manager is None or hit is None or hit.owner is not None:
         return
     sound_path = get_bullet_impact_sound(hit.material)
@@ -130,19 +134,19 @@ def play_impact_sound(sound_manager, hit):
     sound_manager.add_sound(
         sound_path, hit.position, loop=False,
         min_distance=IMPACT_SOUND_MIN_DISTANCE, max_distance=IMPACT_SOUND_MAX_DISTANCE,
-        falloff="inverse",
+        falloff="inverse", slot=("impact", id(gun)) if gun is not None else None,
     )
 
 
-def spawn_impact(particles, hit, size=IMPACT_SIZE, sound_manager=None):
+def spawn_impact(particles, hit, size=IMPACT_SIZE, sound_manager=None, gun=None):
     """Plays the impact effect for a RayHit (Modules/Physics/physics_world.py)
     where it struck. Hits on players (hit.owner set) play nothing here.
     sound_manager: see play_impact_sound above - passed through and
     called here too so a caller only needs this one function for the
-    common case (no custom weapon impact_particle)."""
+    common case (no custom weapon impact_particle). gun: see play_impact_sound."""
     if hit is None or hit.owner is not None:
         return None
-    play_impact_sound(sound_manager, hit)
+    play_impact_sound(sound_manager, hit, gun=gun)
     name = impact_effect_name(hit.material)
     if name is None:
         return None

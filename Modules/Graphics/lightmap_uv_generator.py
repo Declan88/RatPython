@@ -190,7 +190,7 @@ def _flatten_chart(vertices, faces, chart_tris):
     return local_uvs, remapped_faces, unique_original.astype("i8")
 
 
-def _pack_charts(chart_uvs, margin):
+def _shelf_pack(chart_uvs, margin):
     """Simple shelf/skyline packer: sorts charts tallest-first and lays
     them out left-to-right, wrapping to a new row whenever the next
     chart would exceed a target row width. Not space-optimal (a real
@@ -242,6 +242,45 @@ def _pack_charts(chart_uvs, margin):
     return offsets, (max(packed_width, 1e-9), max(packed_height, 1e-9))
 
 
+# A pack whose charts fill less than this fraction of the atlas (chart area / atlas area, the
+# margins counted as wasted) has spent too much of it on margin - see _pack_charts.
+_MIN_PACK_UTILIZATION = 0.25
+
+
+def _pack_charts(chart_uvs, margin_fraction, min_margin_fraction):
+    """Packs the charts so the margin around each ends up `margin_fraction` of the FINAL atlas
+    (so margin_fraction * the bake resolution is the gap in real texels, whatever size the
+    mesh is). _shelf_pack's margin is in the charts' own units (metres), so a fixed margin
+    there shrinks, as a fraction of the atlas, the bigger the mesh gets - a large slab
+    got a couple of texels between charts however much padding was asked for, and neighbouring
+    charts' dilated edges then met and blended (the faint lines along face seams). The atlas
+    size depends on the margin, so this iterates: pack, measure the atlas, set the margin
+    to that fraction of it, repeat.
+
+    A mesh made of thousands of tiny charts can't afford the full margin (every chart would be
+    mostly margin and the real lightmap detail would shrink to nothing), so if the margin eats
+    too much of the atlas (_MIN_PACK_UTILIZATION) it is reduced step by step, never below
+    min_margin_fraction.
+
+    Returns (offsets, (packed_width, packed_height)) like _shelf_pack."""
+    raw_area = sum(float(np.prod(uv.max(axis=0) - uv.min(axis=0))) for uv in chart_uvs)
+    fraction = margin_fraction
+    while True:
+        extent = max(float(np.sqrt(max(raw_area, 1e-12))), 1e-6)
+        for _ in range(6):
+            margin = fraction * extent
+            offsets, (width, height) = _shelf_pack(chart_uvs, margin)
+            new_extent = max(width, height)
+            if abs(new_extent - extent) <= 1e-3 * extent:
+                extent = new_extent
+                break
+            extent = new_extent
+        utilization = raw_area / max(max(width, height) ** 2, 1e-12)
+        if utilization >= _MIN_PACK_UTILIZATION or fraction <= min_margin_fraction * 1.0001:
+            return offsets, (width, height)
+        fraction = max(min_margin_fraction, fraction * 0.7)
+
+
 # Both defaults are also referenced from lightmap_baker.py's
 # dilate_lightmap (via scene_base.py's bake_static_lighting) to scale
 # its own dilation reach to whatever resolution a scene ACTUALLY bakes
@@ -257,11 +296,13 @@ def _pack_charts(chart_uvs, margin):
 # per-chart margin at bake time was 8-16x more texels wide than
 # dilate_lightmap's own OLD fixed iteration count ever reached -
 # confirmed as the actual cause of a reported lightmap seam/bleed bug.
-DEFAULT_RESOLUTION = 256
+DEFAULT_RESOLUTION = 2048
 # 12, not the old 4 - directly "more breathing room" between charts, on
 # top of fixing the dilation-reach mismatch above (see this module's
 # own docstring for both).
-DEFAULT_PADDING_TEXELS = 12.0
+DEFAULT_PADDING_TEXELS = 8.0
+# The least margin (texels at DEFAULT_RESOLUTION) a very dense mesh is allowed to shrink to.
+MIN_PADDING_TEXELS = 3.0
 
 
 def generate_lightmap_uvs(vertices, faces, resolution=DEFAULT_RESOLUTION,
@@ -342,7 +383,8 @@ def generate_lightmap_uvs(vertices, faces, resolution=DEFAULT_RESOLUTION,
         chart_vertex_sources.append(original_indices)
 
     margin = float(padding_texels) / float(max(resolution, 1))
-    offsets, (packed_w, packed_h) = _pack_charts(chart_uvs, margin)
+    min_margin = min(margin, MIN_PADDING_TEXELS / float(max(resolution, 1)))
+    offsets, (packed_w, packed_h) = _pack_charts(chart_uvs, margin, min_margin)
     atlas_extent = max(packed_w, packed_h)
 
     all_uv1, all_sources, all_faces = [], [], []

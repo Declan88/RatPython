@@ -19,6 +19,7 @@ MIN_SPAWN_CLEARANCE = 6.0
 
 class Deathmatch(GameMode):
     name = "Deathmatch"
+    round_duration = 15 * 60  # 15 minutes
 
     def __init__(self, net_mgr, scene=None, spawn_points=None, kill_limit=0):
         super().__init__(net_mgr, scene, spawn_points)

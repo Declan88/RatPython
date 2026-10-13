@@ -149,6 +149,20 @@ class PaperDoll:
             bind = glm.inverse(joints[self._head_index].inverse_bind_matrix)
             self._head_bind = glm.vec4(bind[3].x, bind[3].y, bind[3].z, 1.0)
 
+    def destroy(self):
+        """Releases every GL resource this PaperDoll itself owns (self.
+        program/vao/circle_program/circle_vao/_hat_vaos - NOT obj's own
+        VBOs/IBO, borrowed from the player model and released by whatever
+        tears THAT down instead, e.g. Scene.remove_skeletal). Call before
+        dropping the last reference, e.g. app.py building a fresh one for
+        a new game session."""
+        for vao in (self.vao, self.circle_vao, *self._hat_vaos.values()):
+            vao.release()
+        self.program.release()
+        self.circle_program.release()
+        self._hat_vaos = {}
+        self.obj = None
+
     def _head_position(self):
         if self._head_index is None:
             return glm.vec3(0.0, 1.3, 0.0)

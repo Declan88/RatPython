@@ -1157,20 +1157,12 @@ def load_animation_clips(path, skeleton, rename=None, time_scale=1.0, skin_index
     # so _parse_animations' existing "not in node_to_joint_index -
     # ignore" branch already does the right thing for it for free.
     node_to_target_joint_index = {}
-    unmatched = []
+    # A source joint with no same-named joint in the target skeleton (a weapon's own bones on the
+    # arms rig, say) is simply skipped - its channels are dropped. That is normal, not worth a log line.
     for source_node_idx in source_joint_node_indices:
         joint_name = gltf["nodes"][source_node_idx].get("name")
         if joint_name in target_joint_index_by_name:
             node_to_target_joint_index[source_node_idx] = target_joint_index_by_name[joint_name]
-        else:
-            unmatched.append(joint_name)
-
-    if unmatched:
-        print(
-            f"[skeletal_loader] {path}: {len(unmatched)} joint(s) with no "
-            f"name match in the target skeleton - any channels targeting "
-            f"them are dropped: {unmatched}"
-        )
 
     parsed = _parse_animations(gltf, blob, node_to_target_joint_index, time_scale=time_scale)
 
@@ -1178,13 +1170,7 @@ def load_animation_clips(path, skeleton, rename=None, time_scale=1.0, skin_index
     added = []
     for source_name, clip in parsed.items():
         final_name = rename.get(source_name, source_name)
-        if final_name in skeleton.animations:
-            print(
-                f"[skeletal_loader] {path}: clip '{final_name}' already "
-                f"exists on this skeleton - overwriting with the one from "
-                f"this file."
-            )
-        clip.name = final_name
+        clip.name = final_name      # (a clip already under that name is replaced)
         skeleton.animations[final_name] = clip
         added.append(final_name)
 
@@ -1289,7 +1275,6 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
     # that references it.
     meshes = gltf.get("meshes", [])
     prims = []
-    hidden_node_names = []
     hat_prims = {}
     for node in gltf.get("nodes", []):
         mesh_index = node.get("mesh")
@@ -1301,14 +1286,10 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
         if node_names is not None and node_name not in node_names:
             continue
         if _is_hidden_by_default(node_name):
-            hidden_node_names.append(node_name)
             if node_name.lower().startswith(_HAT_PREFIX):
                 hat_prims[node_name[len(_HAT_PREFIX):]] = list(meshes[mesh_index].get("primitives", []))
             continue
         prims.extend(meshes[mesh_index].get("primitives", []))
-
-    if hidden_node_names:
-        print(f"[skeletal_loader] {path}: hiding by default (name convention): {hidden_node_names}")
 
     if not prims:
         print(f"[skeletal_loader] {path} has no visible mesh primitives, aborting.")
@@ -1368,17 +1349,8 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
     weights_0 = np.concatenate(weights_parts, axis=0)
     faces = np.concatenate(face_parts, axis=0)
 
-    if len(set(material_indices)) > 1:
-        print(
-            f"[skeletal_loader] {path} has {len(prims)} primitives using "
-            f"{len(set(material_indices))} different materials - only the "
-            f"first primitive's material (base color/metallic/roughness/"
-            f"emissive/textures) is used for the WHOLE merged mesh. Same "
-            f"simplification model_loader.py's own multi-object flatten "
-            f"already makes for a non-skinned multi-material mesh - true "
-            f"per-primitive materials would need per-primitive draw calls "
-            f"(or a texture atlas), not implemented here."
-        )
+    # (A skinned object keeps only the FIRST primitive's material for the whole merged mesh - several
+    # materials need one object per node, see node_names. Not logged: it is a known, documented limit.)
 
     # --- Skin / joint hierarchy ---
     joint_node_indices = skin["joints"]
