@@ -82,7 +82,11 @@ jobs:
             --output-filename=RatWar --output-dir=build_nuitka_macos app.py
 
       - name: Zip the app
-        run: ditto -c -k --keepParent build_nuitka_macos/RatWar.app RatWar-macOS-arm64.zip
+        # --onefile makes a single executable (build_nuitka_macos/RatWar); Nuitka ignores
+        # --macos-create-app-bundle in that mode, so there is no RatWar.app to zip.
+        run: |
+          test -f build_nuitka_macos/RatWar
+          ditto -c -k --keepParent build_nuitka_macos/RatWar RatWar-macOS-arm64.zip
 
       - uses: actions/upload-artifact@v4
         with:
