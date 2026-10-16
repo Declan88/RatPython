@@ -69,24 +69,57 @@ jobs:
           done
           iconutil -c icns icon.iconset -o Assets/icon/icon.icns
 
-      # Same flags as BuildCMD_Nuitka_macOS, minus --include-data-files for libsteam_api.dylib:
-      # Nuitka already bundles it as a dependency of py_steam_net (see the dylib copy above),
-      # and bundling it twice is an error.
+      # Packed assets, like BuildCMD_Nuitka_Standalone_Packed.cmd: every asset becomes its own
+      # encrypted blob, so a Steam update only re-sends the assets that changed.
+      #
+      # The encryption key is NOT in the repo (asset_key.bin is git-ignored). A different key
+      # re-encrypts everything, so every player would redownload the whole game - it must be the
+      # same key as the Windows builds. Store it once as the repository secret ASSET_KEY_B64:
+      #   base64 -w0 asset_key.bin | gh secret set ASSET_KEY_B64 --repo Declan88/RatPython
+      - name: Pack the assets
+        env:
+          ASSET_KEY_B64: ${{ secrets.ASSET_KEY_B64 }}
+        run: |
+          if [ -z "$ASSET_KEY_B64" ]; then
+            echo "::error::Repository secret ASSET_KEY_B64 is not set (the base64 of asset_key.bin) - see the comment above this step."
+            exit 1
+          fi
+          printf '%s' "$ASSET_KEY_B64" | base64 --decode > asset_key.bin
+          test "$(wc -c < asset_key.bin | tr -d ' ')" = 32 || { echo "::error::asset_key.bin must be 32 bytes"; exit 1; }
+          # Also writes Modules/Assets/_asset_key.py, which the compile below needs.
+          python tools/pack_assets.py --out build_nuitka/packed --verify
+
+      # Standalone, with NO --include-data-dir=Assets (plain assets must not ship). The scipy and
+      # PIL-AVIF exclusions are the same size trims the Windows packed build uses. libsteam_api.dylib is
+      # not listed: Nuitka bundles it as a dependency of py_steam_net (bundling it twice is an error).
       - name: Build with Nuitka
         run: |
-          python -m nuitka --onefile --macos-create-app-bundle --macos-app-name="RatWar" \
+          python -m nuitka --standalone --macos-create-app-bundle --macos-app-name="RatWar" \
             --macos-app-icon="Assets/icon/icon.icns" --assume-yes-for-downloads --disable-cache=ccache \
-            --include-data-dir=Assets=Assets \
-            --noinclude-data-files="Assets/Lightmaps/TorusScene/*" --nofollow-import-to=Frontend \
-            --noinclude-data-files="Blender/*" --noinclude-data-files="*.blend" --noinclude-data-files="*.blend1" \
+            --nofollow-import-to=Frontend --nofollow-import-to=scipy \
+            --nofollow-import-to=PIL.AvifImagePlugin --nofollow-import-to=PIL._avif \
             --output-filename=RatWar --output-dir=build_nuitka_macos app.py
 
-      - name: Zip the app
-        # --onefile makes a single executable (build_nuitka_macos/RatWar); Nuitka ignores
-        # --macos-create-app-bundle in that mode, so there is no RatWar.app to zip.
+      # The game changes into the folder its executable sits in (app.py's _chdir_for_frozen_build),
+      # so the packed Assets go beside the executable inside the bundle.
+      - name: Add the packed assets
         run: |
-          test -f build_nuitka_macos/RatWar
-          ditto -c -k --keepParent build_nuitka_macos/RatWar RatWar-macOS-arm64.zip
+          APP=$(find build_nuitka_macos -maxdepth 1 -name '*.app' | head -n 1)
+          test -n "$APP" || { echo "::error::no .app in build_nuitka_macos"; ls -la build_nuitka_macos; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          ls "$APP/Contents/MacOS" | head -20
+          mkdir -p "$APP/Contents/MacOS/Assets"
+          rsync -a --delete build_nuitka/packed/Assets/ "$APP/Contents/MacOS/Assets/"
+          # Adding files invalidates the signature Nuitka gave the bundle (ad hoc); apple silicon
+          # refuses unsigned code, so sign it again.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Check the packed build
+        run: python tools/check_packed_build.py "$APP/Contents/MacOS" RatWar
+
+      - name: Zip the app
+        run: ditto -c -k --keepParent "$APP" RatWar-macOS-arm64.zip
 
       - uses: actions/upload-artifact@v4
         with:
