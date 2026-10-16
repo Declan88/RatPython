@@ -10,13 +10,14 @@ import json
 import os
 
 _PATH = os.path.join(os.path.expanduser("~"), ".ratwar", "settings.json")
-_DEFAULTS = {"ssr": True, "gibs": True}
+_DEFAULTS = {"ssr": True, "gibs": True, "bloom": True}
 
 
 class Settings:
     def __init__(self):
         self.ssr = _DEFAULTS["ssr"]        # screen-space reflections (water)
         self.gibs = _DEFAULTS["gibs"]      # physical gibs on death (off = a cheap blood burst)
+        self.bloom = _DEFAULTS["bloom"]    # glow on "bloom_" objects (see Modules/Graphics/bloom.py)
         self.load()
 
     def load(self):

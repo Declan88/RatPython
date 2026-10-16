@@ -72,6 +72,21 @@ def _discover():
         _registry[game_mode_id_of(cls)] = cls
 
 
+# Maps that only work with certain modes: {map key: (allowed mode ids)}. A map not listed here
+# takes any mode.
+MAP_MODES = {"sewer": ("deathmatch",)}
+
+
+def mode_allowed(map_key, mode_id):
+    allowed = MAP_MODES.get(map_key)
+    return allowed is None or mode_id in allowed
+
+
+def coerce_mode(map_key, mode_id):
+    """mode_id if the map allows it, else the map's first allowed mode."""
+    return mode_id if mode_allowed(map_key, mode_id) else MAP_MODES[map_key][0]
+
+
 def game_mode_ids():
     _discover()
     return list(_registry)

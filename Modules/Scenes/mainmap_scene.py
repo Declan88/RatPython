@@ -4,7 +4,7 @@ from Modules.Scenes.scene_base import Scene
 
 class MainMapScene(Scene):
     def __init__(self, ctx):
-        super().__init__(ctx, recalculate_shadows=False)
+        super().__init__(ctx, recalculate_shadows=True)
 
         # Falling off the map (through the water, off a ledge into the void) kills the
         # local player instead of letting them fall forever - see Scene.min_height's own
@@ -53,7 +53,7 @@ class MainMapScene(Scene):
             # see base_alpha_overrides below for the actual transparency
             # amount, and add_static's own alpha_mode_overrides/
             # base_alpha_overrides docstrings for the full reasoning.
-            alpha_mode_overrides={"Treemat": "MASK", "Watermat": "BLEND"},
+            alpha_mode_overrides={"Treemat": "MASK", "Watermat": "BLEND", "powertower01": "MASK"},
             # Vending_machine was exported with a flat emissiveFactor=
             # (1,1,1) plus an emissiveTexture pointing at the SAME image
             # as its own base color texture (confirmed via a raw glTF
@@ -87,6 +87,15 @@ class MainMapScene(Scene):
             # re-bake (this scene already has recalculate_shadows=True).
             cast_shadow_overrides={"tides_light_streetlight": False},
             specular_strength_overrides={"Watermat": 5},
+            # Glow of the "bloom_" nodes in mainmap.glb (see Modules/Graphics/bloom.py), by node
+            # name: the industrial bells (the ".001"/".003" ones are the bell bodies, which have no
+            # emission of their own, so they stay dark) and the shop ceiling light. The numbers are
+            # a first guess - tune to taste in-engine.
+            bloom_overrides={
+                "bloom_light_industrialbell01_on": {"intensity": 0.6, "radius": 1.5},
+                "bloom_light_industrialbell01_on.008": {"intensity": 0.6, "radius": 1.5},
+                "bloom_light_shop2": {"intensity": 0.8, "radius": 2.0},
+            },
             water_overrides={
                 "Watermat": {
                     "pan1_speed": (0.03, 0.015),
@@ -201,6 +210,8 @@ class MainMapScene(Scene):
         self.add_actors_from_glb("Assets/Models/Map/mainmap.glb")
         # "ladder" Empties in the same file become climbable volumes (see Scene.add_ladders_from_glb).
         self.add_ladders_from_glb("Assets/Models/Map/mainmap.glb")
+        # "character_spawn" Empties become player spawn points (see Scene.add_spawns_from_glb).
+        self.add_spawns_from_glb("Assets/Models/Map/mainmap.glb")
 
         self.sound_manager.add_sound(
             "Assets/Audio/crucial_urban_rooftop_ambloop01.wav",

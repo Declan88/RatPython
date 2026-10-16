@@ -21,6 +21,9 @@ sites (replacing a single hardcoded SPAWN_POSITION) and its net_mgr.on_kill
 wiring.
 """
 
+import math
+import random
+
 
 class GameMode:
     """name is a short display label a future mode-select UI could show -
@@ -54,6 +57,11 @@ class GameMode:
         # one point", which is exactly today's single-SPAWN_POSITION
         # behavior - see choose_spawn_position.
         self.spawn_points = list(spawn_points) if spawn_points else [(0.0, 2.0, 3.0)]
+        # What choose_spawn_position last returned - choose_spawn_rotation is always asked right
+        # after it, so a mode can face the player relative to where they actually spawned.
+        self.last_spawn_position = self.spawn_points[0]
+        # {spawn point: yaw} for points that came from a map's "character_spawn" markers.
+        self.spawn_yaws = {}
 
     def update(self, dt):
         """Called once per frame by app.py while a match is running. No-op by
@@ -73,16 +81,47 @@ class GameMode:
         peer with the next state packet."""
         self.net_mgr.local_mode_values[key] = float(value)
 
+    def use_scene_spawns(self, scene, hull_height):
+        """Replaces spawn_points with the map's own "character_spawn" markers
+        (scene.player_spawns - FEET positions, see Scene.add_spawns_from_glb),
+        raised by half the player's hull height (spawn points are hull-centre
+        height) plus a hair so it never starts embedded in the floor. A map
+        with no markers keeps whatever spawn_points it already had."""
+        self.scene = scene
+        spawns = getattr(scene, "player_spawns", None)
+        if spawns:
+            lift = hull_height / 2.0 + 0.05
+            self.spawn_points = [(s["position"].x, s["position"].y + lift, s["position"].z) for s in spawns]
+            self.spawn_yaws = {point: s["yaw"] for point, s in zip(self.spawn_points, spawns)}
+
     def choose_spawn_position(self):
         """Where the local player (re)spawns - called by app.py's
-        setup_game/start_game (reuse path)/end_death, i.e. every point that
-        used to just read the SPAWN_POSITION constant directly. Base
-        implementation: always the first configured spawn point (or the
-        single default above) - a fixed spawn, deliberately the simplest
-        possible mode so a caller with no real mode configured yet still
-        gets consistent, correct behavior. Override for anything smarter
-        (random choice, avoiding other players - see Deathmatch)."""
-        return self.spawn_points[0]
+        setup_game/end_death. Ranks every spawn point by how far it is from
+        the nearest OTHER player, keeps the best third (at least one), and
+        picks one of those at random - so a respawn is always well away from
+        the action, but not the same single "farthest" spot every time (which
+        would be trivially camped). With nobody else around, every point is
+        equally good, so it's a plain random pick."""
+        self.last_spawn_position = self._pick_spawn_position()
+        return self.last_spawn_position
+
+    def _pick_spawn_position(self):
+        points = self.spawn_points
+        if len(points) <= 1:
+            return points[0]
+
+        others = [
+            player.model.obj["position"] for player in self.net_mgr.remote_players.values()
+            if player.model.obj is not None
+        ]
+        if not others:
+            return random.choice(points)
+
+        def clearance(point):
+            return min((point[0] - o.x) ** 2 + (point[1] - o.y) ** 2 + (point[2] - o.z) ** 2 for o in others)
+
+        best = sorted(points, key=clearance, reverse=True)[:max(1, math.ceil(len(points) / 3))]
+        return random.choice(best)
 
     def choose_spawn_rotation(self):
         """(yaw, pitch) degrees the camera snaps to on every (re)spawn - same
@@ -100,8 +139,12 @@ class GameMode:
         before any match begins, not for any deeper reason. Override for a
         mode that wants each spawn POINT to face a particular way (a per-
         point yaw stored alongside spawn_points, say) instead of one fixed
-        direction for every spawn."""
-        return -90.0, 0.0
+        direction for every spawn.
+
+        A spawn that came from a map's "character_spawn" marker (see use_scene_spawns) faces the
+        way that marker is rotated - still authored by the map, never chosen by the player."""
+        yaw = self.spawn_yaws.get(self.last_spawn_position)
+        return (yaw, 0.0) if yaw is not None else (-90.0, 0.0)
 
     def on_kill(self, killer_id, victim_id, weapon_name=""):
         """Called once for every kill THIS client has full information for -

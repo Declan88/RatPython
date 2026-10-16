@@ -17,6 +17,8 @@ better as its own dedicated screen than as another card floating over the
 main menu's background.
 """
 
+from Modules.GameModes.registry import coerce_mode, mode_allowed
+
 from . import theme
 from .controls import ScrollBox
 from .inputs import Dropdown, TextInput
@@ -88,8 +90,8 @@ class LobbyRoom:
 
         footer = root.add(Panel(layout="horizontal", spacing=20, fit_content=True,
                                 anchor=Anchor.BOTTOM_CENTER, offset=(0, -40)))
-        footer.add(_button("LEAVE", self._press_leave, size=(220, 70), font_size=32))
         self.start_button = footer.add(_button("START", self._press_start, size=(220, 70), font_size=32))
+        footer.add(_button("LEAVE", self._press_leave, size=(220, 70), font_size=32))
         return root
 
     def _build_settings_card(self, is_host):
@@ -114,13 +116,13 @@ class LobbyRoom:
             card.add(Label("Map", font_size=20, color=theme.MUTED))
             self.map_dropdown = card.add(Dropdown(
                 [name for name, _ in self.maps], selected=_index_for_key(self.maps, info.get("map")),
-                on_change=lambda i, _o: self.net.update_lobby_setting("map", self.maps[i][1]),
+                on_change=self._on_map_change,
                 size=(_CARD_W - 44, 50), font_size=24,
             ))
             card.add(Label("Game mode", font_size=20, color=theme.MUTED))
             self.mode_dropdown = card.add(Dropdown(
                 [name for name, _ in self.modes], selected=_index_for_key(self.modes, info.get("mode")),
-                on_change=lambda i, _o: self.net.update_lobby_setting("mode", self.modes[i][1]),
+                on_change=self._on_mode_change,
                 size=(_CARD_W - 44, 50), font_size=24,
             ))
             if info.get("has_password"):
@@ -134,6 +136,25 @@ class LobbyRoom:
             self._apply_readonly_settings(info)
 
         self.start_button.visible = is_host
+
+    def _on_map_change(self, index, _option):
+        """A map that only supports some modes (registry.MAP_MODES) switches the mode too."""
+        map_key = self.maps[index][1]
+        self.net.update_lobby_setting("map", map_key)
+        current = self.modes[self.mode_dropdown.selected][1]
+        wanted = coerce_mode(map_key, current)
+        if wanted != current:
+            self.mode_dropdown.set_selected(_index_for_key(self.modes, wanted))   # notifies -> saved
+
+    def _on_mode_change(self, index, _option):
+        """Refuses a mode the selected map doesn't support - snaps the dropdown back."""
+        map_key = self.maps[self.map_dropdown.selected][1]
+        mode_key = self.modes[index][1]
+        if not mode_allowed(map_key, mode_key):
+            self.mode_dropdown.set_selected(
+                _index_for_key(self.modes, coerce_mode(map_key, mode_key)), notify=False)
+            return
+        self.net.update_lobby_setting("mode", mode_key)
 
     def _apply_readonly_settings(self, info):
         self.name_label.text = info.get("name", "...")

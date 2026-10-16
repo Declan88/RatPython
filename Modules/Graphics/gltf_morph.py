@@ -168,6 +168,8 @@ def load_morph_primitives(glb_path):
         "base_color_factor": (r, g, b, a) 0-1,
         "metallic"/"roughness": float,
         "double_sided": bool,
+        "alpha_mode": "OPAQUE" | "MASK" | "BLEND" (glTF's alphaMode),
+        "alpha_cutoff": float,
         "image": PIL.Image or None - the base color texture, undecoded
             beyond PIL's own lazy load (Scene uploads it).
     }"""
@@ -249,6 +251,8 @@ def load_morph_primitives(glb_path):
                 "metallic": float(pbr.get("metallicFactor", 1.0)),
                 "roughness": float(pbr.get("roughnessFactor", 1.0)),
                 "double_sided": bool(material.get("doubleSided", False)),
+                "alpha_mode": material.get("alphaMode", "OPAQUE"),
+                "alpha_cutoff": float(material.get("alphaCutoff", 0.5)),
                 "image": _read_image(gltf, bin_chunk, pbr.get("baseColorTexture")),
             })
 

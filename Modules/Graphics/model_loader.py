@@ -697,7 +697,16 @@ def _material_key(geom):
     name = getattr(mat, "name", None)
     return name if name else id(mat)
 
-def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only=True):
+BLOOM_NODE_PREFIX = "bloom_"
+
+
+def is_bloom_node(node_name):
+    """A map node named "bloom_..." glows (see Modules/Graphics/bloom.py). It still renders and
+    collides like any other mesh."""
+    return str(node_name).lower().startswith(BLOOM_NODE_PREFIX)
+
+
+def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only=True, lightmap_uv_path=None):
     """Like _flatten_scene, but groups nodes by MATERIAL instead of
     merging every node in the file into one mesh - _flatten_scene keeps
     only the FIRST node's material for the whole combined result
@@ -724,6 +733,15 @@ def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only
     giving a clip-brush node no collider at all on any level using add_static_mesh_by_
     material, the exact opposite of what naming it collision_ is meant to do.
 
+    lightmap_uv_path: the glb's path, passed only by the RENDER caller. A "bloom_" node (see
+    is_bloom_node) also gets a group of its own, so only it glows and not the other meshes
+    sharing its material. A node with its own
+    authored TEXCOORD_1 (lightmap UV) is then split out into a group of its own, even if it
+    shares a material name with other nodes: _build_mesh_data takes authored lightmap UVs only
+    when EVERY node in a group has them (each object's UVs fill the whole 0-1 square, so two
+    objects sharing one atlas would overlap), and without this a single node lacking them made
+    the whole material fall back to generated UVs, ignoring the authored ones.
+
     Returns a list of (combined_mesh, node_order) pairs, one per
     distinct material actually present, in first-encountered order - each pair is
     exactly what _flatten_scene would have returned if the file had
@@ -744,6 +762,9 @@ def _flatten_scene_by_material(scene, extra_exclude=None, exclude_collision_only
         if geom is None or not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0: continue
 
         key = _material_key(geom)
+        if lightmap_uv_path is not None and (
+                is_bloom_node(node_name) or _read_gltf_uv1(lightmap_uv_path, [node_name]) is not None):
+            key = (key, node_name)      # authored lightmap UV / a bloom_ node: its own group, see the docstring
         if key not in groups:
             groups[key] = {"vertices": [], "faces": [], "normals": [], "uvs": [], "representative": None, "offset": 0, "names": []}
             order.append(key)
@@ -927,7 +948,7 @@ def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_an
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
         return []
-    groups = _flatten_scene_by_material(scene)
+    groups = _flatten_scene_by_material(scene, lightmap_uv_path=path)
     if not groups:
         print(f"[Error] Failed to parse model {path}: no renderable geometry.")
         return []
@@ -950,5 +971,7 @@ def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_an
             # Unreal's Masked - hard cutout, full depth write/test, no
             # sort-order dependence - see that override's own docstring).
             data["material_name"] = _material_key(mesh)
+            data["bloom"] = bool(node_order) and all(is_bloom_node(n) for n in node_order)
+            data["node_names"] = list(node_order)
             results.append(data)
     return results

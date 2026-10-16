@@ -164,6 +164,7 @@ from Modules.Camera.camera import Camera
 from Modules.Camera.camera_boom_arm import CameraBoomArm
 from Modules.Scenes.torus_scene import TorusScene
 from Modules.Scenes.mainmap_scene import MainMapScene
+from Modules.Scenes.sewer_scene import SewerScene
 from Modules.Scenes.main_menu_scene import MainMenuScene
 from Modules.Physics.character_controller import CharacterController
 from Modules.Player.player_model import PlayerModel
@@ -228,7 +229,7 @@ load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
 from Modules.Networking.remote_player import RemotePlayer
-from Modules.GameModes import Deathmatch, create_game_mode, game_mode_ids, get_game_mode_class
+from Modules.GameModes import Deathmatch, coerce_mode, create_game_mode, game_mode_ids, get_game_mode_class
 
 
 def main():
@@ -266,7 +267,7 @@ def main():
     # below), and building it (parsing its glb, uploading GPU
     # resources, baking lightmaps) is real, non-trivial work worth
     # skipping entirely for a run that never visits it.
-    SCENE_CLASSES = {"torus": TorusScene, "mainmap": MainMapScene, "mainmenu": MainMenuScene}
+    SCENE_CLASSES = {"torus": TorusScene, "mainmap": MainMapScene, "sewer": SewerScene, "mainmenu": MainMenuScene}
     scenes = {}
 
     def get_or_load_scene(key):
@@ -381,6 +382,7 @@ def main():
         # keeps the first-person camera at the same height the visible/
         # shadow-casting model's own eyes actually are.
         player_height = 1.39225 * 9 / 8
+        game_mode.use_scene_spawns(current_scene, player_height)   # the map's "character_spawn" markers
         player = CharacterController(
             current_scene.physics,
             position=game_mode.choose_spawn_position(),
@@ -865,7 +867,7 @@ def main():
     # request_start. The real work (setup_game: map, player, models, each
     # behind its own loading frame) runs from the main loop, not inside
     # that callback, which can fire from inside Steam's callback dispatch.
-    MAPS = [("Main Map", "mainmap"), ("Torus (test)", "torus")]
+    MAPS = [("Main Map", "mainmap"), ("Sewer", "sewer"), ("Torus (test)", "torus")]
     # (display name, id) for every registered Modules.GameModes class - built
     # from the registry itself (game_mode_ids/get_game_mode_class), not a
     # hand-maintained list like MAPS above, so a new mode shows up in the
@@ -1284,6 +1286,7 @@ def main():
     def start_game(map_key, mode_key=None):
         nonlocal in_menu, paper_doll, game_mode
         menu_ui.visible = False
+        mode_key = coerce_mode(map_key, mode_key)   # e.g. the Sewer is Deathmatch only
         # Reassigned here, every real game start, now that a mode is actually
         # known (see MODES/request_start's own comments - module-level
         # construction above is only ever the pre-lobby placeholder). mode_key
@@ -1463,6 +1466,7 @@ def main():
         current_scene.before_viewmodels = lambda: particles.render(prime_camera, overlay=True)
         muzzle = glm.vec3(prime_camera.position) + prime_camera.front * 0.6
         end = glm.vec3(prime_camera.position) + prime_camera.front * 8.0
+        home = player.get_position()          # wherever the spawn put us - restored below
         weapon.play("shoot")
         if weapon.muzzle_particle:
             particles.spawn(weapon.muzzle_particle, muzzle, forward=prime_camera.front, up=prime_camera.up,
@@ -1482,7 +1486,7 @@ def main():
         current_scene.render(prime_camera, None)
         current_scene.before_viewmodels = previous_hook
         particles.clear()
-        player.teleport(SPAWN_POSITION)       # the frames above let it fall a little
+        player.teleport(home)                 # the frames above let it fall a little
         inventory.recoil.reset()
 
     def prime_effects():
@@ -1490,7 +1494,7 @@ def main():
         meshes and materials, blood and impact textures, sounds, the hit marker and death screen
         - so none of it hitches mid-game. All drawn into the back buffer only."""
         show_loading_screen(window, "Loading effects...")
-        eye = glm.vec3(*SPAWN_POSITION) + glm.vec3(0.0, 0.5, 0.0)
+        eye = glm.vec3(player.get_position()) + glm.vec3(0.0, 0.5, 0.0)
         prime_camera = Camera(position=eye, aspect=camera.aspect)
         prime_camera.fov = camera.fov
         prime_camera.yaw, prime_camera.pitch = -90.0, 0.0

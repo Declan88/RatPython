@@ -22,6 +22,7 @@ own and needs none.
 """
 
 import json
+import math
 import re
 import struct
 
@@ -161,6 +162,46 @@ def extract_ladder_markers(glb_path):
         walk(index, glm.mat4(1.0))
     if results:
         print(f"[gltf_actors] Found {len(results)} ladder volume(s) in {glb_path}")
+    return results
+
+
+SPAWN_NODE_PREFIX = "character_spawn"
+
+
+def extract_spawn_markers(glb_path):
+    """Player spawn points authored in a map: every node whose name starts with
+    SPAWN_NODE_PREFIX ("character_spawn", "character_spawn.001", "character_spawn_roof"...,
+    case-insensitive) - an Empty is enough, no geometry needed. Place it where the rat's FEET
+    should be, and rotate it so its glTF -Z axis (Blender's green +Y arrow) points the way the
+    rat should face. Returns a list of {"position": world-space glm.vec3, "yaw": camera yaw in
+    degrees} (empty if the map has none)."""
+    gltf = _read_gltf_json(glb_path)
+    if gltf is None:
+        return []
+    nodes = gltf.get("nodes", [])
+    scenes = gltf.get("scenes", [])
+    if scenes:
+        roots = scenes[gltf.get("scene", 0)].get("nodes", [])
+    else:
+        referenced = {c for n in nodes for c in n.get("children", [])}
+        roots = [i for i in range(len(nodes)) if i not in referenced]
+
+    results = []
+
+    def walk(index, parent_matrix):
+        node = nodes[index]
+        world = parent_matrix * _node_local_matrix(node)
+        if node.get("name", "").lower().startswith(SPAWN_NODE_PREFIX):
+            forward = -glm.vec3(world[2])          # the node's -Z axis in world space
+            results.append({"position": glm.vec3(world[3]),
+                            "yaw": math.degrees(math.atan2(forward.z, forward.x))})
+        for child in node.get("children", []):
+            walk(child, world)
+
+    for root in roots:
+        walk(root, glm.mat4(1.0))
+    if results:
+        print(f"[gltf_actors] Found {len(results)} player spawn marker(s) in {glb_path}")
     return results
 
 

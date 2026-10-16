@@ -185,11 +185,16 @@ class Tracers:
             # it would flip): trim the part closer than the near margin.
             f0 = glm.dot(t.start + t.direction * a - cam_pos, forward)
             f1 = glm.dot(t.start + t.direction * b - cam_pos, forward)
-            if f1 <= NEAR_MARGIN:
+            if f0 <= NEAR_MARGIN and f1 <= NEAR_MARGIN:
                 continue
+            # Either end may be the one behind the camera (a shot fired past you ends behind
+            # it): trim whichever it is, so the streak shows while any part of it is in front.
             if f0 < NEAR_MARGIN:
                 k = (NEAR_MARGIN - f0) / (f1 - f0)
                 a, u0 = a + (b - a) * k, u0 + (u1 - u0) * k
+            elif f1 < NEAR_MARGIN:
+                k = (f0 - NEAR_MARGIN) / (f0 - f1)
+                b, u1 = a + (b - a) * k, u0 + (u1 - u0) * k
             p0 = t.start + t.direction * a
             p1 = t.start + t.direction * b
             # (this end, the other end, u, metres, side, 0 tail/1 head) for the four corners.

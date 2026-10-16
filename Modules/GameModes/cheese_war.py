@@ -20,10 +20,12 @@ peer agrees on it without any extra sync, and a player who leaves returns
 their cheese to it.
 """
 
+import math
+
 from .deathmatch import Deathmatch
 
 CHEESE_TOTAL = 500.0       # the universal supply: pile + all players' cheese
-PULL_RATE = 2.0            # cheese/second drained from the pile into a player standing in it
+PULL_RATE = 3.0           # cheese/second drained from the pile into a player standing in it
 CHEESE_KEY = "cheese"
 
 
@@ -37,6 +39,19 @@ class CheeseWar(Deathmatch):
         self.set_local_stat(CHEESE_KEY, 0.0)
         # {pile actor id: set of player ids inside it this frame} - see report_pile_occupants.
         self._occupants = {}
+
+    def choose_spawn_rotation(self):
+        """Spawn looking at the nearest cheese pile (level, no pitch) - the fixed facing
+        otherwise (see GameMode.choose_spawn_rotation for why it's never player-chosen)."""
+        piles = [a for a in getattr(self.scene, "actors", ()) if getattr(a, "actor_id", None) == "cheesepile"]
+        if not piles:
+            return super().choose_spawn_rotation()
+        x, _y, z = self.last_spawn_position
+        pile = min(piles, key=lambda a: (a.position.x - x) ** 2 + (a.position.z - z) ** 2).position
+        dx, dz = pile.x - x, pile.z - z
+        if dx == 0.0 and dz == 0.0:
+            return super().choose_spawn_rotation()
+        return math.degrees(math.atan2(dz, dx)), 0.0
 
     def report_pile_occupants(self, pile_key, player_ids):
         """Called every frame by each CheesePile actor with the ids of whoever is

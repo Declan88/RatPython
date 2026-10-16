@@ -40,9 +40,10 @@ from Modules.Graphics.pbr_shader import (
 from Modules.Graphics.frustum import extract_frustum_planes, aabb_outside_frustum
 from Modules.Graphics.shadow_module import CascadedShadowMap
 from Modules.Graphics.scene_target import SceneTarget
+from Modules.Graphics.bloom import Bloom
 from Modules.Graphics.point_shadow_module import PointShadowMap
 from Modules.Graphics.gltf_lights import extract_punctual_lights
-from Modules.Graphics.gltf_actors import extract_actor_markers, extract_ladder_markers
+from Modules.Graphics.gltf_actors import extract_actor_markers, extract_ladder_markers, extract_spawn_markers
 from Modules.Actors import create_actor
 from Modules.Graphics.lightmap_baker import (
     create_bake_program,
@@ -365,6 +366,9 @@ class Scene:
         # of them are - exactly like dynamic_objects' own loop already treats
         # every prop generically regardless of what kind it is.
         self.actors = []
+        # The map's "character_spawn" markers ({"position": feet glm.vec3, "yaw": degrees}),
+        # filled by add_spawns_from_glb; GameMode.use_scene_spawns turns them into spawn points.
+        self.player_spawns = []
         self.viewmodel_objects = []   # see add_viewmodel
         self.gibs = None              # Modules/Gore GibManager, made by the game when it wants one
         self._light_cells = {}        # see _mover_lighting
@@ -637,6 +641,9 @@ class Scene:
         # the framebuffer this frame's passes draw into while the target is in use.
         self._target = None
         self._screen_override = None
+        # Glow of "bloom_" meshes (Modules/Graphics/bloom.py), built on the first frame one is visible.
+        self._bloom = None
+        self.bloom_intensity = 1.0
 
     # =============================================================
     # OBJECT LOADING
@@ -802,6 +809,13 @@ class Scene:
                 # so add_static's alpha_mode_overrides can target one
                 # specific material by name.
                 "material_name": model.get("material_name"),
+                # A "bloom_" node (see Modules/Graphics/bloom.py) - its index buffer is kept under a
+                # separate key (not "ibo", which _release_object would then also free) so the bloom
+                # pass can draw it with its own position-only program.
+                "bloom": model.get("bloom", False),
+                "bloom_name": (model.get("node_names") or [None])[0] if model.get("bloom") else None,
+                "bloom_ibo": model.get("ibo") if model.get("bloom") else None,
+                "bloom_uv_vbo": model.get("uv_vbo") if model.get("bloom") else None,
             })
         return results
 
@@ -818,7 +832,7 @@ class Scene:
                     double_sided_overrides=None, ignore_source_double_sided=False,
                     collision_overrides=None, collision_object_overrides=None,
                     base_alpha_overrides=None, self_illum_overrides=None,
-                    cast_shadow_overrides=None):
+                    cast_shadow_overrides=None, bloom_overrides=None):
         """collision=True registers a collider for this object in
         self.physics, so a CharacterController (or a dynamic object
         with its own collision=True) can stand/collide on it.
@@ -1104,6 +1118,12 @@ class Scene:
         never affected either way - see double_sided_overrides' own
         comment for why.
 
+        bloom_overrides: optional {node name: {"intensity": float, "radius": float}} for the
+        "bloom_" objects of the file (see Modules/Graphics/bloom.py) - keyed by the OBJECT's name
+        in the map ("bloom_sphere"), not its material. intensity scales the glow's brightness
+        (default 1.0); radius scales how far it spreads (default 1.0, 2.0 = about twice as wide).
+        Either key may be left out.
+
         cast_shadow_overrides: optional {material_name: bool} - False
         stops ONE specific material casting shadows (sun shadow map and
         the point-light bake shadow cubes alike), e.g. a light fixture
@@ -1136,6 +1156,10 @@ class Scene:
                 model["base_alpha"] = float(base_alpha_overrides[model["material_name"]])
             if specular_strength_overrides and model.get("material_name") in specular_strength_overrides:
                 model["specular_strength"] = float(specular_strength_overrides[model["material_name"]])
+            if model.get("bloom"):
+                params = (bloom_overrides or {}).get(model.get("bloom_name"), {})
+                model["bloom_intensity"] = float(params.get("intensity", 1.0))
+                model["bloom_radius"] = max(0.1, float(params.get("radius", 1.0)))
             if cast_shadow_overrides and model.get("material_name") in cast_shadow_overrides:
                 model["cast_shadow"] = bool(cast_shadow_overrides[model["material_name"]])
             if self_illum_overrides and model.get("material_name") in self_illum_overrides:
@@ -1379,7 +1403,7 @@ class Scene:
         actually tracks this object's current shape-key animation
         instead of always showing its rest pose. No alpha-tested discard
         support there, unlike shadow_program - fine since every
-        primitive here is hardcoded alpha_mode="OPAQUE" below anyway."""
+        primitive here is OPAQUE or BLEND (a BLEND one casts no shadow at all)."""
         primitives = load_morph_primitives(model_path)
         if not primitives:
             return None
@@ -1437,7 +1461,12 @@ class Scene:
                 "double_sided": prim["double_sided"],
                 "has_texture": 1 if texture else 0, "has_metallic_roughness_texture": 0,
                 "has_normal_texture": 0, "has_emissive_texture": 0,
-                "alpha_mode": "OPAQUE", "alpha_cutoff": 0.5, "base_alpha": prim["base_color_factor"][3],
+                "alpha_mode": prim["alpha_mode"], "alpha_cutoff": prim["alpha_cutoff"],
+                "base_alpha": prim["base_color_factor"][3],
+                # A BLEND primitive (glass) is drawn in _render_transparent_objects, which writes
+                # no depth - and the morph shadow program has no alpha test, so it would cast a
+                # solid shadow. Better none.
+                "cast_shadow": prim["alpha_mode"] != "BLEND",
                 "material_name": prim["material_name"],
                 "has_morph": True, "morph_weight": 0.0, "morph_target_names": prim["target_names"],
                 "position": glm.vec3(position), "rotation": glm.vec3(rotation), "scale": glm.vec3(scale),
@@ -2651,6 +2680,12 @@ class Scene:
         for marker in markers:
             self.physics.add_ladder(marker["center"], marker["rotation"], marker["half_extents"])
         return len(markers)
+
+    def add_spawns_from_glb(self, model_path):
+        """Saves every "character_spawn" marker in a glb (see gltf_actors.extract_spawn_markers)
+        as a player spawn point in self.player_spawns. Returns how many."""
+        self.player_spawns.extend(extract_spawn_markers(model_path))
+        return len(self.player_spawns)
 
     def add_actors_from_glb(self, model_path):
         """Reads "actor_<id>" marker nodes out of a glb (see
@@ -4650,18 +4685,22 @@ class Scene:
             static_shadow_light_vp=self._static_shadow_light_vp,
         )
 
-    def _render_early_z(self, objects, view_proj):
+    def _render_early_z(self, objects, view_proj, target=None):
         """Depth-only pre-pass of `objects` into the screen's own depth buffer, with the same
         transform and culling the colour pass will use, so _render_scene's colour draws (depth
         <=, no depth write) only shade the surface that ends up visible. Uses shadow_program's
         trivial shader; a MASK object gets its alpha cutout (see _bind_shadow_alpha) so its
         depth matches what the colour pass draws. Both vertex shaders declare gl_Position
-        invariant, so the depths are bit-identical and the <= test can't punch holes."""
+        invariant, so the depths are bit-identical and the <= test can't punch holes.
+
+        target: a framebuffer to draw the depth into instead of the screen (the bloom pass's
+        half-resolution buffer) - it must already be bound."""
         ctx = self.ctx
         program = self.shadow_program
-        self._screen.color_mask = (False, False, False, False)
+        screen = target if target is not None else self._screen
+        screen.color_mask = (False, False, False, False)
         ctx.depth_func = "<"
-        self._screen.depth_mask = True
+        screen.depth_mask = True
         opaque_bound = False       # the program's alpha state currently says "opaque"
         for obj, _movable in objects:
             masked = obj.get("alpha_mode") == "MASK"
@@ -4678,7 +4717,24 @@ class Scene:
                 self._bind_shadow_alpha(obj)
                 opaque_bound = True
             obj["shadow_vao"].render()
-        self._screen.color_mask = (True, True, True, True)
+        screen.color_mask = (True, True, True, True)
+
+    def _render_bloom(self, camera, view_proj):
+        """The glow of this frame's visible "bloom_" objects (see Modules/Graphics/bloom.py).
+        Costs nothing on a frame where none is in view."""
+        if not settings.bloom:
+            return
+        visible = getattr(self, "_frame_opaque_visible", None) or []
+        glowing = [o for o, _movable in visible if o.get("bloom")]
+        if not glowing:
+            return
+        if self._bloom is None:
+            self._bloom = Bloom(self.ctx)
+        occluders = [(o, m) for o, m in visible if not o.get("bloom")]
+        self._bloom.render(
+            self._screen, glowing, lambda fbo: self._render_early_z(occluders, view_proj, target=fbo),
+            view_proj, self._get_model_matrix, self.bloom_intensity)
+        self._screen.use()
 
     def _render_scene(self, camera, pbr_view_proj):
         self._screen.use()
@@ -4957,12 +5013,16 @@ class Scene:
                     self._draw_hat(obj)
                     bound_signature = None      # the hat rebinds an untinted material buffer
 
+        self._morph_view_proj = morph_view_proj
         if morph_objects:
             self.ctx.enable(moderngl.CULL_FACE)
             self.ctx.cull_face = "back"
             morph_lit = None
             for obj in morph_objects:
                 if not obj.get("visible_in_color", True) or not self._is_visible(obj, frustum_planes, movable=True):
+                    continue
+                if obj.get("alpha_mode") == "BLEND":
+                    blended_objects.append((obj, True))     # drawn after the skybox, see below
                     continue
                 model_matrix = self._get_model_matrix(obj)
                 lit = self._mover_lighting(obj)
@@ -5087,6 +5147,7 @@ class Scene:
         ssr_color, ssr_depth = self._ssr_textures()
         bind_ssr_textures(self.pbr_program, ssr_color if settings.ssr else None, ssr_depth)
         lights_bound = None
+        lights_morph = False
         for obj, _movable in blended_objects:
             # BLEND objects are never lightmapped (see add_static's own
             # alpha_mode_overrides docstring - baking assumes opaque,
@@ -5097,11 +5158,18 @@ class Scene:
             # the shared cache (refreshed a few times a second) rather than
             # recomputed every frame.
             lit = self._mover_lighting(obj, per_object=True)
-            if lit is not lights_bound:
-                bind_packed_lighting(self.pbr_program, lit[2])
+            # A morph object's vao is built against morph_program (its frame uniforms were bound
+            # in _render_scene), so it's drawn with that program, not pbr_program.
+            morph = obj.get("has_morph")
+            prog = self.morph_program if morph else self.pbr_program
+            if lit is not lights_bound or morph != lights_morph:
+                bind_packed_lighting(prog, lit[2])
                 lights_bound = lit
+                lights_morph = morph
             model_matrix = self._get_model_matrix(obj)
-            bind_material(self.pbr_program, obj, model_matrix, pbr_view_proj)
+            bind_material(prog, obj, model_matrix, pbr_view_proj if not morph else self._morph_view_proj)
+            if morph:
+                prog["u_morph_weight"].value = obj.get("morph_weight", 0.0)
             obj["vao"].render()
         self.ctx.disable(moderngl.BLEND)
         self.ctx.enable(moderngl.CULL_FACE)
@@ -5149,6 +5217,10 @@ class Scene:
         view_proj = squash * viewmodel_proj * camera.get_view_matrix()
 
         prog = self.skeletal_program
+        # The gun ignores shadows cast by movers - above all your own body, which sits right
+        # behind it. This program is shared with the characters, so it's reset at the end.
+        if _has_uniform(prog, "u_ignore_mover_shadows"):
+            prog["u_ignore_mover_shadows"].value = 1
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.depth_func = "<"
         self.ctx.enable(moderngl.CULL_FACE)
@@ -5182,12 +5254,13 @@ class Scene:
                 else:
                     self.ctx.disable(moderngl.BLEND)
                     self._screen.depth_mask = True
-            # All of a weapon's parts sit at the camera, so they share one lookup, and it's
-            # cached like a character's (refreshed a few times a second, per lighting cell).
-            lit = self._mover_lighting(obj, self._SKELETAL_LIGHT_CELL)
-            if lit is not lights_bound:
-                bind_packed_lighting(prog, lit[2])
-                lights_bound = lit
+            # All of a weapon's parts sit at the camera, so they share one lookup per frame. Sampled
+            # fresh, not through the shared 10Hz/1.5m-cell cache: that made the gun's lighting
+            # visibly step as you walked, though the probe grid itself interpolates smoothly.
+            if lights_bound is None:
+                lit = self._mover_lighting(obj)
+                lights_bound = pack_lighting(lit[0], lit[1])
+                bind_packed_lighting(prog, lights_bound)
             bind_material(prog, obj, self._get_model_matrix(obj), view_proj)
             bind_bone_matrices(obj)
             # A viewmodel part never dissolves itself, but this program is SHARED with the
@@ -5200,6 +5273,8 @@ class Scene:
         if blending:
             self.ctx.disable(moderngl.BLEND)
             self._screen.depth_mask = True
+        if _has_uniform(prog, "u_ignore_mover_shadows"):
+            prog["u_ignore_mover_shadows"].value = 0
         self.ctx.enable(moderngl.CULL_FACE)
         self.ctx.cull_face = "back"
 
@@ -5303,6 +5378,9 @@ class Scene:
         self._render_transparent_objects(camera, blended_objects, pbr_view_proj)
         if prof:
             t = self._lap(prof, "  render: transparent", t)
+        self._render_bloom(camera, pbr_view_proj)
+        if prof:
+            t = self._lap(prof, "  render: bloom", t)
         if self.before_viewmodels is not None:
             self.before_viewmodels()
         self._render_viewmodels(camera)
@@ -5341,6 +5419,9 @@ class Scene:
         for obj in self.viewmodel_objects:
             self._release_skeletal_object(obj)
 
+        if self._bloom is not None:
+            self._bloom.destroy()
+            self._bloom = None
         self.point_lights.clear()
         self.sound_manager.destroy()
         self.physics.destroy()

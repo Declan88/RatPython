@@ -450,6 +450,10 @@ uniform sampler2D u_shadow_maps[NUM_CASCADES];
 uniform mat4 u_light_mvps[NUM_CASCADES];
 uniform float u_cascade_splits[NUM_CASCADES];
 uniform int u_has_shadows;
+// 1 = ignore the cascades above (moving casters) - set while drawing the first-person viewmodel, which
+// would otherwise be shadowed by the local player's own (shadow-only) body standing right behind it.
+// Static-geometry shadows still apply.
+uniform int u_ignore_mover_shadows;
 
 // Bounding sphere of everything drawn into the shadow cascades this frame (they hold only
 // movers): xyz centre, w radius (with a margin for the soft-shadow filter). A static pixel
@@ -697,7 +701,7 @@ float calculate_static_shadow(vec3 world_pos, vec3 normal) {
 // overhead dominates far more than it does in the main scene loop's
 // many-objects-per-bind_frame_uniforms-call case).
 float calculate_cascade_shadow(vec3 world_pos, float view_depth, vec3 normal) {
-    if (u_has_shadows == 0 || view_depth <= 0.0) return 0.0;
+    if (u_has_shadows == 0 || u_ignore_mover_shadows != 0 || view_depth <= 0.0) return 0.0;
 
     int cascade = get_cascade_index(view_depth);
 

@@ -92,7 +92,7 @@ class LobbyMenu:
         sidebar.add(Panel(color=theme.ACCENT, size=(4, 0), size_frac=(0, 1), anchor=Anchor.TOP_RIGHT))
         column = sidebar.add(Panel(anchor=Anchor.TOP_LEFT, offset=(80, 50), layout="vertical",
                                    spacing=14, fit_content=True))
-        column.add(Label("RAT KING", font_size=132, color=theme.ACCENT, font=theme.title_font_path()))
+        column.add(Image("Assets/icon/logo.png", size=(480, 270)))  # 16:9, matches the file
         self._build_profile(column)
         column.add(Panel(size=(1, 18)))  # spacer
         # Multiplayer needs Steam; without it there's nothing HOST/JOIN could actually do
@@ -270,8 +270,10 @@ class LobbyMenu:
 
         option("Reflections (SSR)", "ssr")
         option("Gibs on death", "gibs")
+        option("Bloom", "bloom")
         card.add(Label("Off: water uses a cheap reflection,", font_size=20, color=_MUTED))
-        card.add(Label("deaths are a blood burst, not gibs.", font_size=20, color=_MUTED))
+        card.add(Label("deaths are a blood burst, not gibs,", font_size=20, color=_MUTED))
+        card.add(Label("and lights don't glow.", font_size=20, color=_MUTED))
 
     def _set_settings_open(self, show):
         if not hasattr(self, "settings_card"):
