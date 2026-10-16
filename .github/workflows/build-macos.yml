@@ -1,0 +1,78 @@
+name: Build macOS
+
+# Nuitka compiles for the machine it runs on, so the Mac build has to run on a Mac: GitHub's.
+# Start it from the Actions tab ("Run workflow") or by pushing a tag like v1.2.3.
+# The result is a zipped RatWar.app, attached to the run as an artifact.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-14            # Apple Silicon (arm64)
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: py_steam_net-main
+
+      # The versions the project is developed against.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin Nuitka==4.2.1 \
+            moderngl==5.12.0 numpy==2.5.2 OpenEXR==3.4.15 pillow==12.3.0 pygame-ce==2.5.8 \
+            pyglm==2.8.3 pygltflib==1.16.5 trimesh==5.1.0 Panda3D==1.10.16
+
+      # The repo only holds Windows wheels of py_steam_net, so build the macOS one from source.
+      - name: Build py_steam_net (Steam wrapper)
+        run: |
+          maturin build --release --interpreter python \
+            --manifest-path py_steam_net-main/Cargo.toml --out wheelhouse
+          python -m pip install wheelhouse/*.whl
+
+      # Fail here, in seconds, if a dependency has no macOS wheel or won't import.
+      - name: Check imports
+        run: |
+          python -c "import pygame, moderngl, glm, numpy, trimesh, pygltflib, OpenEXR, PIL, py_steam_net; \
+          from panda3d.bullet import BulletWorld; print('imports ok')"
+
+      # The build command wants Assets/icon/icon.icns; make it from icon.png (1024x1024).
+      - name: Make icon.icns
+        run: |
+          mkdir icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s Assets/icon/icon.png --out icon.iconset/icon_${s}x${s}.png
+            sips -z $((s * 2)) $((s * 2)) Assets/icon/icon.png --out icon.iconset/icon_${s}x${s}@2x.png
+          done
+          iconutil -c icns icon.iconset -o Assets/icon/icon.icns
+
+      # Same flags as BuildCMD_Nuitka_macOS.
+      - name: Build with Nuitka
+        run: |
+          python -m nuitka --onefile --macos-create-app-bundle --macos-app-name="RatWar" \
+            --macos-app-icon="Assets/icon/icon.icns" --assume-yes-for-downloads --disable-cache=ccache \
+            --include-data-files=libsteam_api.dylib=libsteam_api.dylib --include-data-dir=Assets=Assets \
+            --noinclude-data-files="Assets/Lightmaps/TorusScene/*" --nofollow-import-to=Frontend \
+            --noinclude-data-files="Blender/*" --noinclude-data-files="*.blend" --noinclude-data-files="*.blend1" \
+            --output-filename=RatWar --output-dir=build_nuitka_macos app.py
+
+      - name: Zip the app
+        run: ditto -c -k --keepParent build_nuitka_macos/RatWar.app RatWar-macOS-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RatWar-macOS-arm64
+          path: RatWar-macOS-arm64.zip
+          if-no-files-found: error
