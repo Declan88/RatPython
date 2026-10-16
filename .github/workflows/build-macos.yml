@@ -69,12 +69,14 @@ jobs:
           done
           iconutil -c icns icon.iconset -o Assets/icon/icon.icns
 
-      # Same flags as BuildCMD_Nuitka_macOS.
+      # Same flags as BuildCMD_Nuitka_macOS, minus --include-data-files for libsteam_api.dylib:
+      # Nuitka already bundles it as a dependency of py_steam_net (see the dylib copy above),
+      # and bundling it twice is an error.
       - name: Build with Nuitka
         run: |
           python -m nuitka --onefile --macos-create-app-bundle --macos-app-name="RatWar" \
             --macos-app-icon="Assets/icon/icon.icns" --assume-yes-for-downloads --disable-cache=ccache \
-            --include-data-files=libsteam_api.dylib=libsteam_api.dylib --include-data-dir=Assets=Assets \
+            --include-data-dir=Assets=Assets \
             --noinclude-data-files="Assets/Lightmaps/TorusScene/*" --nofollow-import-to=Frontend \
             --noinclude-data-files="Blender/*" --noinclude-data-files="*.blend" --noinclude-data-files="*.blend1" \
             --output-filename=RatWar --output-dir=build_nuitka_macos app.py
