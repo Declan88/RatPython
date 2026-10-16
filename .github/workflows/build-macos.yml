@@ -41,6 +41,11 @@ jobs:
           maturin build --release --interpreter python \
             --manifest-path py_steam_net-main/Cargo.toml --out wheelhouse
           python -m pip install wheelhouse/*.whl
+          # The wrapper's compiled library looks for libsteam_api.dylib right beside itself
+          # (@loader_path), and the wheel doesn't carry it. app.py preloads it by path, but the
+          # import check below doesn't, and Nuitka needs to find it to bundle it.
+          PKG=$(python -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('py_steam_net').origin))")
+          cp libsteam_api.dylib "$PKG/"
 
       # Fail here, in seconds, if a dependency has no macOS wheel or won't import.
       - name: Check imports
