@@ -3,6 +3,7 @@ name: Build macOS
 # Nuitka compiles for the machine it runs on, so the Mac build has to run on a Mac: GitHub's.
 # Start it from the Actions tab ("Run workflow") or by pushing a tag like v1.2.3.
 # The result is a zipped RatWar.app, attached to the run as an artifact.
+# BuildCMD_Nuitka_Standalone_Packed.cmd starts this itself and uploads the result to Steam (tools/mac_build.py).
 on:
   workflow_dispatch:
   push:
@@ -106,6 +107,11 @@ jobs:
         run: |
           APP=$(find build_nuitka_macos -maxdepth 1 -name '*.app' | head -n 1)
           test -n "$APP" || { echo "::error::no .app in build_nuitka_macos"; ls -la build_nuitka_macos; exit 1; }
+          # Nuitka names the bundle after the script (app.app); Steam's macOS launch option is RatWar.app.
+          if [ "$(basename "$APP")" != "RatWar.app" ]; then
+            mv "$APP" build_nuitka_macos/RatWar.app
+            APP=build_nuitka_macos/RatWar.app
+          fi
           echo "APP=$APP" >> "$GITHUB_ENV"
           ls "$APP/Contents/MacOS" | head -20
           mkdir -p "$APP/Contents/MacOS/Assets"
