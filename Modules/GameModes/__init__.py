@@ -11,9 +11,9 @@ from .game_mode import GameMode
 from .deathmatch import Deathmatch
 from .cheese_war import CheeseWar
 
-from .registry import create_game_mode, get_game_mode_class, game_mode_ids, mode_allowed, coerce_mode
+from .registry import create_game_mode, get_game_mode_class, game_mode_ids, mode_allows_map, coerce_map
 
 __all__ = [
     "GameMode", "Deathmatch", "CheeseWar",
-    "create_game_mode", "get_game_mode_class", "game_mode_ids", "mode_allowed", "coerce_mode",
+    "create_game_mode", "get_game_mode_class", "game_mode_ids", "mode_allows_map", "coerce_map",
 ]

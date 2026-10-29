@@ -32,6 +32,7 @@ import glm
 import trimesh
 import numpy as np
 from panda3d.core import NodePath, PandaNode, Point3, Vec3, BitMask32
+from Modules.Window import loading_screen
 from Modules.Graphics.model_loader import load_mesh_groups_by_material, load_mesh_groups_by_object, _is_no_collision_node
 from Modules.Audio.footstep_materials import guess_physical_material
 from Modules.Physics.collision_shape_cache_io import load_shape_cache, save_shape_cache
@@ -240,7 +241,9 @@ def _build_triangle_mesh_shape(vertices, faces):
     adjacency info Bullet needs."""
     tri_mesh = BulletTriangleMesh()
     tri_mesh.setWeldingDistance(1e-8)
-    for a, b, c in faces:
+    for index, (a, b, c) in enumerate(faces):
+        if index % 2048 == 0:
+            loading_screen.tick()     # a big level is seconds of this loop: keep the loading screen moving
         tri_mesh.addTriangle(
             to_physics_pos(vertices[a]),
             to_physics_pos(vertices[b]),

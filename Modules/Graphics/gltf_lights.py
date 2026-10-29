@@ -141,6 +141,10 @@ def extract_punctual_lights(glb_path):
     if results:
         print(f"[gltf_lights] Found {len(results)} punctual light(s) in {glb_path}")
     else:
-        print(f"[gltf_lights] No punctual lights found in {glb_path}")
+        # Different from "no lights in the file": the definitions are there, but no node in the scene
+        # that gets exported (gltf["scene"]) points at them - e.g. they sit in a collection that isn't
+        # part of the exported scene.
+        print(f"[gltf_lights] {glb_path} defines {len(light_defs)} punctual light(s) but no node in its "
+              f"active scene uses any of them - none added")
 
     return results

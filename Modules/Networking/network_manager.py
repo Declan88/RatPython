@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import secrets
 import time
 
@@ -21,6 +22,16 @@ from Modules.Player.rat_colors import encode_color
 
 # The game's own Steam App ID (was 480, Spacewar). Keep steam_appid.txt in sync for dev runs.
 STEAM_APP_ID = 5436290
+
+
+def _launch_app_id():
+    """The app Steam launched us as (it sets SteamAppId for every game it starts), else
+    STEAM_APP_ID. Playtesters own the Playtest app (5436340), not 5436290 - forcing
+    5436290 on them makes Steam refuse to initialize at all."""
+    try:
+        return int(os.environ.get("SteamAppId", "")) or STEAM_APP_ID
+    except ValueError:
+        return STEAM_APP_ID
 
 
 class NetworkManager:
@@ -146,6 +157,7 @@ class NetworkManager:
         self._owns_lobby = None       # see _probe_lobby_owner: None until it has been checked
         self._owner_id = None         # the lobby owner's Steam id when Steam has told us (get_lobby_owner)
         self._owner_probed = 0.0
+        self.init_error = ""          # why the last _init_steam failed, for the menu's warning (no console in builds)
 
         self._init_steam()
 
@@ -157,7 +169,7 @@ class NetworkManager:
         reconnect() itself, which does want to know whether THIS attempt worked."""
         try:
             self.client = py_steam_net.PySteamClient()
-            self.client.init(STEAM_APP_ID)
+            self.client.init(_launch_app_id())
             print(f"Steam P2P initialized successfully. Ready: {self.client.is_ready()}")
 
             self.local_steam_id = self.client.own_steam_id()
@@ -168,9 +180,11 @@ class NetworkManager:
             self.client.set_message_recv_callback(self.handle_data)
             self.client.set_lobby_changed_callback(self.on_lobby_changed)
             self.client.set_connection_failed_callback(self.on_session_failed)
+            self.init_error = ""
             return True
         except Exception as e:
             print(f"Steam initialization failed: {e}. Make sure Steam client is running.")
+            self.init_error = str(e)
             self.client = None
             return False
 

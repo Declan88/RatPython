@@ -17,7 +17,7 @@ better as its own dedicated screen than as another card floating over the
 main menu's background.
 """
 
-from Modules.GameModes.registry import coerce_mode, mode_allowed
+from Modules.GameModes.registry import coerce_map, mode_allows_map
 
 from . import theme
 from .controls import ScrollBox
@@ -68,6 +68,10 @@ class LobbyRoom:
         self._is_host_built_for = None   # which role the settings card was last built for
         self._player_signature = None
         self._game_started_handled = False
+        self._host_mode = None            # the host's current picks (the lobby info lags behind a change)
+        self._host_map = None
+        self._available_maps = list(maps)
+        self._rebuild_pending = False
         self.root = self._build()
 
     # ---- construction ---------------------------------------------------
@@ -113,16 +117,25 @@ class LobbyRoom:
                 info.get("name", "Rat King Lobby"), max_length=24, size=(_CARD_W - 44, 50), font_size=24,
                 on_submit=lambda text: self.net.update_lobby_setting("lobby_name", text or "Rat King Lobby"),
             ))
-            card.add(Label("Map", font_size=20, color=theme.MUTED))
-            self.map_dropdown = card.add(Dropdown(
-                [name for name, _ in self.maps], selected=_index_for_key(self.maps, info.get("map")),
-                on_change=self._on_map_change,
-                size=(_CARD_W - 44, 50), font_size=24,
-            ))
+            # The mode comes first: it decides which maps the map dropdown offers (registry.MODE_MAPS).
+            mode_key = self._host_mode or info.get("mode") or self.modes[0][1]
+            self._available_maps = self._maps_for(mode_key)
+            map_key = self._host_map or info.get("map")
+            if map_key not in [key for _, key in self._available_maps]:
+                map_key = self._available_maps[0][1]
+                self.net.update_lobby_setting("map", map_key)
+            self._host_mode, self._host_map = mode_key, map_key
             card.add(Label("Game mode", font_size=20, color=theme.MUTED))
             self.mode_dropdown = card.add(Dropdown(
-                [name for name, _ in self.modes], selected=_index_for_key(self.modes, info.get("mode")),
+                [name for name, _ in self.modes], selected=_index_for_key(self.modes, mode_key),
                 on_change=self._on_mode_change,
+                size=(_CARD_W - 44, 50), font_size=24,
+            ))
+            card.add(Label("Map", font_size=20, color=theme.MUTED))
+            self.map_dropdown = card.add(Dropdown(
+                [name for name, _ in self._available_maps],
+                selected=_index_for_key(self._available_maps, map_key),
+                on_change=self._on_map_change,
                 size=(_CARD_W - 44, 50), font_size=24,
             ))
             if info.get("has_password"):
@@ -137,24 +150,26 @@ class LobbyRoom:
 
         self.start_button.visible = is_host
 
+    def _maps_for(self, mode_key):
+        """The (display name, key) maps the mode can be played on."""
+        return [(name, key) for name, key in self.maps if mode_allows_map(mode_key, key)] or list(self.maps)
+
     def _on_map_change(self, index, _option):
-        """A map that only supports some modes (registry.MAP_MODES) switches the mode too."""
-        map_key = self.maps[index][1]
-        self.net.update_lobby_setting("map", map_key)
-        current = self.modes[self.mode_dropdown.selected][1]
-        wanted = coerce_mode(map_key, current)
-        if wanted != current:
-            self.mode_dropdown.set_selected(_index_for_key(self.modes, wanted))   # notifies -> saved
+        self._host_map = self._available_maps[index][1]
+        self.net.update_lobby_setting("map", self._host_map)
 
     def _on_mode_change(self, index, _option):
-        """Refuses a mode the selected map doesn't support - snaps the dropdown back."""
-        map_key = self.maps[self.map_dropdown.selected][1]
+        """Saves the mode, and moves to its first map if the current one can't be played in it. The map
+        dropdown's options change with the mode, so the card is rebuilt - on the next update(), not here:
+        this runs inside the dropdown's own click handling."""
         mode_key = self.modes[index][1]
-        if not mode_allowed(map_key, mode_key):
-            self.mode_dropdown.set_selected(
-                _index_for_key(self.modes, coerce_mode(map_key, mode_key)), notify=False)
-            return
+        self._host_mode = mode_key
         self.net.update_lobby_setting("mode", mode_key)
+        new_map = coerce_map(mode_key, self._host_map)
+        if new_map != self._host_map:
+            self._host_map = new_map
+            self.net.update_lobby_setting("map", new_map)
+        self._rebuild_pending = True
 
     def _apply_readonly_settings(self, info):
         self.name_label.text = info.get("name", "...")
@@ -224,6 +239,7 @@ class LobbyRoom:
         self._since_poll = 0.0
         self._player_signature = None
         self._is_host_built_for = None
+        self._host_mode = self._host_map = None
         self._build_settings_card(self.net.is_host)
         self._refresh_players()
         self.root.visible = True
@@ -242,6 +258,9 @@ class LobbyRoom:
     def update(self, dt):
         if not self.root.visible:
             return
+        if self._rebuild_pending:
+            self._rebuild_pending = False
+            self._build_settings_card(self.net.is_host)
         self._since_poll += dt
         if self._since_poll < self.POLL_SECONDS:
             return

@@ -87,7 +87,7 @@ _disable_window_ghosting()
 # right target in the first place).
 
 from Modules.Window.window import WindowManager
-from Modules.Window.loading_screen import show_loading_screen
+from Modules.Window.loading_screen import hide_loading_screen, show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
 from Modules.UI import Anchor, Crosshair, Hitmarker, Label, ProgressBar
@@ -229,7 +229,7 @@ load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
 from Modules.Networking.remote_player import RemotePlayer
-from Modules.GameModes import Deathmatch, coerce_mode, create_game_mode, game_mode_ids, get_game_mode_class
+from Modules.GameModes import Deathmatch, coerce_map, create_game_mode, game_mode_ids, get_game_mode_class
 
 
 def main():
@@ -279,8 +279,11 @@ def main():
         instead of as a frozen window."""
         if key not in scenes:
             show_loading_screen(window, f"Loading {key}...")
-            scenes[key] = SCENE_CLASSES[key](window.ctx)
-            scenes[key].gibs = GibManager(scenes[key], particles)
+            try:
+                scenes[key] = SCENE_CLASSES[key](window.ctx)
+                scenes[key].gibs = GibManager(scenes[key], particles)
+            finally:
+                hide_loading_screen()
             # See WindowManager.reset_frame_timer's own docstring - a
             # multi-second construction just ran on this same thread,
             # and the NEXT dt computed would otherwise include all of it.
@@ -867,7 +870,7 @@ def main():
     # request_start. The real work (setup_game: map, player, models, each
     # behind its own loading frame) runs from the main loop, not inside
     # that callback, which can fire from inside Steam's callback dispatch.
-    MAPS = [("Main Map", "mainmap"), ("Sewer", "sewer"), ("Torus (test)", "torus")]
+    MAPS = [("Boardwalk", "mainmap"), ("Sewer", "sewer")]
     # (display name, id) for every registered Modules.GameModes class - built
     # from the registry itself (game_mode_ids/get_game_mode_class), not a
     # hand-maintained list like MAPS above, so a new mode shows up in the
@@ -1286,7 +1289,7 @@ def main():
     def start_game(map_key, mode_key=None):
         nonlocal in_menu, paper_doll, game_mode
         menu_ui.visible = False
-        mode_key = coerce_mode(map_key, mode_key)   # e.g. the Sewer is Deathmatch only
+        map_key = coerce_map(mode_key, map_key)   # e.g. the Sewer is Deathmatch only
         # Reassigned here, every real game start, now that a mode is actually
         # known (see MODES/request_start's own comments - module-level
         # construction above is only ever the pre-lobby placeholder). mode_key
@@ -1516,6 +1519,7 @@ def main():
         death_screen.show()       # one invisible frame builds its text
         ui.render()
         death_screen.hide()
+        hide_loading_screen()     # the animated "Loading effects..." screen shown at the top
         # Everything built so far lives for the rest of the game: keep the garbage collector from
         # re-scanning it (a full collection mid-game is a visible hitch).
         gc.collect()

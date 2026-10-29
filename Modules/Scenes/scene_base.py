@@ -41,6 +41,7 @@ from Modules.Graphics.frustum import extract_frustum_planes, aabb_outside_frustu
 from Modules.Graphics.shadow_module import CascadedShadowMap
 from Modules.Graphics.scene_target import SceneTarget
 from Modules.Graphics.bloom import Bloom
+from Modules.Window import loading_screen
 from Modules.Graphics.point_shadow_module import PointShadowMap
 from Modules.Graphics.gltf_lights import extract_punctual_lights
 from Modules.Graphics.gltf_actors import extract_actor_markers, extract_ladder_markers, extract_spawn_markers
@@ -296,6 +297,7 @@ _POSE_INTERVALS = (POSE_UPDATE_INTERVAL, 1.0 / 100.0, 1.0 / 60.0, 1.0 / 30.0)   
 def _pump_load():
     if pygame.display.get_init():
         pygame.event.pump()      # keeps Windows treating the window as responsive
+    return loading_screen.tick()   # animates the loading screen if one is up; True = a frame was drawn (GL state changed)
     if LOAD_PUMP is not None:
         try:
             LOAD_PUMP()
@@ -3350,10 +3352,14 @@ class Scene:
             obj["sun_lightmap_texture"] = create_lightmap(self.ctx, object_resolution)
             invalidate_bind_plan(obj)
 
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.depth_func = "<="
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = moderngl.ONE, moderngl.ONE
+        def _set_bake_gl_state():
+            self.ctx.enable(moderngl.DEPTH_TEST)
+            self.ctx.depth_func = "<="
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = moderngl.ONE, moderngl.ONE      # each light is ADDED onto the lightmap
+            self.ctx.disable(moderngl.CULL_FACE)
+
+        _set_bake_gl_state()
 
         # Point lights flagged for baked shadows, one at a time. Each
         # gets its own temporary 6-face shadow cube (static geometry
@@ -3399,7 +3405,11 @@ class Scene:
                     obj["shadow_vao"].render()
 
             for obj in eligible:
-                _pump_load()
+                # A loading-screen redraw (it runs from here, once a frame is due) turns blending off and
+                # rebinds the framebuffer: without putting the bake's state back, every later light
+                # OVERWRITES the lightmap instead of adding to it and the point lights vanish from it.
+                if _pump_load():
+                    _set_bake_gl_state()
                 bake_point_light(
                     self.ctx, self.bake_program, obj, self._get_model_matrix(obj),
                     light, temp_shadow
@@ -3521,6 +3531,7 @@ class Scene:
             return array[:, :, :3]
 
         for obj, path, sun_path, object_resolution in zip(eligible, cache_paths, sun_cache_paths, object_resolutions):
+            _pump_load()          # saving and re-uploading every lightmap is seconds: keep the loading screen moving
             light_array = _save_texture_cache(obj["lightmap_texture"], path, object_resolution)
             sun_array = _save_texture_cache(obj["sun_lightmap_texture"], sun_path, object_resolution)
             # Swap the (RGBA16F, 8 B/texel) bake targets for the same compact textures a cache

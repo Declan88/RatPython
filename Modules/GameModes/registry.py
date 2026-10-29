@@ -72,19 +72,22 @@ def _discover():
         _registry[game_mode_id_of(cls)] = cls
 
 
-# Maps that only work with certain modes: {map key: (allowed mode ids)}. A map not listed here
-# takes any mode.
-MAP_MODES = {"sewer": ("deathmatch",)}
+# The maps each game mode can be played on, by map key (the keys of app.py's MAPS). A mode not listed
+# here can be played on every map. The lobby only offers a mode's own maps.
+MODE_MAPS = {
+    "deathmatch": ("mainmap", "sewer"),
+    "cheese_war": ("mainmap",),
+}
 
 
-def mode_allowed(map_key, mode_id):
-    allowed = MAP_MODES.get(map_key)
-    return allowed is None or mode_id in allowed
+def mode_allows_map(mode_id, map_key):
+    allowed = MODE_MAPS.get(mode_id)
+    return allowed is None or map_key in allowed
 
 
-def coerce_mode(map_key, mode_id):
-    """mode_id if the map allows it, else the map's first allowed mode."""
-    return mode_id if mode_allowed(map_key, mode_id) else MAP_MODES[map_key][0]
+def coerce_map(mode_id, map_key):
+    """map_key if the mode can be played on it, else the mode's first map."""
+    return map_key if mode_allows_map(mode_id, map_key) else MODE_MAPS[mode_id][0]
 
 
 def game_mode_ids():

@@ -147,6 +147,8 @@ class LobbyMenu:
             warn = self.profile_panel.add(Panel(layout="vertical", spacing=8, fit_content=True))
             warn.add(Label("Steam uninitialized! Open Steam and press reconnect",
                           font_size=20, color=_WARN))
+            if self.net.init_error:
+                warn.add(Label(f"({self.net.init_error})", font_size=16, color=_WARN))
             warn.add(_button("Reconnect", self._reconnect, size=(220, 44), font_size=22))
 
     def _apply_avatar(self):
@@ -175,7 +177,7 @@ class LobbyMenu:
 
     def _start_singleplayer(self):
         """Straight into the main map, no lobby, no Steam needed at all - see maps' own
-        order (main_menu_scene.py builds this from app.py's MAPS, "Main Map" first).
+        order (main_menu_scene.py builds this from app.py's MAPS, "Boardwalk" first).
         Defaults to "deathmatch" the same way - no mode picker exists outside the
         Host panel, and this path never touches it."""
         default_map = next((key for name, key in self.maps if key == "mainmap"), self.maps[0][1])
