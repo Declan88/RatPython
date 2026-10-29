@@ -53,7 +53,11 @@ def _check_pushed():
         print(f"  {len(dirty)} uncommitted change(s), e.g.")
         for line in dirty[:8]:
             print(f"    {line}")
-    if input("Build the Mac version without them anyway? [y/N] ").strip().lower() != "y":
+    try:
+        answer = input("Build the Mac version without them anyway? [y/N] ")
+    except EOFError:        # no console to answer from (run unattended)
+        answer = ""
+    if answer.strip().lower() != "y":
         sys.exit("Stopped - commit and push first, or run with --no-mac.")
 
 
