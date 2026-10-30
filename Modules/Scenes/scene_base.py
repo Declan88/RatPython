@@ -3230,6 +3230,24 @@ class Scene:
 
             if skip_pose:
                 continue
+            # Batched with the other characters when it can be (see pose_batch); the per-joint weights already
+            # eased if the mask is changing, as compute_blended_bone_matrices_multi would.
+            component = obj.get("upper_component_space", False)
+            upper = None
+            if weighted_upper is not None:
+                weights = upper_mask
+                prev_mask = obj["upper_joint_mask_prev"]
+                if prev_mask is not None and offset_blend_weight < 1.0 and prev_mask != upper_mask:
+                    weights = [old + (new - old) * offset_blend_weight
+                               for old, new in zip(map(float, prev_mask), map(float, upper_mask))]
+                upper = (weighted_upper, obj["upper_prev_animation"], obj["upper_prev_anim_time"],
+                         upper_blend_weight, weights, component)
+            request = pose_batch.make_request(
+                skeleton, weighted_lower, obj["prev_animation"], obj["prev_anim_time"], lower_blend_weight,
+                rotation_offsets=blended_offsets, upper=upper)
+            if request is not None:
+                pose_requests.append((obj, request))
+                continue
             obj["bone_matrices"] = skeleton.compute_blended_bone_matrices_multi(
                 weighted_lower, weighted_upper, upper_mask,
                 lower_prev_animation=obj["prev_animation"], lower_prev_time=obj["prev_anim_time"],
@@ -3239,7 +3257,7 @@ class Scene:
                 upper_rotation_offsets=blended_offsets,
                 upper_joint_mask_prev=obj["upper_joint_mask_prev"],
                 mask_blend_weight=offset_blend_weight,   # shares the offset crossfade's timer
-                component_space=obj.get("upper_component_space", False),
+                component_space=component,
             )
 
         if pose_requests:

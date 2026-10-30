@@ -132,19 +132,6 @@ PLAYER_DIRECTIONAL_CLIPS = {
     "crouch_walk": {"N": "crouch_walk",
                     **{d.upper(): f"crouch_walk_{d}" for d in ("s", "e", "w", "ne", "nw", "se", "sw")}},
 }
-# How a weapon's held pose is layered over the locomotion: HL2's own weightlist for its gun-holding layers
-# ("weights_layer_walk_aiming" in male_shared.qc - the hips and spine ease in, chest/arms/neck/head fully, legs not at
-# all; unlisted joints take their nearest listed ancestor's weight), blended in component space as those layers'
-# "worldspace" flag does, so the chest keeps the pose's facing while the running hips twist under it.
-WEAPON_POSE_WEIGHTS = {
-    "ValveBiped.Bip01_Pelvis": 0.1,
-    "ValveBiped.Bip01_Spine": 0.2,
-    "ValveBiped.Bip01_Spine1": 0.4,
-    "ValveBiped.Bip01_Spine2": 0.6,
-    "ValveBiped.Bip01_Spine4": 1.0,
-    "ValveBiped.Bip01_L_Thigh": 0.0,
-    "ValveBiped.Bip01_R_Thigh": 0.0,
-}
 # Rat eye level is 1.39225 m above the feet; CharacterController puts the eye at height * 8/9.
 PLAYER_HEIGHT = 1.39225 * 9 / 8
 
@@ -200,7 +187,8 @@ load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
 from Modules.Networking.remote_player import (
-    AIM_LEVEL_JOINT, AIM_PITCH_JOINTS, CROUCH_STATES, CROUCH_WALK_CLIPS, CROUCH_WALK_FILE, ROOT_OFFSETS, RemotePlayer)
+    AIM_LEVEL_JOINT, AIM_PITCH_JOINTS, CROUCH_STATES, CROUCH_WALK_CLIPS, CROUCH_WALK_FILE, ROOT_OFFSETS,
+    UPPER_BODY_ROOT_JOINTS, WEAPON_POSE_WEIGHTS, RemotePlayer)
 from Modules.GameModes import Deathmatch, coerce_map, create_game_mode, game_mode_ids, get_game_mode_class
 
 
@@ -306,14 +294,9 @@ def main():
             root_offsets=ROOT_OFFSETS,         # per-clip body offsets (the crouch pose's raised feet)
             aim_pitch_joints=AIM_PITCH_JOINTS,  # the spine bends to where we look...
             aim_level_joint=AIM_LEVEL_JOINT,    # ...and the head faces straight ahead at pitch 0
-            # Locomotion splits at the clavicles, not their parent Spine4: Spine4 also parents the neck and
-            # head, which must keep following the lower body's locomotion clip.
-            upper_body_root_joints=[
-                "ValveBiped.Bip01_R_Clavicle",
-                "ValveBiped.Bip01_L_Clavicle",
-            ],
-            # A weapon's held pose (set_upper_override) is layered on the way Source layers HL2's gun-holding
-            # poses: its weightlist, blended in component space (see WEAPON_POSE_WEIGHTS).
+            # The upper/lower body split and how a held weapon's pose is layered on - the same for every player
+            # (see remote_player's UPPER_BODY_ROOT_JOINTS/WEAPON_POSE_WEIGHTS).
+            upper_body_root_joints=UPPER_BODY_ROOT_JOINTS,
             override_upper_body_root_joints=WEAPON_POSE_WEIGHTS,
             override_upper_body_component_space=True,
             upper_states=PLAYER_ANIMATION_STATES,

@@ -124,6 +124,23 @@ AIM_PITCH_JOINTS = {
     "ValveBiped.Bip01_Head1": (1.0, 40.0),
 }
 AIM_LEVEL_JOINT = "ValveBiped.Bip01_Head1"
+# The upper/lower body split for locomotion: at the clavicles, not their parent Spine4 - Spine4 also parents the neck
+# and head, which must keep following the lower body's locomotion clip. Shared with app.py.
+UPPER_BODY_ROOT_JOINTS = ["ValveBiped.Bip01_R_Clavicle", "ValveBiped.Bip01_L_Clavicle"]
+# How a held weapon's pose (WeaponsBase.player_animations) is layered over the locomotion: HL2's own weightlist for
+# its gun-holding layers ("weights_layer_walk_aiming" in male_shared.qc - the hips and spine ease in,
+# chest/arms/neck/head fully, legs not at all; unlisted joints take their nearest listed ancestor's weight), blended
+# in component space as those layers' "worldspace" flag does, so the chest keeps the pose's facing while the running
+# hips twist under it. Shared with app.py.
+WEAPON_POSE_WEIGHTS = {
+    "ValveBiped.Bip01_Pelvis": 0.1,
+    "ValveBiped.Bip01_Spine": 0.2,
+    "ValveBiped.Bip01_Spine1": 0.4,
+    "ValveBiped.Bip01_Spine2": 0.6,
+    "ValveBiped.Bip01_Spine4": 1.0,
+    "ValveBiped.Bip01_L_Thigh": 0.0,
+    "ValveBiped.Bip01_R_Thigh": 0.0,
+}
 # Same facing-relative walk and crouch-walk clips the local player uses (see app.py).
 _DIRECTIONAL_CLIPS = {
     "walk": {
@@ -195,6 +212,10 @@ class RemotePlayer:
             scale=scale, time_scale=_RAT_ANIM_TIME_SCALE, tint_mask_path=RAT_TINT_MASK_PATH,
             directional_clips=_DIRECTIONAL_CLIPS, root_offsets=ROOT_OFFSETS, aim_pitch_joints=AIM_PITCH_JOINTS,
             aim_level_joint=AIM_LEVEL_JOINT,
+            # The same split and weapon-pose layering as the local player's, so the arm pose of the weapon in
+            # their hand shows (WeaponsBase.equip_player only applies it to a model with this split).
+            upper_body_root_joints=UPPER_BODY_ROOT_JOINTS, upper_states=animation_states,
+            override_upper_body_root_joints=WEAPON_POSE_WEIGHTS, override_upper_body_component_space=True,
             jump_animation="rifle_jump", crouch_animation=CROUCH_STATES,
         )
         # Matches torus_scene.py's own decorative rat.glb character's
@@ -226,8 +247,8 @@ class RemotePlayer:
 
         # The weapon in their hand is whichever their packets name (see _apply_weapon);
         # each one they've shown is kept (loaded once) so switching back is instant.
-        # The world model goes in the hand; the arm pose only applies to a model with
-        # an upper-body split, which this one doesn't have - see WeaponsBase.equip_player.
+        # The world model goes in the hand and the weapon's arm pose on the upper body
+        # (see WeaponsBase.equip_player).
         self._weapons = {}
         self._weapon_wanted = None   # weapon id from the latest packet
         self._weapon_id = None       # id of the weapon in their hand now
@@ -410,6 +431,9 @@ class RemotePlayer:
             self._model_debt = 0.0
             self._pending_jump = False
             self._pending_shot_cancel = False
+            if self.weapon is not None:
+                # Keeps the weapon pose's correction right (it's put back after an emote - see WeaponsBase.set_moving).
+                self.weapon.set_moving(0.0 if stale else float(s.get("v", 0.0)))
         else:
             self.model.move_to(feet_pos)
         if self._pending_death:
