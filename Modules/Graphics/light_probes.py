@@ -83,6 +83,13 @@ _MARGIN_CELLS = 2
 # coarser grid is still strictly better than no grid at all.
 _MAX_PROBES = 40000
 
+# build_light_probe_grid's progress callback runs once per this many probes.
+_PROGRESS_EVERY = 256
+
+
+def _no_progress():
+    pass
+
 
 def _object_cells(aabb_min, aabb_max, origin, spacing, margin_cells):
     lo = np.floor((np.asarray(aabb_min, dtype="f8") - origin) / spacing).astype(np.int64) - margin_cells
@@ -95,7 +102,7 @@ def _object_cells(aabb_min, aabb_max, origin, spacing, margin_cells):
 
 
 def build_light_probe_grid(static_aabbs, point_lights, visibility_test,
-                            spacing=DEFAULT_PROBE_SPACING):
+                            spacing=DEFAULT_PROBE_SPACING, progress=None):
     """static_aabbs: list of (mins, maxs) numpy arrays, ONE PER static
     object (not one combined box - see the module docstring's GRID SCOPE
     section). point_lights: Scene.point_lights - each dict needs
@@ -116,21 +123,28 @@ def build_light_probe_grid(static_aabbs, point_lights, visibility_test,
     irradiance keeps its default of 0) without spending a raycast on it
     - a light that far away already contributes ~0 via its own falloff
     curve regardless of what this grid says, so shadow-testing it here
-    would be wasted work with no visible effect."""
+    would be wasted work with no visible effect.
+
+    progress: optional callable, called every so often while building (a
+    big map takes over a second) - e.g. a loading screen's pump."""
     if not point_lights or not static_aabbs:
         return None
+    if progress is None:
+        progress = _no_progress
 
     origin = np.minimum.reduce([mins for mins, _ in static_aabbs])
 
-    cells = set()
-    for mins, maxs in static_aabbs:
-        cells.update(_object_cells(mins, maxs, origin, spacing, _MARGIN_CELLS))
-
-    while len(cells) > _MAX_PROBES:
-        spacing *= 1.25
+    def gather(spacing):
         cells = set()
         for mins, maxs in static_aabbs:
+            progress()
             cells.update(_object_cells(mins, maxs, origin, spacing, _MARGIN_CELLS))
+        return cells
+
+    cells = gather(spacing)
+    while len(cells) > _MAX_PROBES:
+        spacing *= 1.25
+        cells = gather(spacing)
 
     num_lights = len(point_lights)
     lights_in_range = [
@@ -141,7 +155,9 @@ def build_light_probe_grid(static_aabbs, point_lights, visibility_test,
 
     visibility = {}
     irradiance = {}
-    for cell in cells:
+    for count, cell in enumerate(cells):
+        if count % _PROGRESS_EVERY == 0:
+            progress()
         ix, iy, iz = cell
         probe_pos = glm.vec3(
             origin[0] + ix * spacing, origin[1] + iy * spacing, origin[2] + iz * spacing,

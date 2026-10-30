@@ -97,21 +97,22 @@ class LobbyMenu:
         self._build_profile(column)
         column.add(Panel(size=(1, 18)))  # spacer
         # Multiplayer needs Steam; without it there's nothing HOST/JOIN could actually do
-        # (see _steam_ready) - a single "Start singleplayer" button stands in for both,
-        # straight into the main map with no lobby at all. Both live in the same slot,
-        # toggled by _update_play_buttons rather than one replacing the other, so this
-        # doesn't have to rebuild anything if Reconnect later succeeds mid-session.
-        # Vertically centred stack. The status line and join list hang below it as their
-        # own widgets (pivot at their top), so showing them never shifts the buttons.
+        # (see _steam_ready). "Start singleplayer" - straight into the main map, no lobby -
+        # is always there, under HOST/JOIN when they show and on its own when they don't,
+        # toggled by _update_play_buttons, so nothing is rebuilt if Reconnect later succeeds
+        # mid-session. Vertically centred stack. The status line hangs below it as its own
+        # widget (pivot at its top, placed for the buttons showing), so showing it never shifts
+        # the buttons.
+        spacing, height = self._PLAY_BUTTON_SPACING, self._PLAY_BUTTON_HEIGHT
         middle = sidebar.add(Panel(anchor=Anchor.MIDDLE_LEFT, offset=(80, 0), layout="vertical",
-                                   spacing=14, fit_content=True))
-        self.mp_buttons = middle.add(Panel(layout="vertical", spacing=14, fit_content=True))
-        self.mp_buttons.add(_button("HOST", self.toggle_host, size=(_W + 36, 84), font_size=40))
-        self.mp_buttons.add(_button("JOIN", self.toggle_join, size=(_W + 36, 84), font_size=40))
+                                   spacing=spacing, fit_content=True))
+        self.mp_buttons = middle.add(Panel(layout="vertical", spacing=spacing, fit_content=True))
+        self.mp_buttons.add(_button("HOST", self.toggle_host, size=(_W + 36, height), font_size=40))
+        self.mp_buttons.add(_button("JOIN", self.toggle_join, size=(_W + 36, height), font_size=40))
         self.sp_button = middle.add(_button(
-            "START SINGLEPLAYER", self._start_singleplayer, size=(_W + 36, 84), font_size=36))
+            "START SINGLEPLAYER", self._start_singleplayer, size=(_W + 36, height), font_size=36))
         self.status = sidebar.add(Label("", font_size=26, color=_WARN, anchor=Anchor.MIDDLE_LEFT,
-                                        pivot=(0, 0), offset=(80, 105)))
+                                        pivot=(0, 0), offset=(80, 0)))   # y: see _update_play_buttons
         # Which version this is - lobbies only take players on the same one.
         sidebar.add(Label(f"v{VERSION}", font_size=22, color=_MUTED, anchor=Anchor.BOTTOM_LEFT, offset=(80, -30)))
 
@@ -171,12 +172,20 @@ class LobbyMenu:
             self._rebuild_profile()
             self._update_play_buttons()
 
+    _PLAY_BUTTON_HEIGHT = 84
+    _PLAY_BUTTON_SPACING = 14
+
     def _update_play_buttons(self):
+        """HOST/JOIN only with Steam; singleplayer always, below them. The status line goes just under however
+        many buttons show (the stack is centred on the sidebar's middle)."""
         available = self.net.available
         self.mp_buttons.visible = available
-        self.sp_button.visible = not available
+        self.sp_button.visible = True
         if not available:
             self._set_join_visible(False)
+        count = 3 if available else 1
+        height = count * self._PLAY_BUTTON_HEIGHT + (count - 1) * self._PLAY_BUTTON_SPACING
+        self.status.offset = (80, height / 2 + self._PLAY_BUTTON_SPACING)
 
     def _start_singleplayer(self):
         """Straight into the main map, no lobby, no Steam needed at all - see maps' own

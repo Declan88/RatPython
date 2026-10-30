@@ -57,6 +57,7 @@ from Modules.Graphics.lightmap_baker import (
     create_blur_quad_vao,
     blur_lightmap,
 )
+from Modules.Graphics import model_loader as _model_loader
 from Modules.Graphics.model_loader import load_glb, load_glb_by_material, _upload_texture, _has_attribute
 from Modules.Graphics.gltf_morph import load_morph_primitives
 from Modules.Graphics.lightmap_uv_generator import (
@@ -259,6 +260,9 @@ def _pump_load():
         except Exception:
             pass
     return loading_screen.tick()   # animates the loading screen if one is up; True = a frame was drawn (GL state changed)
+
+
+_model_loader.progress_hook = _pump_load      # between a model's texture uploads, too
 
 
 # The scene's MSAA samples - in the offscreen target, since the window itself has none. 2x, not 4x: MSAA is a real
@@ -1832,6 +1836,7 @@ class Scene:
 
         (self.equirect_skybox_texture, self.equirect_is_hdr, sky_color, ground_color,
          environment_sh) = load_equirect_texture(self.ctx, path)
+        _pump_load()      # loading the sky is a few hundred ms at the start of a scene's load
         self.equirect_skybox_vao, self.equirect_skybox_vbo = create_equirect_skybox_vao(
             self.ctx, self.equirect_skybox_program
         )
@@ -2360,6 +2365,7 @@ class Scene:
 
         self.light_probe_grid = build_light_probe_grid(
             aabbs, self.point_lights, self.physics.line_of_sight,
+            progress=_pump_load,      # over a second on a big map: keep the loading screen moving
         )
         self._still_lighting.clear()
 
@@ -2599,6 +2605,7 @@ class Scene:
             resolution change between runs."""
             loaded = []
             for path, object_resolution in zip(paths, object_resolutions):
+                _pump_load()      # reading every cache file takes over a second on a big map: keep the screen moving
                 array = lightmap_cache_io.load_lightmap_cache(
                     path, object_resolution, point_shadow_resolution,
                     directional_shadow_resolution
@@ -2639,6 +2646,7 @@ class Scene:
             cached_sun_arrays = _load_cache(sun_cache_paths) if cached_arrays is not None else None
             if cached_arrays is not None and cached_sun_arrays is not None:
                 for obj, array, sun_array in zip(eligible, cached_arrays, cached_sun_arrays):
+                    _pump_load()      # the uploads (the driver converts each to a packed format) take seconds too
                     _release(obj.get("lightmap_texture"))
                     _release(obj.get("sun_lightmap_texture"))
                     obj["lightmap_texture"] = _texture_from_cache_array(array)

@@ -311,10 +311,11 @@ class WindowManager:
             elif event.type == pygame.WINDOWDISPLAYCHANGED:
                 self.refresh_rate = monitor_refresh_rate()     # moved to another monitor
             elif event.type == pygame.VIDEORESIZE:
+                # Just the new size: an OpenGL window's drawable follows the window by itself. NOT set_mode again -
+                # with FULLSCREEN in self.flags that re-entered fullscreen on every resize: on macOS each re-entry
+                # is a new fullscreen transition, which sends another resize, so the window flipped in and out of
+                # fullscreen endlessly (and leaving fullscreen with F11 was undone by the resize it caused).
                 self.width, self.height = event.w, event.h
-                self.screen = pygame.display.set_mode(
-                    (self.width, self.height), self.flags, vsync=self.vsync
-                )
                 self.ctx.viewport = (0, 0, self.width, self.height)
                 camera.aspect = self.width / self.height
 

@@ -204,8 +204,15 @@ def _normalize_color(values):
     col = np.asarray(values[:3], dtype="f4")
     return col / (255.0 if np.max(col) > 1.0 else 1.0)
 
+# Called before each texture upload, if set - a scene points it at its loading-screen pump (scene_base._pump_load), so a
+# model with many large textures doesn't hold the loading screen still for its whole load.
+progress_hook = None
+
+
 def _upload_texture(ctx, img):
     if img is None: return None
+    if progress_hook is not None:
+        progress_hook()
     if not isinstance(img, Image.Image): img = Image.fromarray(np.asarray(img))
     # RGBA, not RGB - a base color texture's own alpha channel needs to
     # survive into the shader for MASK/BLEND alpha_mode materials to

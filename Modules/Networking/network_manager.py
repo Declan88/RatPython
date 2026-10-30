@@ -17,6 +17,7 @@ import time
 
 import py_steam_net
 from .remote_player import RemotePlayer
+from Modules.Chat import commands
 from Modules.Player.rat_colors import encode_color
 from Modules.version import VERSION
 
@@ -659,6 +660,15 @@ class NetworkManager:
             return None
         return max(0.0, duration - (time.time() - start))
 
+    # A lobby needs at least this many players in it before its host can start the game - except for the admin
+    # (Modules/Chat/commands.py's ADMIN_STEAM_ID), who can start one alone to test.
+    MIN_PLAYERS_TO_START = 2
+
+    def can_start_game(self):
+        """Whether the lobby has enough players for its host to start (MIN_PLAYERS_TO_START), by the member list
+        as last read (refresh_members) - always for the admin."""
+        return commands.is_admin(self.local_steam_id) or len(self._member_order) >= self.MIN_PLAYERS_TO_START
+
     def start_the_game(self):
         """The host presses Start in the lobby room - writes the one
         flag every peer polls for (see is_game_started), via the exact
@@ -666,13 +676,20 @@ class NetworkManager:
         broadcast" mechanism as start_round_timer/map/mode above. No
         special host-only network message needed - a value every peer
         already knows how to read for itself is enough. No-op without a
-        real lobby (singleplayer skips the lobby room entirely)."""
+        real lobby (singleplayer skips the lobby room entirely), or with
+        fewer than MIN_PLAYERS_TO_START players in it. Returns whether it
+        started."""
         if not self.client or not self.current_lobby_id or not self.is_host:
-            return
+            return False
+        self._refresh_members()
+        if not self.can_start_game():
+            return False
         try:
             self.client.set_lobby_data(self.current_lobby_id, "game_started", "1")
         except Exception as e:
             print(f"[Net] start_the_game failed: {e}")
+            return False
+        return True
 
     def is_game_started(self):
         """True once start_the_game has been called by whoever's

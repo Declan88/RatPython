@@ -94,6 +94,9 @@ class LobbyRoom:
 
         footer = root.add(Panel(layout="horizontal", spacing=20, fit_content=True,
                                 anchor=Anchor.BOTTOM_CENTER, offset=(0, -40)))
+        # Why START does nothing yet (the host only): a lobby needs NetworkManager.MIN_PLAYERS_TO_START players.
+        self.start_hint = root.add(Label("", font_size=24, color=theme.WARN, anchor=Anchor.BOTTOM_CENTER,
+                                         offset=(0, -130)))
         self.start_button = footer.add(_button("START", self._press_start, size=(220, 70), font_size=32))
         footer.add(_button("LEAVE", self._press_leave, size=(220, 70), font_size=32))
         return root
@@ -242,13 +245,22 @@ class LobbyRoom:
         self._host_mode = self._host_map = None
         self._build_settings_card(self.net.is_host)
         self._refresh_players()
+        self._update_start_hint()
         self.root.visible = True
 
     def hide(self):
         self.root.visible = False
 
     def _press_start(self):
-        self.net.start_the_game()
+        if not self.net.start_the_game():
+            self._update_start_hint()
+
+    def _update_start_hint(self):
+        """Dims START and says why while the host can't start yet (too few players)."""
+        waiting = self._is_host_built_for and not self.net.can_start_game()
+        needed = self.net.MIN_PLAYERS_TO_START
+        self.start_hint.text = f"Waiting for players - at least {needed} are needed to start" if waiting else ""
+        self.start_button.label.color = theme.MUTED if waiting else (255, 255, 255, 255)
 
     def _press_leave(self):
         self.net.leave_lobby()
@@ -271,6 +283,7 @@ class LobbyRoom:
         if not self._is_host_built_for:
             self._apply_readonly_settings(self.net.current_lobby_info() or {})
         self._refresh_players()
+        self._update_start_hint()
 
         if not self._game_started_handled and self.net.is_game_started():
             self._game_started_handled = True
