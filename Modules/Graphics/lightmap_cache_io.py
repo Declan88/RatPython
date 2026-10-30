@@ -1,30 +1,12 @@
 """
-Lightmap disk cache I/O.
+Lightmap disk cache I/O: OpenEXR (DWAB-compressed float16) when the package is installed, else compressed .npz.
 
-Uses OpenEXR when available - the actual industry-standard format for
-multi-channel float HDR image data, with compression modes (ZIP here)
-tuned for smooth continuous-tone content like baked lighting, typically
-beating generic DEFLATE-on-raw-floats by a real margin. Falls back to
-compressed .npz automatically if the OpenEXR package isn't installed,
-so this isn't a hard dependency - just a size optimization when present.
-
-NOTE: this module is written directly from the current (v3.3+) official
-OpenEXR python module's documented API (openexr.com/en/latest/python.html
-and the project's own README), not verified by actually running it - no
-network access was available to pip install and test OpenEXR itself.
-The plain .npz fallback path is the one to trust unconditionally; test
-the OpenEXR path specifically before relying on it.
-
-Metadata (which resolutions a cached lightmap was baked at, so a bake
-call with different resolution settings can tell a cache is stale
-rather than silently reusing it) is stored differently per format:
-- .npz: as extra arrays alongside "data", using numpy's native support.
-- .exr: EXR header attributes aren't used here (the simplified File API's
-  support for arbitrary custom attributes isn't confirmed), so metadata
-  is stored in a small sidecar .json file instead.
+Metadata (the resolutions a lightmap was baked at, so a bake with different settings sees the cache as stale) is a
+sidecar .json for .exr, extra arrays for .npz. A missing, stale or damaged file reads as a cache miss (re-bake).
 """
 
 import json
+import os
 
 try:
     import OpenEXR
@@ -73,14 +55,21 @@ def save_lightmap_cache(path, array, lightmap_resolution, point_shadow_resolutio
         header = {"compression": OpenEXR.DWAB_COMPRESSION, "type": OpenEXR.scanlineimage,
                   "dwaCompressionLevel": DWA_COMPRESSION_LEVEL}
         channels = {"RGB": array.astype(np.float16)}
+        # Written to a temporary name and swapped in, so a bake killed mid-write leaves the previous file intact
+        # instead of a truncated one.
+        temporary = path.with_name(path.stem + ".partial.exr")
         with OpenEXR.File(header, channels) as outfile:
-            outfile.write(str(path))
-        path.with_suffix(".json").write_text(json.dumps({
+            outfile.write(str(temporary))
+        os.replace(temporary, path)
+        meta = path.with_suffix(".json")
+        meta_temporary = meta.with_name(meta.stem + ".partial.json")
+        meta_temporary.write_text(json.dumps({
             "lightmap_resolution": lightmap_resolution,
             "point_shadow_resolution": point_shadow_resolution,
             "directional_shadow_resolution": directional_shadow_resolution,
             "uv_layout": UV_LAYOUT_VERSION,
         }))
+        os.replace(meta_temporary, meta)
     else:
         np.savez_compressed(
             path, data=array,
@@ -113,8 +102,12 @@ def load_lightmap_cache(path, lightmap_resolution, point_shadow_resolution,
            meta.get("point_shadow_resolution") != point_shadow_resolution or \
            meta.get("directional_shadow_resolution") != directional_shadow_resolution or            meta.get("uv_layout") != UV_LAYOUT_VERSION:
             return None       # (a cache from before UV layouts were versioned has no key: stale too)
-        with OpenEXR.File(str(path)) as infile:
-            return infile.channels()["RGB"].pixels.astype(np.float16)
+        try:
+            with OpenEXR.File(str(path)) as infile:
+                return infile.channels()["RGB"].pixels.astype(np.float16)
+        except Exception as e:   # a damaged file: treat it as missing, so the scene re-bakes instead of crashing
+            print(f"[lightmap cache] unreadable {path.name} ({e}) - re-baking")
+            return None
     else:
         if not path.exists():
             return None

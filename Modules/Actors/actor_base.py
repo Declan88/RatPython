@@ -114,19 +114,9 @@ class ActorBase:
     cast_shadow = True
     visible_in_color = True
 
-    # How many update() calls between contactTest sweeps of this actor's
-    # own self._shapes (see update() below) - 1 (default) checks every
-    # single frame, same as always. Raise this on an actor whose shapes
-    # are pure proximity/event detectors with no need for frame-perfect
-    # response (most of them - see CheesePile's own 4, "~4 frames of
-    # latency on a Cheese War proximity print is imperceptible"):
-    # contactTest's own cost scales with how many OTHER bodies exist in
-    # the physics world, not with this actor's own shape - confirmed
-    # directly on mainmap.glb (88 separate per-object static colliders)
-    # at ~0.15ms per call vs ~0.0002ms in an empty world, a ~700x
-    # difference that showed up as a measurable, disproportionate (tens
-    # of fps at this project's own very high uncapped framerates) per-
-    # frame cost for checking a single small sphere once a frame.
+    # update() calls between overlap checks of this actor's shapes (1 = every frame). The check only tests against
+    # players' tagged bodies (PhysicsWorld.overlapping_owners), so it's cheap; raise this for a shape that doesn't
+    # need frame-perfect response anyway.
     shape_check_interval = 1
 
     def __init__(self, scene, position, rotation, scale):
@@ -329,41 +319,12 @@ class ActorBase:
         sphere, on_enter/on_exit wired to its own print methods)."""
 
     def update(self, dt, player_positions=(), game_mode=None):
-        """Call once per frame (Scene.update() does, for every actor in
-        self.actors, generically). player_positions ([(player_id, glm.vec3
-        position), ...]) and game_mode (the active Modules.GameModes.
-        GameMode instance - see Scene.update's own docstring for both) are
-        accepted for signature compatibility with that generic call and for
-        any OTHER per-frame logic a subclass might want (see cheesepile.py's
-        own override, which uses game_mode to self-destroy outside "Cheese
-        War"), but NEITHER is used by the shape-overlap check below - that's
-        answered by a real physics query (self._shapes, see
-        create_collision_shape) instead of hand-rolled distance math
-        against a position list, so it stays correct regardless of what
-        shape a player's own collider actually is, without this class
-        needing to know or care. A subclass overriding this for its own
-        per-frame logic should normally call super().update(dt,
-        player_positions, game_mode) too, unless it has no shapes at all.
+        """Once per frame (Scene.update). player_positions/game_mode are for a subclass's own logic (cheesepile.py
+        uses game_mode); a subclass overriding this should call super().update too if it has shapes.
 
-        For every shape this actor owns (self._shapes - empty for most
-        actors, the common case where load_shapes never called
-        create_collision_shape): contactTest's against that shape's own
-        node (the same immediate, on-demand query
-        CharacterController._can_stand already prefers over the
-        separately-cached, can-go-stale getOverlappingNodes() - see its own
-        docstring), reads each contact's "owner" python tag to identify WHO
-        is actually overlapping (a plain wall/floor contact has no such tag
-        and is silently skipped), and fires that shape's own
-        on_enter(owner)/on_exit(owner) exactly once each, on the frame an
-        owner id actually starts/stops appearing among its contacts - not
-        every frame it's inside/outside - by diffing against that shape's
-        own "inside" set (last frame's), not the whole actor's.
-
-        shape_check_interval > 1 (see its own class docstring) skips
-        the contactTest sweep entirely on every call that isn't a
-        multiple of it - still counted via self._update_count either
-        way, so the actual check cadence stays even (every Nth call),
-        not reset/drifting if an actor goes dormant and resumes later."""
+        For each shape (create_collision_shape): asks the physics world which tagged bodies (players' ghosts and
+        hitboxes - exact shapes, not a distance guess) overlap it, and fires on_enter/on_exit only on the frame an
+        owner starts/stops overlapping. Checked every shape_check_interval-th call."""
         self._update_count += 1
         if self._shapes and self._update_count % self.shape_check_interval != 0:
             return
@@ -371,16 +332,7 @@ class ActorBase:
             node_path = info["node_path"]
             if node_path is None:
                 continue
-            node = node_path.node()
-            result = self.scene.physics.world.contactTest(node)
-            now_inside = set()
-            for i in range(result.getNumContacts()):
-                contact = result.getContact(i)
-                other = contact.getNode1() if contact.getNode0() == node else contact.getNode0()
-                if other.hasPythonTag("owner"):
-                    owner = other.getPythonTag("owner")
-                    if owner is not None:
-                        now_inside.add(owner)
+            now_inside = self.scene.physics.overlapping_owners(node_path.node())
             entered = now_inside - info["inside"]
             exited = info["inside"] - now_inside
             info["inside"] = now_inside

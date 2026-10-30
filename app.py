@@ -8,46 +8,27 @@ import glm
 
 
 def _is_frozen_build():
-    """True for a Nuitka-compiled run ("__compiled__" injected into this
-    entry module's globals - Nuitka's own documented detection method),
-    False for an ordinary `python app.py` dev run. Shared by every
-    frozen-only check in this file (currently just the asset-path chdir)
-    so they can't silently drift out of sync with each other."""
+    """True in a Nuitka build (Nuitka injects "__compiled__" into this module's globals)."""
     return "__compiled__" in globals()
 
 
 def _chdir_for_frozen_build():
-    """Nuitka's --onefile mode re-executes itself from its own unpacked
-    temp directory before any of this code runs, so sys.executable
-    already points at that unpacked location by the time this runs (for
-    --standalone too - there's just no separate temp dir to unpack to,
-    sys.executable is simply where the built exe already sits). Every
-    asset path in this codebase (torus_scene.py's model/texture/audio
-    paths, etc.) is a plain relative string like "Assets/Models/...",
-    which only resolves correctly if the process's current working
-    directory happens to BE that location. Since none of those call
-    sites can be reached before this runs (they're all behind imports/
-    calls below), chdir'ing here once, before anything else executes,
-    makes every existing relative path keep working unmodified instead
-    of touching dozens of individual asset-loading call sites."""
+    """Every asset path is a plain relative "Assets/..." string, so a built exe must run from its own folder."""
     if _is_frozen_build():
         os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
 
 
 _chdir_for_frozen_build()
 
-# Packed (encrypted) assets: when the build ships Assets/pack.idx instead of plain asset files, this makes every
-# read under Assets/ come from the pack - see Modules/Assets/pack_runtime.py. It must run before anything
-# that reads an asset at import time (e.g. the footstep sound index), and does nothing in a source-tree run.
+# Packed (encrypted) assets: when the build ships Assets/pack.idx, every read under Assets/ comes from the pack
+# (Modules/Assets/pack_runtime.py). Must run before anything reads an asset at import time; a no-op from source.
 from Modules.Assets import pack_runtime
 pack_runtime.install()
 
 
 def _disable_window_ghosting():
-    """Loading blocks the main thread for seconds at a time, and OpenGL only works from that
-    thread, so window messages can't be answered meanwhile. If the player clicks the window
-    in that time Windows swaps it for a white "ghost" and offers to end the process; this
-    tells Windows not to. The clicks simply queue up (and are dropped once loading is done)."""
+    """Loading blocks the GL thread for seconds; without this, a click meanwhile makes Windows swap the window
+    for a white "not responding" ghost. The clicks just queue up instead."""
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.DisableProcessWindowsGhosting()
@@ -57,36 +38,12 @@ def _disable_window_ghosting():
 
 _disable_window_ghosting()
 
-# NOTE on Optimus/switchable-graphics GPU selection for OpenGL: Windows'
-# own "High performance" registry hint (Settings > System > Display >
-# Graphics, or the equivalent HKCU\Software\Microsoft\DirectX\
-# UserGpuPreference key an app could write itself) isn't reliably
-# honored for a raw OpenGL context (moderngl/pygame-ce, via WGL) the way
-# it is for Direct3D/DXGI apps - an earlier version of this file wrote
-# that key directly and confirmed it did nothing for this project, so
-# it was removed rather than kept as inert dead code. The mechanism
-# that DOES work is exporting two symbols -
-# NvOptimusEnablement and AmdPowerXpressRequestHighPerformance - but
-# these MUST be in the actual .exe's own PE export table specifically;
-# a DLL loaded at runtime does nothing, regardless of how early it's
-# loaded here - an earlier version of this file tried exactly that (a
-# companion gpu_hint.dll) and it had no effect, and the old PyInstaller
-# build needed a patched bootloader to get this right for the same
-# underlying reason (that workaround was PyInstaller-specific and
-# doesn't carry over to Nuitka).
-#
-# Nothing in THIS Python file can express that fix - there is no
-# per-build-invocation flag or Python-level hook for it - but
-# nuitka_gpu_preference_plugin.py (project root, loaded via
-# BuildCMD_Nuitka's own --user-plugin= flag) now does, using Nuitka's
-# getExtraCodeFiles() plugin hook. Confirmed working (see that file's
-# own docstring for the pefile-verified proof and the two non-obvious
-# details that made it work: which compile stage a --onefile build's
-# "onefile_"-prefixed extra-code-file key actually reaches, and why the
-# onefile bootstrap .exe - not some separate extracted exe - is the
-# right target in the first place).
+# Dedicated-GPU selection on Optimus/switchable laptops: only the NvOptimusEnablement/
+# AmdPowerXpressRequestHighPerformance exports in the .exe itself work (not the Windows registry hint, not a
+# DLL) - nuitka_gpu_preference_plugin.py adds them at build time.
 
 from Modules.Window.window import WindowManager
+from Modules.Window.nvidia_profile import ensure_threaded_optimization
 from Modules.Window.loading_screen import hide_loading_screen, show_loading_screen
 from Modules.UI import UIManager
 from Modules.UI.demo import build_demo
@@ -103,58 +60,78 @@ from Modules.Particles.dissolve_sparks import register_dissolve_sparks
 from Modules.Gore import GibManager
 from Modules.Debug import FrameProfiler
 from Modules.Window.cpu_affinity import (
-    pin_main_thread_to_fast_cores, CpuTuner, apply_process_cpu_mask_from_env, apply_priority_from_env,
-    cpu_affinity_label)
+    prefer_performance_cores, keep_other_threads_off_main_cores, apply_process_cpu_mask_from_env,
+    apply_priority_from_env, cpu_affinity_label)
 from Modules.Particles.impacts import (IMPACT_FILE, IMPACT_GROUP, MATERIAL_ALIASES, LIFETIME_SCALE, MAX_IMPACT_EFFECTS,
                                        RADIUS_SCALE, keep_frame, spawn_impact, play_impact_sound)
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
+from Modules.Input import Action, AimAssist, InputManager, CONTROLLER
+from Modules.Input.bindings import RUMBLE_DAMAGE, RUMBLE_DEATH, RUMBLE_FIRE, RUMBLE_HIT
+from Modules.UI import gamepad_nav
+from Modules.settings import settings
 
 SPAWN_POSITION = (0.0, 2.5, 6.0)   # where the player (re)spawns: hull centre, metres
 RESPAWN_SECONDS = 3.0
-# A standing, shootable target near spawn purely for testing the kill feed/
-# sound without a second PC - see setup_game/the shooting code's own dummy
-# branch. 1 is a reserved id no real Steam64 id can ever equal (those are all
-# 17 digits), so it can never collide with a real player's.
+# A shootable target for testing kills alone (/adddummy). 1 can never equal a real (17-digit) Steam64 id.
 TEST_DUMMY_STEAM_ID = 1
 TEST_DUMMY_OFFSET = (3.0, 0.0, -2.0)   # metres from SPAWN_POSITION, feet-height
 TEST_DUMMY_RESPAWN_SECONDS = 1.5
 TEST_DUMMY_HEALTH = 100.0
-STARTING_LOADOUT = ["usp", "gouda_gun", "pencil", "corroder"]   # weapon ids (see Modules/Weapons/registry.py) everyone spawns with
-# Number-row keys 1-9 select inventory slots 0-8 directly (see on_key_down) - same
-# switch_weapon() the scroll wheel already uses, just jumping straight to a slot instead
-# of stepping by +-1. Only as many of these as the inventory actually has slots for are
-# ever reachable - the rest are harmless no-ops (on_key_down checks len(inventory)).
-WEAPON_SLOT_KEYS = {
-    pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2, pygame.K_4: 3, pygame.K_5: 4,
-    pygame.K_6: 5, pygame.K_7: 6, pygame.K_8: 7, pygame.K_9: 8,
-}
+STARTING_LOADOUT = ["usp", "gouda_gun", "pencil", "corroder"]   # weapon ids (Modules/Weapons/registry.py)
+# Number-row keys 1-9 select inventory slots 0-8 (only the slots that exist).
+WEAPON_SLOT_KEYS = {getattr(pygame, f"K_{n}"): n - 1 for n in range(1, 10)}
 
-# /smite's sound pair - see app.py's own spawn_smite. Distances are Minecraft's own attenuation
-# (given in blocks) carried straight over as metres, this project's own world scale (a block and
-# a metre are both "about one big stride" - the same correspondence Assets/Particles' own
-# UNIT_SCALE comment uses converting Source's inches).
-#
-# NOT the cause of an earlier "can't hear the explosion unless I'm the one smited" report, even
-# though it looked like one at first (SoundManager's own falloff="inverse" curve is steeper than
-# Minecraft's, and this got pushed as high as 2000m/8,000,000m chasing that theory without it
-# helping) - the REAL cause was show_kill_feed's own Kill.wav (universal=True, no distance
-# falloff at all, GAIN=4.0 - see KILL_SOUND_GAIN) firing at the same instant for any admin kill
-# OTHER than a self-smite (no kill credit for suicide, so it never fires there), reliably
-# drowning out this pair regardless of range. Restored to the original conversion now that
-# show_kill_feed takes play_sound=False for a smite kill instead.
+# /smite's sound pair. Ranges are Minecraft's attenuation in blocks, taken as metres. (Kill.wav, not these
+# ranges, was what once drowned the explosion out - show_kill_feed's play_sound=False covers that.)
 SMITE_EXPLOSION_SOUND = "Assets/Audio/Effects/Lightning/Explosion3.wav"
 SMITE_THUNDER_SOUND = "Assets/Audio/Effects/Lightning/Thunder1.wav"
-SMITE_EXPLOSION_RANGE = 16.0        # Minecraft: 16 blocks
-SMITE_THUNDER_RANGE = 160_000.0     # Minecraft: 160,000 blocks
+SMITE_EXPLOSION_RANGE = 16.0
+SMITE_THUNDER_RANGE = 160_000.0
 HITMARKER_SOUND = "Assets/Audio/Player/hitmarker.wav"
-HITMARKER_VOLUME = 1.0   # the sound manager applies a volume twice (on the sound and on its channel), so 1.0 is what plays at full
-HITMARKER_HEADSHOT_PITCH = 1.45   # a headshot's hitmarker sound is this much higher (playback speed)
-HITMARKER_GAIN = 10.0     # ...so anything louder has to amplify the samples themselves (soft-clipped)
+HITMARKER_VOLUME = 1.0   # the sound manager applies a volume twice (sound and channel), so 1.0 is full
+HITMARKER_HEADSHOT_PITCH = 1.45   # a headshot's hitmarker plays this much faster
+HITMARKER_GAIN = 10.0     # anything louder has to amplify the samples themselves (soft-clipped)
 KILL_SOUND = "Assets/Audio/player/Kill.wav"
 KILL_SOUND_VOLUME = 1.0
 KILL_SOUND_GAIN = 4.0
+
+# The rat's animations. Most were exported at Blender's default 24 fps although authored for 30, so their key
+# times are 1.25x too long; RAT_ANIM_TIME_SCALE corrects that for the files flagged below (checked per file
+# from the raw keyframe spacing - the others were re-exported at 30 fps).
+RAT_ANIM_TIME_SCALE = 24.0 / 30.0
+RIFLE_POSE_DIR = "Assets/Animations/Poses/Rifle"
+# (file, clip name on the merged skeleton, needs the 24 -> 30 fps fix). Each file's real pose is its "New" clip
+# (the NE/NW/SE/SW files also carry 33 identical leftover clips, "Diag" among them, which are ignored).
+RIFLE_POSES = (
+    ("rifleidle.glb", "rifle_idle", True),
+    ("RifleWalkN.glb", "rifle_walk", False),
+    ("RifleWalkS.glb", "rifle_walk_s", False),
+    ("RifleWalkE.glb", "rifle_walk_e", False),
+    ("RifleWalkW.glb", "rifle_walk_w", True),
+    ("RifleWalkNE.glb", "rifle_walk_ne", True),
+    ("RifleWalkNW.glb", "rifle_walk_nw", True),
+    ("RifleWalkSE.glb", "rifle_walk_se", True),
+    ("RifleWalkSW.glb", "rifle_walk_sw", True),
+    ("RifleRunN.glb", "rifle_run", False),
+    ("RifleJump.glb", "rifle_jump", False),
+    ("RifleCrouch.glb", "rifle_crouch", False),   # a static pose: frame rate doesn't matter
+)
+# (state, clip, min speed m/s) - Source's velwalk/velrun (90/220 units/s). Used for both body halves.
+PLAYER_ANIMATION_STATES = (
+    ("idle", "rifle_idle", 0.0),
+    ("walk", "rifle_walk", 90.0 * 0.0254),
+    ("run", "rifle_run", 220.0 * 0.0254),
+)
+# Facing-relative walk clips (no directional run set exists yet, so "run" always plays rifle_run).
+PLAYER_DIRECTIONAL_CLIPS = {
+    "walk": {"N": "rifle_walk",
+             **{d.upper(): f"rifle_walk_{d}" for d in ("s", "e", "w", "ne", "nw", "se", "sw")}},
+}
+# Rat eye level is 1.39225 m above the feet; CharacterController puts the eye at height * 8/9.
+PLAYER_HEIGHT = 1.39225 * 9 / 8
+
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.UI.killfeed import KillFeed
 from Modules.UI.damage_indicator import DamageIndicator
@@ -178,33 +155,12 @@ from Modules.UI.weapon_hud import WeaponHUD
 
 
 def load_steam_api_dll():
-    # One shared library name per platform - Valve's Steamworks SDK ships
-    # a differently-named/formatted binary for each (steam_api64.dll on
-    # Windows, libsteam_api.dylib on macOS - a universal x86_64+arm64
-    # binary here, so one file covers both Intel and Apple Silicon -
-    # libsteam_api.so on Linux). ctypes.CDLL(..., mode=ctypes.RTLD_GLOBAL)
-    # and RTLD_GLOBAL itself are both real cross-platform POSIX/ctypes
-    # concepts, not Windows-specific, so the loading logic below is
-    # identical for all three - only the filename differs.
-    lib_name = {
-        "win32": "steam_api64.dll",
-        "darwin": "libsteam_api.dylib",
-    }.get(
-        sys.platform, "libsteam_api.so"
-    )  # covers "linux" and any other POSIX platform
-
+    """Pre-loads the platform's Steamworks library globally (RTLD_GLOBAL) before py_steam_net is imported.
+    STEAM_API_DLL_PATH overrides where it's looked for."""
+    lib_name = {"win32": "steam_api64.dll", "darwin": "libsteam_api.dylib"}.get(sys.platform, "libsteam_api.so")
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # _chdir_for_frozen_build() (called at module import time, above this
-    # function's own call further down) already puts the process's cwd
-    # at the right unpacked location for a Nuitka build on every
-    # platform, so the os.getcwd() candidate below covers a frozen build
-    # on its own - no separate extraction-folder special-case needed.
-    candidates = [
-        os.path.join(script_dir, lib_name),
-        os.path.join(os.getcwd(), lib_name),
-    ]
-
+    # A frozen build already chdir'd to its own folder (above), so the cwd candidate covers it.
+    candidates = [os.path.join(script_dir, lib_name), os.path.join(os.getcwd(), lib_name)]
     env_override = os.environ.get("STEAM_API_DLL_PATH")
     if env_override:
         candidates.insert(0, env_override)
@@ -223,8 +179,6 @@ def load_steam_api_dll():
     print(f"Warning: {lib_name} not found.")
 
 
-# Pre-load the platform's Steamworks shared library globally before any
-# modules import py_steam_net.
 load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
@@ -234,49 +188,28 @@ from Modules.GameModes import Deathmatch, coerce_map, create_game_mode, game_mod
 
 def main():
     print("Yo wsg")
-    # Keep the main thread off this machine's slow cores (hybrid CPUs: ~600 vs ~400 vs ~200 fps
-    # depending on where the OS happened to start it) - see Modules/Window/cpu_affinity.py.
-    # CPU placement. RATWAR_CPU_MASK (e.g. "16-19") confines the whole process, for experiments. The automatic
-    # pinning (RATWAR_AUTO_PIN=1) is OFF by default: logs showed it did not remove the fps variance and its
-    # in-game tuner sometimes settled the thread on one of the slow CPUs (see Modules/Window/cpu_affinity.py).
+    # CPU placement (Modules/Window/cpu_affinity.py): on a hybrid CPU, the process (the graphics driver's threads
+    # included) on the P-cores, and this main thread on P-cores of its own - re-applied to the other threads after
+    # the window and each load, since the driver starts threads lazily. RATWAR_CPU_MASK replaces it (experiments).
     apply_priority_from_env()
-    cpu_mask = apply_process_cpu_mask_from_env()
-    if not cpu_mask and os.environ.get("RATWAR_AUTO_PIN"):
-        cpu_tuner = CpuTuner(pin_main_thread_to_fast_cores())
-    else:
-        cpu_tuner = CpuTuner(None)
+    if not apply_process_cpu_mask_from_env():
+        prefer_performance_cores()
+    # NVIDIA's threaded optimization, forced on for this exe (Modules/Window/nvidia_profile.py) - left on "Auto"
+    # the driver turned it off by itself in most sessions, halving fps. Before the GL context exists.
+    ensure_threaded_optimization()
     window = WindowManager(800, 600, "Rat King")
+    keep_other_threads_off_main_cores()
     camera = Camera(position=(0.0, 0.0, 3.0), aspect=window.width / window.height)
-    # The normal, hip-fire FOV - camera.fov itself gets temporarily narrowed while
-    # scoping (see the main loop's own scope handling) and eased back to exactly this
-    # afterward, so it has to be captured once, up front, rather than hardcoding
-    # Camera's own default again here (or trusting camera.fov to still read it after
-    # the first time scoping touches it).
+    # Hip-fire FOV and sensitivity: scoping narrows both by the same ratio and eases back to these.
     BASE_FOV = camera.fov
-    # Same idea, for mouse sensitivity: a real scope makes the same physical mouse
-    # movement turn the view much less (zoomed in = more screen-space travel per
-    # degree), so camera.sensitivity is scaled by the same fov/BASE_FOV ratio
-    # camera.fov is already eased by every frame (see the main loop) - at full zoom
-    # (scope_fov/BASE_FOV) a mouse swipe turns the camera proportionally less.
     BASE_SENSITIVITY = camera.sensitivity
 
-    # Scene classes, not instances - see get_or_load_scene below. Only
-    # ever constructed the first time something actually switches to
-    # that key, not all up front: TorusScene is kept around purely as a
-    # K_1-selectable test/comparison scene (see the switch handler
-    # below), and building it (parsing its glb, uploading GPU
-    # resources, baking lightmaps) is real, non-trivial work worth
-    # skipping entirely for a run that never visits it.
+    # Scene classes, built the first time something switches to them (TorusScene is only a test scene).
     SCENE_CLASSES = {"torus": TorusScene, "mainmap": MainMapScene, "sewer": SewerScene, "mainmenu": MainMenuScene}
     scenes = {}
 
     def get_or_load_scene(key):
-        """Returns the already-built scenes[key] if it exists, else
-        constructs it first - showing one loading-screen frame right
-        before that (still fully synchronous/blocking - see loading_
-        screen.py's own docstring for why) construction runs, so
-        switching to a not-yet-visited scene reads as "loading"
-        instead of as a frozen window."""
+        """scenes[key], building it first (behind a loading-screen frame) if needed."""
         if key not in scenes:
             show_loading_screen(window, f"Loading {key}...")
             try:
@@ -284,80 +217,48 @@ def main():
                 scenes[key].gibs = GibManager(scenes[key], particles)
             finally:
                 hide_loading_screen()
-            # See WindowManager.reset_frame_timer's own docstring - a
-            # multi-second construction just ran on this same thread,
-            # and the NEXT dt computed would otherwise include all of it.
-            window.reset_frame_timer()
+            keep_other_threads_off_main_cores()   # any thread the load started
+            window.reset_frame_timer()   # keep the multi-second load out of the next dt
         return scenes[key]
 
-    # Gameplay state. Nothing below exists until setup_game() runs (the
-    # main menu's Play button) - it is what loads mainmap, so the menu
-    # doesn't pay for that load up front. The main loop only reaches any of
-    # this after in_menu goes False.
+    # Gameplay state - nothing below exists until setup_game() runs (a match start).
     current_scene_key = None
     current_scene = None
     player = None
-    player_height = None
     local_player_model = None
     viewmodel = None  # first-person arms glued to the camera
-    weapon = None     # the local player's CURRENT weapon (Modules/Weapons) - inventory.current
-    # Every weapon the local player carries, and which one's out (any weapon in the
-    # registry can be in it, by id - see Modules/Weapons/inventory.py) - see
-    # switch_weapon, called by setup_game (below) for the initial equip and by the
-    # scroll-wheel handling further down.
-    inventory = Inventory(STARTING_LOADOUT)
+    weapon = None     # the local player's current weapon - inventory.current
+    inventory = Inventory(STARTING_LOADOUT)   # built once: loadout and ammo carry across matches
     boom_arm = None
-    # No manual toggle any more (see the removed V keybind in on_key_down) - purely
-    # state-driven: begin_death/end_death flip this directly (dead means third person,
-    # alive means first, full stop - see their own comments).
+    # Purely state-driven: third person while dead or emoting, first person otherwise.
     third_person = False
 
     def apply_third_person_visibility():
-        """The current weapon's world model follows third_person exactly like the local
-        player's own body does (see local_player_model's own visible_in_color=False,
-        set_visible_in_color calls) - WeaponsBase.set_active always shows it regardless of
-        first/third person (a weapon switch has no idea which one is active), so this has
-        to be reapplied after anything that could have just turned it back on: the third-
-        person toggle itself, and a weapon switch/the very first equip (which defaults to
-        visible - correct for third person, wrong for the first-person default). Defined here,
-        not inside setup_game, so switch_weapon (a sibling of setup_game, not nested inside
-        it) can see it too - it needs weapon/third_person, both already live at this scope."""
+        """The current weapon's world model shows only in third person (equipping always shows it)."""
         if weapon is not None:
             for obj in weapon.worldmodel_objs:
                 obj["visible_in_color"] = third_person
-    test_dummy = None  # a standing, shootable RemotePlayer for testing the kill feed/sound alone - see setup_game
-    # deaths: the dummy's own death counter (receive_state's "x" - see RemotePlayer);
-    # respawn_at: perf_counter() time to show it again, or None while it's up.
-    # pos/yaw: its fixed spot, resent on every receive_state call (required every time).
+    test_dummy = None  # a shootable RemotePlayer for testing alone - see spawn_test_dummy
+    # deaths: its death counter (RemotePlayer's "x"); respawn_at: perf_counter() time to show it again, or None.
     dummy_state = {"deaths": 0, "respawn_at": None, "pos": None, "yaw": 180.0, "health": 100.0}
 
+    def dummy_packet(alive, damage_class=None):
+        """The movement packet that puts the test dummy at its spot, alive or dead."""
+        packet = {"p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0, "c": 0, "g": 1, "s": 0,
+                  "d": [0.0, 0.0], "j": 0, "x": dummy_state["deaths"], "a": int(alive)}
+        if damage_class is not None:
+            packet["dc"] = str(damage_class)
+        return packet
+
     def setup_game(scene_key):
-        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, weapon, player, player_height, third_person, test_dummy, paper_doll
-        # Every call here is now a brand-new lobby session (start_game no
-        # longer has a "reuse the scene we disconnected from" shortcut - see
-        # its own comment) - fully tear down whatever the LAST session built
-        # before constructing anything new, so stale actors (e.g. a
-        # cheesepile that already despawned itself last round), physics
-        # bodies and GL resources never carry over into a new lobby, even
-        # one that happens to reuse the same map. player.destroy()/
-        # local_player_model.destroy() release what THEY own; current_scene.
-        # destroy() releases everything else (statics/dynamics/skeletals/
-        # viewmodel parts/actors/physics/sounds) and is popped out of
-        # `scenes` so get_or_load_scene below can't hand back the dead
-        # instance - a fresh SCENE_CLASSES[...]() construction runs instead,
-        # same as visiting that key for the very first time.
-        if player is not None:
-            player.destroy()
-            player = None
-        if local_player_model is not None:
-            local_player_model.destroy()
-            local_player_model = None
-        if paper_doll is not None:
-            paper_doll.destroy()
-            paper_doll = None
-        if test_dummy is not None:
-            test_dummy.destroy()
-            test_dummy = None
+        nonlocal boom_arm, current_scene, current_scene_key, local_player_model, viewmodel, player, third_person
+        nonlocal test_dummy, paper_doll
+        # Every match is a full rebuild: tear down the last one (even on the same map) so no actor, physics body
+        # or GL resource carries over, and drop the old scene so a fresh one is built.
+        for leftover in (player, local_player_model, paper_doll, test_dummy):
+            if leftover is not None:
+                leftover.destroy()
+        player = local_player_model = paper_doll = test_dummy = None
         if current_scene is not None:
             current_scene.destroy()
             scenes.pop(current_scene_key, None)
@@ -365,95 +266,16 @@ def main():
         current_scene_key = scene_key
         current_scene = get_or_load_scene(current_scene_key)
 
-        # Player capsule: walks/collides against current_scene's static
-        # geometry (see torus_scene.py's collision=True statics) via the
-        # scene's own physics world. Spawned above the floor so it falls
-        # and settles on first update rather than starting embedded in it.
-        # max_slope_degrees raised slightly past Source's 45.57 default - the
-        # TorusScene staircase's clip-brush ramp (see torus_scene.py) sits at
-        # ~46.3 degrees, fit to the actual tread-nosing line rather than a
-        # shallower approximation, so it needs a hair more headroom to count
-        # as walkable floor instead of a wall.
-        # CharacterController.get_eye_offset() (non-crouched, see
-        # character_controller.py) puts the camera at height/2 +
-        # height*_DEFAULT_EYE_RATIO above the feet, where _DEFAULT_EYE_RATIO
-        # is 0.7/1.8 - i.e. eye level = height * 8/9. The rat.glb model's
-        # actual measured eye level is 1.39225m above its feet, so height is
-        # set here to whatever makes that formula land exactly there
-        # (1.39225 * 9/8), rather than picking an arbitrary height and
-        # letting the eye level fall wherever the generic ratio puts it -
-        # keeps the first-person camera at the same height the visible/
-        # shadow-casting model's own eyes actually are.
-        player_height = 1.39225 * 9 / 8
-        game_mode.use_scene_spawns(current_scene, player_height)   # the map's "character_spawn" markers
+        game_mode.use_scene_spawns(current_scene, PLAYER_HEIGHT)   # the map's "character_spawn" markers
         player = CharacterController(
             current_scene.physics,
             position=game_mode.choose_spawn_position(),
-            height=player_height,
-            max_slope_degrees=47.0,
-            # Tags the local player's own movement ghost with their steam_id
-            # (see CharacterController's own owner param docstring) - lets a
-            # contactTest-based query (Modules/Actors' own player-proximity
-            # trigger) identify the local player the same way it already
-            # identifies a remote one via their hitbox's own owner tag.
-            owner=net_mgr.local_steam_id,
+            height=PLAYER_HEIGHT,
+            max_slope_degrees=47.0,   # a hair past Source's 45.57: the torus scene's stair ramp is ~46.3
+            owner=net_mgr.local_steam_id,   # tags our movement ghost, so actor triggers can tell who we are
         )
 
-        # The local player's own visual body - shadow-only (visible_in_color
-        # =False) since a first-person player never sees their own model,
-        # only what it casts onto the ground. Model path/animation are
-        # hardcoded HERE, at the call site, rather than inside PlayerModel
-        # itself, so swapping the local player's visual model later is a
-        # one-line change - PlayerModel (Modules/Player/player_model.py)
-        # stays fully generic, not tied to this one asset.
-        # All of this project's rat/rifle animations were baked with
-        # Blender's factory-default scene frame rate (24fps) left unchanged,
-        # even though they were actually authored/intended for 30fps - so
-        # every raw keyframe time in these files is 30/24 = 1.25x too long
-        # (each file plays back 25% slower than intended). RAT_ANIM_TIME_SCALE
-        # corrects for that by rescaling every keyframe time by 24/30 before
-        # it's used - see skeletal_loader.load_skinned_glb/
-        # load_animation_clips' own time_scale docstring for the mechanism.
-        RAT_ANIM_TIME_SCALE = 24.0 / 30.0
-
-        # Blend-state table: (name, clip, min_speed), min_speed in m/s.
-        # Source's own velwalk/velrun (90/220 Source units/s * 0.0254 - the
-        # same constants character_controller.py's footstep-sound code uses)
-        # decide when "walk"/"run" kick in. rat.glb's own baked-in "New" clip
-        # is actually a dancing animation, not an idle one - "rifle_idle"/
-        # "rifle_walk"/"rifle_run" (loaded below from the separate pose-only
-        # files, sharing rat.glb's armature) are the real poses. All three
-        # are full-body clips (legs included, not just arms), so the same
-        # table is reused for the upper-body split below too - appending a
-        # new blend state later (crouch-walk, sprint, whatever) is just
-        # adding another triple here, PlayerModel needs no other change.
-        player_animation_states = (
-            ("idle", "rifle_idle", 0.0),
-            ("walk", "rifle_walk", 90.0 * 0.0254),
-            ("run", "rifle_run", 220.0 * 0.0254),
-        )
-
-        # Facing-relative directional overrides for the "walk" state only -
-        # RifleWalkS/E/W/NE/NW/SE/SW.glb (loaded below) exist alongside
-        # RifleWalkN.glb, but there's no equivalent run-direction set yet,
-        # so "run" deliberately has no entry here at all and keeps playing
-        # rifle_run regardless of direction until those are authored too -
-        # see PlayerModel's directional_clips docstring for exactly how a
-        # missing state/direction falls back to the plain (or nearest-
-        # cardinal) clip.
-        player_directional_clips = {
-            "walk": {
-                "N": "rifle_walk",
-                "S": "rifle_walk_s",
-                "E": "rifle_walk_e",
-                "W": "rifle_walk_w",
-                "NE": "rifle_walk_ne",
-                "NW": "rifle_walk_nw",
-                "SE": "rifle_walk_se",
-                "SW": "rifle_walk_sw",
-            },
-        }
-
+        # Our own body: shadow-only in first person.
         local_player_model = PlayerModel(
             current_scene,
             "Assets/Models/rat.glb",
@@ -461,204 +283,44 @@ def main():
             cast_shadow=True,
             time_scale=RAT_ANIM_TIME_SCALE,
             tint_mask_path=RAT_TINT_MASK_PATH,
-            states=player_animation_states,
-            directional_clips=player_directional_clips,
-            # Splits the model into a lower body (locomotion - legs, spine,
-            # neck, head - above) and an upper body (gun-holding pose)
-            # driven independently. Deliberately just the two clavicles, NOT
-            # their shared parent Spine4 - Spine4 also parents Neck1 (->
-            # Head1), and Bip01_Spine/Spine1/Spine2 above IT drive the torso
-            # twist - rooting the split there pulled the spine AND neck/head
-            # into the "upper body" mask too, so a gun-holding pose (or the
-            # shotgun-idle override) would visibly override the head/neck
-            # look-direction and spine lean along with the arms, not just
-            # the arms. Rooting at the clavicles instead confines the swap
-            # to exactly the shoulder/arm/hand chains - spine, neck, and
-            # head always follow the LOWER body's own locomotion clip
-            # (idle/walk/run/jump/crouch) no matter what the upper body is
-            # doing.
+            states=PLAYER_ANIMATION_STATES,
+            directional_clips=PLAYER_DIRECTIONAL_CLIPS,
+            # Locomotion splits at the clavicles, not their parent Spine4: Spine4 also parents the neck and
+            # head, which must keep following the lower body's locomotion clip.
             upper_body_root_joints=[
                 "ValveBiped.Bip01_R_Clavicle",
                 "ValveBiped.Bip01_L_Clavicle",
             ],
-            # A weapon's held pose (set_upper_override - see WeaponsBase.
-            # equip_player) uses a WIDER split instead, rooted
-            # at Spine4 - which also parents Neck1 (-> Head1) alongside both
-            # clavicle chains in this rig, so this pulls in arms, neck, AND
-            # head as one unit. Locomotion-driven upper-body poses above
-            # stay narrower (clavicles only) on purpose, but an override
-            # like pistol_idle was authored with its own Spine4/neck
-            # rotation as PART of the pose - splitting it at the clavicles
-            # instead fed that clip's clavicle rotation the wrong PARENT
-            # transform (whatever Spine4 orientation the current locomotion
-            # clip happened to be using), which is what actually made the
-            # arm look rotated wrong. Widening the override's own mask to
-            # include Spine4 lets it supply its own correct pose for
-            # everything above the shoulders, matching how it was actually
-            # authored - no manual per-joint rotation correction needed.
+            # A weapon's held pose (set_upper_override) splits at Spine4 instead: those clips were authored with
+            # their own Spine4/neck rotation, and splitting them at the clavicles posed the arms off the wrong
+            # parent transform.
             override_upper_body_root_joints=["ValveBiped.Bip01_Spine4"],
-            upper_states=player_animation_states,
-            # RifleJump.glb (loaded below) - a one-shot takeoff pose, not a
-            # speed-driven blend state like the three above, so it's its own
-            # param rather than another `states` entry: PlayerModel.update()
-            # overrides BOTH bodies with it the instant is_grounded reads
-            # False, holding its last frame (see add_skeletal's own loop
-            # param) until is_on_ground() is true again, at which point
-            # normal idle/walk/run switching resumes.
-            jump_animation="rifle_jump",
-            # RifleCrouch.glb (loaded below) - a static held pose (2
-            # identical keyframes, confirmed via raw glb inspection - not a
-            # cycle), not a speed-driven blend state, so it's its own param
-            # like jump_animation above rather than another `states` entry.
-            # PlayerModel.update() overrides BOTH bodies with it for as long
-            # as is_crouched (already passed below via player.is_crouched())
-            # reads True, resuming normal idle/walk/run switching the
-            # instant it reads False again.
-            crouch_animation="rifle_crouch",
+            upper_states=PLAYER_ANIMATION_STATES,
+            jump_animation="rifle_jump",       # held on both bodies while airborne
+            crouch_animation="rifle_crouch",   # held on both bodies while crouched
         )
-        # Matches torus_scene.py's own decorative rat.glb character's
-        # shading exactly (same flat "character["specular_strength"] = 0"
-        # mutation there) - PlayerModel has no constructor knob for this
-        # (bind_material's own default is 1.0, a normal specular highlight),
-        # so it's set directly on the obj dict here, same as the decorative
-        # one does.
         if local_player_model.obj is not None:
-            local_player_model.obj["specular_strength"] = 0
-        # First-person arms (see Modules/Player/viewmodel.py) - drawn only
-        # while the camera is in first person, tinted with the same fur color.
+            local_player_model.obj["specular_strength"] = 0   # flat shading, like the torus scene's rat
         viewmodel = ViewModel(current_scene)
-        # rifleidle.glb/RifleWalkN.glb are separate pose-only exports sharing
-        # rat.glb's own armature (see load_additional_animations) - both
-        # files happen to name their one clip "New" (same name rat.glb's own
-        # base clip already uses), hence the rename to keep all three
-        # distinct on the merged skeleton.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/rifleidle.glb",
-            rename={"New": "rifle_idle"},
-            time_scale=RAT_ANIM_TIME_SCALE,
-        )
-        # RifleWalkN.glb specifically has ALREADY been re-exported at a
-        # correct 30fps (confirmed: its own keyframes are spaced at exactly
-        # 1/30s, unlike rat.glb/rifleidle.glb above, still at 1/24s) - no
-        # time_scale correction here, or this would double-correct an
-        # already-fixed file and play it 20% too fast.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleWalkN.glb",
-            rename={"New": "rifle_walk"},
-        )
-        # RifleWalkS.glb/RifleWalkE.glb - re-exported since this was first
-        # wired in and now BOTH already bake at a correct 30fps (confirmed
-        # via raw glb inspection: 28 keyframes/0.9s and 23 keyframes/0.7333s
-        # respectively, both exactly 30fps) - no time_scale correction, same
-        # as RifleWalkN.glb.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleWalkS.glb",
-            rename={"New": "rifle_walk_s"},
-        )
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleWalkE.glb",
-            rename={"New": "rifle_walk_e"},
-        )
-        # RifleWalkW.glb - unlike S/E above, still baked at 24fps (confirmed:
-        # 18 keyframes over 0.7083s), so it still needs the correction or it
-        # plays 25% slower than intended.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleWalkW.glb",
-            rename={"New": "rifle_walk_w"},
-            time_scale=RAT_ANIM_TIME_SCALE,
-        )
-        # RifleWalkNE/NW/SE/SW.glb - each of these bundles 34 clips (a full
-        # animation library re-export, not just the one directional pose),
-        # all byte-identical to each other across the 4 files EXCEPT the one
-        # literally named "New" - confirmed by directly comparing every
-        # clip's keyframe data across all 4 files. That's the same clip name
-        # every other single-pose file here (rifleidle.glb, RifleWalkN.glb,
-        # etc.) uses for its real authored pose, so it's used here too rather
-        # than the more prominent-looking "Diag" clip, which turned out to be
-        # byte-for-byte identical junk shared by all 4 files (a leftover
-        # reference/placeholder track, not the actual walk motion). All 4
-        # confirmed at 24fps via the same keyframe-spacing check as
-        # RifleWalkW.glb above, so all 4 need the correction.
-        for _direction, _filename in (
-            ("ne", "RifleWalkNE.glb"),
-            ("nw", "RifleWalkNW.glb"),
-            ("se", "RifleWalkSE.glb"),
-            ("sw", "RifleWalkSW.glb"),
-        ):
+        for filename, clip, fix_fps in RIFLE_POSES:
             current_scene.load_additional_animations(
-                local_player_model.obj,
-                f"Assets/Animations/Poses/Rifle/{_filename}",
-                rename={"New": f"rifle_walk_{_direction}"},
-                time_scale=RAT_ANIM_TIME_SCALE,
-            )
-        # RifleRunN.glb - also already baked at a correct 30fps (confirmed
-        # the same way as RifleWalkN.glb), no time_scale correction needed.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleRunN.glb",
-            rename={"New": "rifle_run"},
-        )
-        # RifleJump.glb - confirmed already baked at a correct 30fps (same
-        # raw-keyframe-spacing check as RifleWalkN.glb/RifleRunN.glb), no
-        # time_scale correction needed.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleJump.glb",
-            rename={"New": "rifle_jump"},
-        )
-        # RifleCrouch.glb - a static pose (its own first/last keyframe are
-        # identical, confirmed via raw glb inspection), so its authored
-        # frame rate/duration don't matter - no time_scale correction needed.
-        current_scene.load_additional_animations(
-            local_player_model.obj,
-            "Assets/Animations/Poses/Rifle/RifleCrouch.glb",
-            rename={"New": "rifle_crouch"},
-        )
-        # Emotes.glb's own clips become the radial wheel's catalogue directly -
-        # no hardcoded name list anywhere: whatever's actually in the file is
-        # what the wheel shows (see PlayerModel.play_emote's own docstring and
-        # EmoteWheel.set_pages). No rename needed - confirmed none of its clip
-        # names (Breakdance, Criss Cross, Gagnam Style, Griddy, Quagmire today)
-        # collide with any name already merged onto rat.glb's skeleton.
+                local_player_model.obj, f"{RIFLE_POSE_DIR}/{filename}", rename={"New": clip},
+                time_scale=RAT_ANIM_TIME_SCALE if fix_fps else 1.0)
+        # Whatever clips Emotes.glb holds become the emote wheel's catalogue (none collide with the names above).
         emote_catalogue = current_scene.load_additional_animations(
             local_player_model.obj, "Assets/Animations/Emotes/Emotes.glb",
         )
         emote_wheel.set_pages(emote_catalogue)
-        # Third-person mode - see Modules/Camera/camera_boom_arm.py. Off by
-        # default (first person): the local player's own model stays
-        # shadow-only (visible_in_color=False above) until begin_death/
-        # end_death flip it (no manual toggle any more - see the module-level
-        # third_person's own comment).
         third_person = False
         boom_arm = CameraBoomArm(current_scene.physics)
 
-        # The current weapon decides everything about how the player holds it:
-        # its gun and arm animations on the first-person viewmodel, its world
-        # model in the character's hand, and the pose of the player rig's upper
-        # body (plus that pose's rotation corrections - see WeaponsBase).
-        # force=True: a fresh map means a fresh scene/player_model to equip
-        # onto even if the SLOT itself (inventory.index) hasn't changed - the
-        # ammo/reload state on the weapon itself carries over unaffected
-        # (the inventory is built once, outside setup_game, not recreated
-        # per map).
+        # force=True: a fresh scene/player model needs equipping even though the slot is unchanged.
         switch_weapon(inventory.index, force=True)
-        # Prime every OTHER slot too (loads its models/animations WITHOUT
-        # showing them or disturbing the real current weapon's pose - see
-        # equip_player/equip_viewmodel's own activate=False), so the FIRST
-        # scroll to it is just as instant as every switch after - see
-        # switch_weapon's own docstring for why a switch between
-        # already-primed weapons has no loading cost at all.
+        # Load every other carried weapon too (hidden), so the first switch to it doesn't hitch.
         for other in inventory.weapons:
             if other is not weapon:
                 prime_weapon(other)
-        # Bake every weapon's clips now, so the first draw/reload/switch doesn't
-        # hitch (see ViewModel.warm_animations).
-        viewmodel.warm_animations()
+        viewmodel.warm_animations()   # bake every clip now, not at the first draw/reload
 
     def prime_weapon(other):
         """Loads a carried weapon's models/animations without showing it (see setup_game)."""
@@ -680,18 +342,9 @@ def main():
         return f"Gave {get_weapon_class(weapon_id).name}."
 
     def switch_weapon(slot_index, force=False):
-        """Switches to inventory slot slot_index (a no-op if it's already
-        out, unless force) - the initial equip in setup_game above (which
-        also primes every OTHER slot up front, right after), and every
-        later scroll-wheel switch (see the main loop).
-
-        The outgoing weapon (if any) is only DEACTIVATED (hidden), not
-        unequipped - WeaponsBase.equip_player/equip_viewmodel both notice a
-        weapon that's already primed for the current scene and just
-        reactivate it instead of reloading anything, which is what makes
-        switching back and forth near-instant instead of the load-time
-        stutter a full unequip/re-equip cycle used to cause on every single
-        switch (see WeaponsBase.equip_player's own docstring)."""
+        """Switches to inventory slot slot_index (a no-op if it's already out, unless force). The outgoing weapon
+        is only hidden; equipping one that's already primed for this scene just reactivates it, so switching
+        costs no loading."""
         nonlocal weapon
         if not force and weapon is not None and slot_index % len(inventory) == inventory.index:
             return
@@ -701,23 +354,11 @@ def main():
         net_mgr.local_weapon = weapon_id_of(type(weapon))      # so other players draw the same gun
         weapon.equip_viewmodel(viewmodel)
         weapon.equip_player(current_scene, local_player_model)
-        # equip_player always shows the new weapon's world model (WeaponsBase.set_active has no
-        # idea whether the local player is first- or third-person) - mask it back down to match.
-        # Covers the very first equip too (third_person defaults False, so this hides it
-        # immediately instead of it being visible in first person).
         apply_third_person_visibility()
 
     def spawn_test_dummy():
-        """The test dummy: reuses RemotePlayer wholesale (the same model,
-        hitboxes - body AND head, for headshot testing too - weapon, gib-on-
-        death and auto-hide/show-again machinery a real remote player gets)
-        rather than building any of that again - see the shooting code's own
-        dummy branch for how a hit on it is turned into a kill without any
-        network traffic at all (it isn't a real match participant). NOT
-        spawned automatically - only the /adddummy command (see
-        Modules/Chat/commands.py) calls this, so it never shows up
-        uninvited. Calling it again while one's already up replaces it
-        (fresh position/state) rather than stacking a second one."""
+        """/adddummy: a RemotePlayer standing near spawn (same model, hitboxes, gibs and dissolve as a real one),
+        hit locally with no network traffic. Replaces an existing dummy."""
         nonlocal test_dummy
         if current_scene is None:
             return "No map loaded."
@@ -736,18 +377,13 @@ def main():
         dummy_state["pos"] = (dummy_xz[0], dummy_feet_y, dummy_xz[1])
         test_dummy = RemotePlayer(current_scene, TEST_DUMMY_STEAM_ID)
         test_dummy.name = "Test Dummy"
-        test_dummy.receive_state({
-            "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
-            "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0, "x": 0, "a": 1,
-        })
+        test_dummy.receive_state(dummy_packet(alive=True))
+
         def dummy_died(pos, vel, color, damage_class):
-            if get_damage_class(damage_class).death_effect == DISSOLVE:
-                pass   # the RemotePlayer dissolve state machine (shared - test_dummy IS one) handles the body itself
-            elif current_scene.gibs is not None:
+            # A dissolve is handled by RemotePlayer's own dissolve state machine.
+            if get_damage_class(damage_class).death_effect != DISSOLVE and current_scene.gibs is not None:
                 current_scene.gibs.spawn(pos, vel, push=dummy_state.get("push"), tint=color)
             if damage_class == "smite":
-                # Only /smite's own damage class (Smite) gets the lightning strike - a plain
-                # Zap (a weapon's) is just the dissolve.
                 spawn_smite(pos)
         test_dummy.on_death = dummy_died
         test_dummy.on_dissolve_spark = spawn_dissolve_spark_burst
@@ -757,73 +393,45 @@ def main():
     ui = UIManager(window)
     ui_demo = build_demo(ui)
 
-    # The scope sight picture, full-screen (Reticle.png is authored at 1920x1080, a
-    # vignette mask + reticle lines meant to cover the whole view, not a small centred
-    # icon) - shown instead of the crosshair once a scoped weapon's ADS has FULLY eased
-    # in (WeaponsBase.scoped), replacing the ordinary crosshair for "looking through the
-    # sight" rather than overlaying it. ScopeOverlay (not a plain Image) fits the
-    # image's own aspect ratio undistorted and extends its border to cover whatever's
-    # left over on a non-16:9 window instead of stretching it - see its own docstring.
-    # Added FIRST, before every other HUD element below (ui.root paints children in
-    # add order, so whatever's added first sits at the very back) - it's a full-screen
-    # overlay meant to sit UNDER the real HUD (health bar, weapon HUD, kill feed, ...),
-    # not cover any of it. Added here, not where it's used lower down, specifically so
-    # a later HUD element never accidentally lands behind it again the same way the
-    # health bar did when this used to be added after it.
+    # The full-screen scope sight picture, shown instead of the crosshair once ADS has fully eased in. Added
+    # first so it sits behind every other HUD element (ui.root draws children in add order).
     reticle = ui.root.add(ScopeOverlay("Assets/Textures/UI/Reticle.png", visible=False))
 
-    # TEMPORARY health bar - a placeholder until a real damage system exists.
-    # H takes 10 damage, J heals 10 (see on_key_down); nothing else reads or
-    # writes `health` yet. Hidden on the main menu, shown once a map starts.
     name_tags = NameTags(ui)
     scoreboard = Scoreboard(ui)
-    health ={"value": 100.0, "max": 100.0}
+    health = {"value": 100.0, "max": 100.0}
     health_bar = ProgressBar(
         value=health["value"], max_value=health["max"], label_format="{value:.0f} / {max:.0f}",
         anchor=Anchor.BOTTOM_LEFT, offset=(130, -49), size=(300, 26), visible=False,
         fill_color=(90, 200, 110, 255),
     )
     ui.root.add(health_bar)
-    # Round countdown, top-right - see GameMode.round_remaining's own
-    # docstring (Steam-lobby-metadata-backed, so it stays correct even
-    # across a host handoff). Text is set every frame in the main loop
-    # below; this label's own .visible only covers "in a game at all"
-    # (same on/off points as health_bar) - the main loop ALSO hides it
-    # specifically whenever the active mode has no round_duration set
-    # (round_remaining() returns None), so it never sits there blank.
-    # No explicit pivot needed - Widget's own default pivot is just
-    # whatever anchor is (see widgets.py), which for TOP_RIGHT already
-    # means "the label's own top-right corner sits at the anchor point",
-    # i.e. it grows leftward/won't run off the right edge of the screen.
+    # Round countdown, top-right - also hidden whenever the mode has no round timer (round_remaining() is None).
     round_timer_label = ui.root.add(Label(
         "", font_size=30, color=(255, 255, 255, 255), align="right",
         anchor=Anchor.TOP_RIGHT, offset=(-16, 16), visible=False,
     ))
-    # Screen-centre crosshair; its gap is the current weapon's real spread.
-    crosshair = ui.root.add(Crosshair(visible=False))
-    # Current weapon + ammo, bottom-right, with the other weapon slots shown
-    # dim above it - see Modules/UI/weapon_hud.py. Shown/hidden alongside
-    # the crosshair; updated every frame from the shooting code below.
-    weapon_hud = ui.root.add(WeaponHUD())
-    # Diagonal ticks over the crosshair when one of our shots hits another player.
-    hitmarker = ui.root.add(Hitmarker())
-    # Arrow on a ring around the crosshair pointing at whoever just shot US (see
-    # Modules/UI/damage_indicator.py) - updated every frame from the camera below,
-    # triggered from on_damaged.
-    damage_indicator = ui.root.add(DamageIndicator())
-    # F9: a live breakdown of where each frame's time goes (see Modules/Debug/frame_profiler.py).
-    prof = FrameProfiler()
+    crosshair = ui.root.add(Crosshair(visible=False))   # its gap is the current weapon's real spread
+    weapon_hud = ui.root.add(WeaponHUD())   # current weapon + ammo, other slots dim above it
+    hitmarker = ui.root.add(Hitmarker())   # ticks over the crosshair when one of our shots hits a player
+    damage_indicator = ui.root.add(DamageIndicator())   # arrow pointing at whoever just hurt us
+    game_hud = (health_bar, round_timer_label, crosshair, weapon_hud, name_tags)   # shown only in a match
+
+    def set_game_hud_visible(on):
+        for widget in game_hud:
+            widget.visible = on
+
+    def point_damage_indicator(source):
+        """Points the damage indicator at a world position."""
+        to_source = glm.vec3(source) - camera.position
+        damage_indicator.trigger((to_source.x, to_source.z))
+    prof = FrameProfiler()   # F9: where each frame's time goes (Modules/Debug/frame_profiler.py)
     profile_label = ui.root.add(Label("", font_size=17, color=(255, 255, 170, 255), visible=False, offset=(14, 14)))
     hit_sound_channel = [None]   # every hit plays on the same channel, cutting off the last
     kill_sound_channel = [None]  # ditto, for Kill.wav
-    # Kill feed, top-left - see net_mgr.on_killfeed wiring below.
     kill_feed = ui.root.add(KillFeed())
-    # Text chat + admin commands (Modules/Chat/commands.py) - Enter opens it
-    # (see on_key_down), bottom-left. commands_ctx is filled in below once
-    # change_health/spawn_test_dummy exist; the callables inside are only
-    # ever invoked later, once chat is actually used, so the empty dict here
-    # is fine in the meantime (mirrors particles.raycast's own forward
-    # reference to current_scene just above setup_game).
+    # Text chat + admin commands (Modules/Chat/commands.py). commands_ctx is filled in further down; it's only
+    # read once someone actually runs a command.
     commands_ctx = {}
     chatbox = ui.root.add(ChatBox(
         is_admin=lambda: commands.is_admin(net_mgr.local_steam_id),
@@ -832,21 +440,13 @@ def main():
         ctx=commands_ctx,
     ))
 
-    # Dying: health reaching 0 (from any source) flags `pending`; the main loop starts
-    # the death at a safe point (begin_death) and ends it (end_death) when the
-    # screen's countdown runs out. `eye_drop` eases the camera down to the floor.
+    # Dying: health reaching 0 flags `pending`; the main loop starts the death at a safe point (begin_death) and
+    # ends it (end_death) when the death screen's countdown runs out. `eye_drop` eases the camera to the floor.
+    # smite/damage_class are set by whatever is about to kill us, and read (and reset) by begin_death.
     death = {"pending": False, "active": False, "eye_drop": 0.0, "push": None, "push_time": 0.0,
-             "smite": False,          # set by smite_self right before the killing change_health call
-             "damage_class": "bullet"}   # set by whatever's ABOUT to kill us - on_damaged/kill_self/
-                                          # smite_self/explode's own self-damage branch, right before
-                                          # each one's own change_health call - begin_death reads and
-                                          # resets it once the death it names actually happens
+             "smite": False, "damage_class": "bullet"}
     death_screen = ui.root.add(DeathScreen(RESPAWN_SECONDS))
-    # Radial emote wheel (hold B) - built once here, same as every other full-
-    # screen UI widget; its actual pages (the auto-discovered emote catalogue)
-    # aren't known until setup_game loads Emotes.glb onto local_player_model,
-    # so set_pages() is called from there, not here - see that call site.
-    emote_wheel = ui.root.add(EmoteWheel())
+    emote_wheel = ui.root.add(EmoteWheel())   # hold B; its pages come from Emotes.glb in setup_game
     # ESC in a game: resume / disconnect to the main menu / quit. Added last so it draws on top.
     pause = {"on": False, "quit": False}
     pause_menu = ui.root.add(PauseMenu(
@@ -863,63 +463,32 @@ def main():
         if health["value"] <= 0.0 and not death["active"]:
             death["pending"] = True
 
-    # The game starts on the main menu and loads nothing else. Host/Join
-    # (see Modules/UI/lobby_menu.py) talk to NetworkManager - created here,
-    # before any map exists, since the menu needs Steam callbacks pumped -
-    # and once a lobby is hosted/joined the menu reports the chosen map via
-    # request_start. The real work (setup_game: map, player, models, each
-    # behind its own loading frame) runs from the main loop, not inside
-    # that callback, which can fire from inside Steam's callback dispatch.
+    def kill_local(damage_class):
+        """Kills the local player outright (a command, or falling out of the map)."""
+        death["damage_class"] = damage_class
+        change_health(-(health["max"] + 1.0))
+
+    # The game starts on the main menu with nothing else loaded. The menu talks to NetworkManager (it needs Steam
+    # callbacks pumped) and reports the chosen map via request_start; the load itself runs from the main loop,
+    # not from inside that callback (which can fire during Steam's callback dispatch).
     MAPS = [("Boardwalk", "mainmap"), ("Sewer", "sewer")]
-    # (display name, id) for every registered Modules.GameModes class - built
-    # from the registry itself (game_mode_ids/get_game_mode_class), not a
-    # hand-maintained list like MAPS above, so a new mode shows up in the
-    # host-lobby mode dropdown (see lobby_menu.py) automatically just by
-    # existing (and being imported in Modules/GameModes/__init__.py - see
-    # registry.py's own module docstring on why that line is required).
-    # Cheese War first in the mode dropdown, the rest in registry order.
+    # Every registered game mode (Modules/GameModes - remember its __init__ import), Cheese War first.
     MODES = [(get_game_mode_class(mode_id).name, mode_id)
              for mode_id in sorted(game_mode_ids(), key=lambda m: m != "cheese_war")]
     in_menu = True
-    # True while the lobby waiting room (Modules/UI/lobby_room.py) is
-    # showing - a third main-loop state alongside in_menu/gameplay, set
-    # by menu_scene.build_ui's own on_lobby_enter/on_lobby_leave hooks
-    # (see its own docstring). Every existing "not in_menu" gameplay-
-    # input gate below also excludes this, same reasoning as in_menu
-    # itself: no gameplay hotkey should fire while just waiting to start.
-    in_lobby = False
+    in_lobby = False   # the lobby waiting room - gameplay keys are off there too
     pending_start = None
     net_mgr = NetworkManager(camera, None)
-    # The active game mode: decides (re)spawn position and owns scoring's
-    # display (see Modules/GameModes/game_mode.py). Deathmatch/SPAWN_POSITION
-    # here is only ever the PRE-LOBBY placeholder (scoreboard/on_kill etc. all
-    # read this variable even before any real match has started) - request_
-    # start/start_game below reassign it (via create_game_mode) to whichever
-    # mode the host actually picked, every time a real game starts.
+    # A placeholder until a match starts - start_game replaces it with the mode the host picked.
     game_mode = Deathmatch(net_mgr, spawn_points=[SPAWN_POSITION])
 
     def dummy_or_display_name(steam_id):
         return "Test Dummy" if steam_id == TEST_DUMMY_STEAM_ID else net_mgr.display_name(steam_id)
 
     def show_kill_feed(killer_id, victim_id, weapon_name, headshot, play_sound=True):
-        """A row in the kill feed (see Modules/UI/killfeed.py) - shown to
-        EVERY player for EVERY kill (net_mgr.on_killfeed below fires this the
-        same way on every client - see NetworkManager's own _broadcast_kill/
-        _receive_killfeed), plus the local-only "we got a kill" feedback -
-        Kill.wav, universal=True like the hitmarker's own feedback sound, so
-        only WE hear it, not something other players' games play - for a kill
-        WE scored. Also the path a hit on TEST_DUMMY takes directly (see the
-        shooting code below), bypassing the network entirely since that's a
-        local-only target, not a real match kill.
-
-        play_sound=False skips Kill.wav specifically - kill_dummy passes this for a smite
-        (damage_class == "smite"): KILL_SOUND_GAIN=4.0 and universal=True (always full volume,
-        no distance falloff at all) means it reliably drowns out spawn_smite's own positional
-        explosion/thunder pair playing at the very same instant - confirmed by a smite on
-        anyone OTHER than yourself (which routes through here) being effectively inaudible
-        over it, while smiting yourself (which never calls show_kill_feed at all - no kill
-        credit for a suicide) let the explosion come through clearly. The visual kill feed
-        entry itself is unaffected either way."""
+        """A kill feed row (every client shows every kill), plus Kill.wav when the kill is ours. Kill.wav is
+        loud and has no falloff, so play_sound=False (a smite) keeps it from drowning out the smite's own
+        explosion and thunder."""
         killer_name = dummy_or_display_name(killer_id)
         victim_name = dummy_or_display_name(victim_id)
         kill_feed.add_kill(
@@ -940,18 +509,14 @@ def main():
     net_mgr.on_chat = lambda sender_id, text: chatbox.push_message(net_mgr.display_name(sender_id), text)
     net_mgr.on_player_joined = lambda steam_id, name: chatbox.push_system(f"{name} joined the game")
     net_mgr.on_player_left = lambda steam_id, name: chatbox.push_system(f"{name} left the game")
-    # An admin's /kill <player> targeting a REAL remote player (see
-    # kill_player below) arrives here on THAT player's own client - we only
-    # ever act on it if the sender really is the hardcoded admin (checked
-    # independently on this end, not trusted from the sender - see
-    # NetworkManager.send_admin_kill's own docstring).
+    # An admin's /kill or /smite aimed at us arrives here; the sender is checked on this end, not trusted.
     net_mgr.on_admin_kill = (
         lambda sender_id, damage_class="bullet":
-            (smite_self() if damage_class == "smite" else kill_self()) if commands.is_admin(sender_id) else None)
+            kill_by_name("", "smite" if damage_class == "smite" else "bullet")
+            if commands.is_admin(sender_id) else None)
 
     def damage_dummy(amount, weapon_name="", headshot=False, push=None, damage_class="bullet"):
-        """Hurts the test dummy like a real player: it has TEST_DUMMY_HEALTH and only
-        dies (kill_dummy) once that's gone. Ignored if there's no dummy or it's already down."""
+        """Hurts the test dummy like a real player: it dies once its TEST_DUMMY_HEALTH is gone."""
         if test_dummy is None or test_dummy.dead:
             return
         dummy_state["health"] -= amount
@@ -959,69 +524,44 @@ def main():
             kill_dummy(weapon_name, headshot, push=push, damage_class=damage_class)
 
     def spawn_smite(position):
-        """The /smite effect at `position` - a lightning strike (Modules/Particles/lightning.py:
-        a bright flash + a burst of electric arcs) plus the explosion/thunder sound pair, at
-        this project's own converted-from-Minecraft attenuation (see SMITE_EXPLOSION_RANGE/
-        SMITE_THUNDER_RANGE's own comment). Always called LOCALLY, once per client that needs
-        to actually show/hear it - the local player's own death (begin_death), the test
-        dummy's (kill_dummy), and every remote player's (remote_death, driven by the smite
-        flag on their death packet - see NetworkManager.notify_death) - never sent over the
-        network itself; the DEATH is what's replicated, and each client reacts to it."""
-        particles.spawn("smite_flash", position)
-        particles.spawn("smite_bolt", position)
-        particles.spawn("smite_bolt_sky", position)
-        particles.spawn("smite_crackle", position)
-        current_scene.sound_manager.add_sound(
-            SMITE_EXPLOSION_SOUND, position, min_distance=1.0, max_distance=SMITE_EXPLOSION_RANGE,
-            loop=False, falloff="inverse")
-        current_scene.sound_manager.add_sound(
-            SMITE_THUNDER_SOUND, position, min_distance=1.0, max_distance=SMITE_THUNDER_RANGE,
-            loop=False, falloff="inverse")
+        """The /smite effect: a lightning strike plus the explosion/thunder pair. Never sent over the network -
+        each client plays it locally when it learns of a smite death."""
+        for system in ("smite_flash", "smite_bolt", "smite_bolt_sky", "smite_crackle"):
+            particles.spawn(system, position)
+        for sound, max_distance in ((SMITE_EXPLOSION_SOUND, SMITE_EXPLOSION_RANGE),
+                                    (SMITE_THUNDER_SOUND, SMITE_THUNDER_RANGE)):
+            current_scene.sound_manager.add_sound(
+                sound, position, min_distance=1.0, max_distance=max_distance, loop=False, falloff="inverse")
 
     def spawn_dissolve_spark_burst(position):
-        """One spark/glow burst at `position` (Modules/Particles/dissolve_sparks.py) - the
-        ambient dust, fired LOCALLY, purely visual, every DISSOLVE_SPARK_INTERVAL while a
-        Zap-dissolving body is still animating (see RemotePlayer.on_dissolve_spark, wired up
-        below for both the test dummy and every real remote player) - same "each client
-        reacts locally, nothing extra goes over the network" shape as spawn_smite above."""
+        """Ambient sparks/glow on a Zap-dissolving body (fired periodically by RemotePlayer, purely local)."""
         particles.spawn("dissolve_spark", position)
         particles.spawn("dissolve_glow", position)
 
     def spawn_dissolve_arc(position):
-        """One tesla-arc burst at `position` (Modules/Particles/dissolve_sparks.py) - the
-        actual "electricity" read, kept separate from spawn_dissolve_spark_burst above since
-        RemotePlayer fires this one several times at once from different points on the body,
-        on its own (faster-ramping) interval - see RemotePlayer.on_dissolve_arc/
-        DISSOLVE_ARC_INTERVAL_START's own docstring."""
+        """One tesla arc on a dissolving body (RemotePlayer fires several at once, on its own interval)."""
         particles.spawn("dissolve_arc", position)
 
     def kill_dummy(weapon_name="", headshot=False, push=None, damage_class="bullet"):
-        """Kills the test dummy right now, if one's up and not already down -
-        shared by a real hit on it (see the shooting code below) and the
-        /kill (or /smite) command's own player-target path (kill_player/smite_player).
-        damage_class picks gibs vs. a dissolve - see dummy_died/Modules/Weapons/
-        damage_classes.py."""
+        """Kills the test dummy now (a fatal hit, or /kill / /smite naming it). damage_class picks gibs or a
+        dissolve."""
         if test_dummy is None:
             return "No test dummy - use /adddummy first."
         if test_dummy.dead:
             return "The test dummy is already down."
         dummy_state["deaths"] += 1
-        dummy_state["push"] = push      # the gibs' shove (see spawn_test_dummy's on_death)
-        test_dummy.receive_state({
-            "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
-            "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0,
-            "x": dummy_state["deaths"], "a": 0, "dc": str(damage_class),
-        })
+        dummy_state["push"] = push      # the gibs' shove (see spawn_test_dummy's dummy_died)
+        test_dummy.receive_state(dummy_packet(alive=False, damage_class=damage_class))
         dummy_state["respawn_at"] = time.perf_counter() + TEST_DUMMY_RESPAWN_SECONDS
         show_kill_feed(net_mgr.local_steam_id, TEST_DUMMY_STEAM_ID, weapon_name, headshot,
                        play_sound=damage_class != "smite")
         return "Test dummy killed."
 
     def explode(source_weapon, hit):
-        """Sets off source_weapon.explosion where `hit` landed: everyone inside its radius
-        takes damage (the shooter only a proportion of it, see Explosion) and, if it kills
-        them, their gibs are thrown away from the blast."""
+        """Sets off source_weapon.explosion where `hit` landed: everyone inside its radius takes damage (the
+        shooter only a proportion of it, see Explosion) and, if it kills them, their gibs fly away from it."""
         explosion = source_weapon.explosion
+        damage_class = source_weapon.damage_class.name
         origin = glm.vec3(hit.position) + glm.vec3(hit.normal) * 0.1     # just off the surface
         targets = [(steam_id, other.body_center) for steam_id, other in net_mgr.remote_players.items()
                    if not other.dead]
@@ -1034,111 +574,65 @@ def main():
         hurt_someone = False
         for blast in blast_hits:
             if blast.is_invoker:
-                death["damage_class"] = source_weapon.damage_class.name
+                death["damage_class"] = damage_class
                 change_health(-blast.damage)
-                # Self-damage from our OWN explosion never goes through net_mgr.on_damage at
-                # all (nothing to send - we already know about it) - that's the only other
-                # place a hit normally triggers the damage indicator, so it needs triggering
-                # directly here instead, pointed at the blast itself (origin), not some
-                # notion of "attacker" (that's also us, standing wherever we fired FROM, not
-                # where the blast actually was - origin is the only reading that makes sense
-                # for your own splash catching you).
-                to_blast = origin - camera.position
-                damage_indicator.trigger((to_blast.x, to_blast.z))
+                controls.rumble(RUMBLE_DAMAGE, blast.damage / 40.0)
+                point_damage_indicator(origin)   # our own splash never comes through net_mgr.on_damage
             elif blast.target_id == TEST_DUMMY_STEAM_ID:
                 hurt_someone = True
-                damage_dummy(blast.damage, source_weapon.name, False, push=blast.push,
-                            damage_class=source_weapon.damage_class.name)
+                damage_dummy(blast.damage, source_weapon.name, False, push=blast.push, damage_class=damage_class)
             else:
                 hurt_someone = True
                 net_mgr.send_damage(blast.target_id, blast.damage, source_weapon.name, push=blast.push,
-                                    damage_class=source_weapon.damage_class.name, origin=tuple(origin))
+                                    damage_class=damage_class, origin=tuple(origin))
         if hurt_someone:
             hitmarker.trigger(headshot=False)
 
-    def kill_self():
-        """The /kill command's default (no argument) - suicide, for testing
-        death/respawn without needing something around to shoot you. Also
-        what a REMOTE admin-kill (see net_mgr.on_admin_kill above) runs on
-        the targeted player's own client."""
+    def die_by_command(damage_class, message):
+        """/kill or /smite on ourselves (also what an admin's remote /kill or /smite runs here). Always this
+        damage class, never whatever an earlier survived hit left in death["damage_class"]."""
         if death["active"] or death["pending"]:
             return "You're already dead."
-        # Explicit, not relying on whatever's left over from a previous non-fatal hit - a
-        # player who took Zap damage earlier and survived, then used /kill on themselves,
-        # should die a plain death, not dissolve from a hit that didn't actually kill them.
-        death["damage_class"] = "bullet"
-        change_health(-(health["max"] + 1.0))
-        return "You died."
-
-    def smite_self():
-        """/smite's default (no argument) - same as kill_self but marks the death as a smite
-        (begin_death reads death["smite"] and both shows the lightning locally and tells
-        notify_death to replicate it) and its damage class as Smite (a Zap dissolve instead of gibs -
-        see begin_death/remote_death's own damage_class branch) - also what a remote
-        /smite <player> (see net_mgr.on_admin_kill above) runs on the targeted player's own
-        client."""
-        if death["active"] or death["pending"]:
-            return "You're already dead."
-        death["smite"] = True
-        death["damage_class"] = "smite"
-        change_health(-(health["max"] + 1.0))
-        return "Smitten."
+        death["smite"] = damage_class == "smite"   # begin_death shows the lightning and replicates it
+        kill_local(damage_class)
+        return message
 
     def kill_targets():
-        """Candidate names for /kill's own argument (see commands.Command's
-        arg_source docstring) - yourself, the test dummy if it's up, and
-        every other connected player."""
+        """Autocomplete candidates for /kill and /smite: you, the test dummy if it's up, and everyone else."""
         names = [net_mgr.display_name(net_mgr.local_steam_id)]
         if test_dummy is not None and not test_dummy.dead:
             names.append("Test Dummy")
-        names.extend(
-            player.name or net_mgr.display_name(steam_id)
-            for steam_id, player in net_mgr.remote_players.items()
-        )
+        names.extend(other.name or net_mgr.display_name(steam_id)
+                     for steam_id, other in net_mgr.remote_players.items())
         return names
 
-    def kill_player(name):
-        """/kill <name>'s own dispatch: resolves name (case-insensitive) to
-        yourself, the test dummy, or another connected player, and kills
-        whichever it is. A remote player can only ever be told to kill
-        THEMSELVES (see NetworkManager.send_admin_kill) - there's no way to
-        reach into their game and do it directly - so that branch can only
-        ever report the request was sent, not that it actually happened."""
+    def kill_by_name(name, damage_class):
+        """/kill or /smite [name] (damage_class "bullet" or "smite"): you, the test dummy, or another player. A
+        remote player can only be asked to kill themselves (NetworkManager.send_admin_kill), so that case only
+        reports the request was sent."""
+        smite = damage_class == "smite"
         target = name.strip().lower()
         if target in ("", "me", "you", "self", net_mgr.display_name(net_mgr.local_steam_id).lower()):
-            return kill_self()
+            return die_by_command(damage_class, "Smitten." if smite else "You died.")
         if target in ("dummy", "test dummy"):
-            return kill_dummy("/kill")
-        for steam_id, player in net_mgr.remote_players.items():
-            if (player.name or "").lower() == target:
-                if net_mgr.send_admin_kill(steam_id):
-                    return f"Kill request sent to {player.name}."
-                return f"Couldn't reach {player.name}."
+            return kill_dummy("/smite" if smite else "/kill", damage_class=damage_class)
+        for steam_id, other in net_mgr.remote_players.items():
+            if (other.name or "").lower() == target:
+                if net_mgr.send_admin_kill(steam_id, damage_class=damage_class):
+                    return f"{'Smite' if smite else 'Kill'} request sent to {other.name}."
+                return f"Couldn't reach {other.name}."
         return f"No connected player named '{name}'."
 
-    def smite_player(name):
-        """/smite <name>'s own dispatch - identical shape to kill_player, just marking the
-        death (or the remote request) as a smite instead of a plain kill."""
-        target = name.strip().lower()
-        if target in ("", "me", "you", "self", net_mgr.display_name(net_mgr.local_steam_id).lower()):
-            return smite_self()
-        if target in ("dummy", "test dummy"):
-            return kill_dummy("/smite", damage_class="smite")
-        for steam_id, player in net_mgr.remote_players.items():
-            if (player.name or "").lower() == target:
-                if net_mgr.send_admin_kill(steam_id, damage_class="smite"):
-                    return f"Smite request sent to {player.name}."
-                return f"Couldn't reach {player.name}."
-        return f"No connected player named '{name}'."
-
-    commands_ctx["add_dummy"] = spawn_test_dummy
-    commands_ctx["give_weapon"] = give_weapon
-    commands_ctx["weapon_ids"] = weapon_ids
-    commands_ctx["kill_self"] = kill_self
-    commands_ctx["kill_player"] = kill_player
-    commands_ctx["kill_targets"] = kill_targets
-    commands_ctx["smite_self"] = smite_self
-    commands_ctx["smite_player"] = smite_player
+    commands_ctx.update(
+        add_dummy=spawn_test_dummy,
+        give_weapon=give_weapon,
+        weapon_ids=weapon_ids,
+        kill_targets=kill_targets,
+        kill_self=lambda: kill_by_name("", "bullet"),
+        kill_player=lambda name: kill_by_name(name, "bullet"),
+        smite_self=lambda: kill_by_name("", "smite"),
+        smite_player=lambda name: kill_by_name(name, "smite"),
+    )
     tracers = Tracers(window.ctx)
     particles = ParticleManager(window.ctx, material_aliases=MATERIAL_ALIASES,
                                 radius_scale=RADIUS_SCALE, frame_filter=keep_frame,
@@ -1147,12 +641,12 @@ def main():
     particles.group_limits["tracer_spiral"] = 8   # a burst of shots can't pile up unlimited spiral effects
     particles.load("Assets/Particles/Muzzle/muzzleflashes.pcf")
     particles.load(IMPACT_FILE)
-    # Whatever particle files the weapons ask for (see WeaponsBase.particle_files).
-    for weapon_id in weapon_ids():    # every weapon, not just carried ones: other players' guns too
+    # Whatever particle files the weapons ask for - every weapon, not just carried ones: other players' guns too.
+    for weapon_id in weapon_ids():
         for pcf_path, system_names in get_weapon_class(weapon_id).particle_files.items():
             particles.load(pcf_path, only=system_names)
-    # The Gouda flash's ring is the one part of it the source effect doesn't lock to the muzzle: left
-    # free it drifts ahead of the gun and lingers as a ghost of the flash.
+    # The Gouda flash's ring is the one part the source effect doesn't lock to the muzzle: left free, it drifts
+    # ahead of the gun and lingers as a ghost of the flash.
     particles.lock_to_control_point("bo3_raygun_muzzleflash_ring")
     register_blood(particles)
     register_lightning(particles)
@@ -1163,25 +657,26 @@ def main():
     particles.raycast_fast = lambda ax, ay, az, bx, by, bz: (
         current_scene.physics.raycast_light(ax, ay, az, bx, by, bz) if current_scene is not None else None)
 
+    def spawn_shot_impact(gun, hit):
+        """The impact effect and sound where a shot from `gun` ended (hit may be None: a miss)."""
+        if gun.impact_particle and hit is not None:
+            particles.spawn_surface(gun.impact_particle, hit.position, hit.normal,
+                                    colors=gun.impact_color, size=gun.impact_size, group=IMPACT_GROUP)
+            play_impact_sound(current_scene.sound_manager, hit, gun=gun)
+        else:
+            spawn_impact(particles, hit, sound_manager=current_scene.sound_manager, gun=gun)
+
     def remote_shot(start, end, follow=None, shooter_weapon=None):
-        """Another player's shot, drawn with THEIR weapon's looks (tracer, impact, muzzle
-        flash - whichever gun they hold, see RemotePlayer): its tracer, a muzzle flash that
-        stays on their gun, and the impact where it ended (looked up here - only the end
-        point is sent)."""
+        """Another player's shot, drawn with their weapon's looks: tracer, muzzle flash on their gun, and the
+        impact where it ended (looked up here - only the end point is sent)."""
         shooter_weapon = shooter_weapon or WeaponsBase
         tracers.add(start, end, style=shooter_weapon.tracer_style)
         shooter_weapon.spawn_tracer_spiral(particles, start, end, camera_pos=camera.position)
         aim = glm.vec3(end) - glm.vec3(start)
         if glm.length(aim) > 1e-3:
             if current_scene is not None:
-                hit = current_scene.physics.raycast(start, glm.vec3(end) + glm.normalize(aim) * 0.1)
-                if shooter_weapon.impact_particle and hit is not None:
-                    particles.spawn_surface(
-                        shooter_weapon.impact_particle, hit.position, hit.normal,
-                        colors=shooter_weapon.impact_color, size=shooter_weapon.impact_size, group=IMPACT_GROUP)
-                    play_impact_sound(current_scene.sound_manager, hit, gun=shooter_weapon)
-                else:
-                    spawn_impact(particles, hit, sound_manager=current_scene.sound_manager, gun=shooter_weapon)
+                spawn_shot_impact(shooter_weapon,
+                                  current_scene.physics.raycast(start, glm.vec3(end) + glm.normalize(aim) * 0.1))
             if shooter_weapon.muzzle_particle:
                 particles.spawn(shooter_weapon.muzzle_particle, start, forward=aim,
                                 colors=shooter_weapon.muzzle_color, size=shooter_weapon.muzzle_size,
@@ -1189,8 +684,6 @@ def main():
     net_mgr.on_tracer = remote_shot
 
     def remote_footstep(material, position, volume, steam_id=None):
-        """Another player's footstep, replicated the same way as their shots/jumps - see
-        NetworkManager.notify_footstep/RemotePlayer's own docstrings."""
         if current_scene is not None:
             current_scene.play_footstep_sound(material, position, volume=volume, character=steam_id)
     net_mgr.on_footstep = remote_footstep
@@ -1198,14 +691,8 @@ def main():
     net_mgr.on_dissolve_arc = spawn_dissolve_arc
 
     def remote_death(position, velocity, color=None, damage_class="bullet"):
-        """Another player died: their body bursts into gibs (in their fur colour) where they
-        stood, UNLESS damage_class dissolves instead (Zap - see Modules/Weapons/
-        damage_classes.py; RemotePlayer's own dissolve state machine handles the body itself,
-        already running by the time this fires - see its _set_dead) - and if it was a
-        /smite specifically, the lightning effect too (see dummy_died's own comment on why
-        that's keyed on the damage class name rather than a separate flag). spawn_smite
-        itself is never called over the network - each client reacts to the replicated
-        death/damage_class on its own."""
+        """Another player died: gibs in their fur colour (unless they dissolve - RemotePlayer animates that
+        itself), plus the lightning for a smite."""
         if current_scene is None:
             return
         if get_damage_class(damage_class).death_effect != DISSOLVE and current_scene.gibs is not None:
@@ -1213,30 +700,22 @@ def main():
         if damage_class == "smite":
             spawn_smite(position)
     net_mgr.on_death = remote_death
-    # Another player's shot hit us: the shooter decided that, we apply it.
+
     def on_damaged(amount, attacker_id, weapon_name, headshot, push=None, damage_class="bullet", origin=None):
+        """Another player's shot hit us: the shooter decided that, we apply it."""
         death["damage_class"] = damage_class   # what killed us, if this hit does - see begin_death
         change_health(-amount)
+        controls.rumble(RUMBLE_DAMAGE, amount / 40.0)
         if push is not None:      # an explosion's shove: if this kills us, our gibs fly that way
             death["push"], death["push_time"] = glm.vec3(*push), time.perf_counter()
-        # Points the damage indicator at wherever this actually came from. origin (the
-        # shooter's own hit/blast position - see network_manager.py's send_damage docstring)
-        # is preferred when given: exact for a direct hit, and the only correct choice for
-        # splash damage (an explosion can reach someone standing well off to the side of
-        # wherever the attacker themselves is). Falls back to the attacker's own CURRENT
-        # position (looked up live off their replicated state - body_center is continuously
-        # updated from their movement stream) only for an older/odd message with no origin;
-        # None either way (they disconnected/despawned between firing and this landing, or
-        # this is the test dummy, which isn't a RemotePlayer at all, AND no origin was sent)
-        # just skips showing an arrow rather than guessing.
+        # origin (where the shot or blast came from) is exact, and the only right answer for splash damage; an
+        # old message without one falls back to the attacker's current position, or no arrow at all.
         if origin is not None:
-            to_source = glm.vec3(*origin) - camera.position
-            damage_indicator.trigger((to_source.x, to_source.z))
+            point_damage_indicator(origin)
         else:
             attacker = net_mgr.remote_players.get(attacker_id)
             if attacker is not None:
-                to_attacker = attacker.body_center - camera.position
-                damage_indicator.trigger((to_attacker.x, to_attacker.z))
+                point_damage_indicator(attacker.body_center)
     net_mgr.on_damage = on_damaged
     from Modules.Scenes import scene_base as _scene_base
     _scene_base.LOAD_PUMP = net_mgr.pump_callbacks
@@ -1247,13 +726,7 @@ def main():
         pending_start = (map_key, mode_key)
 
     def start_from_lobby(map_key, mode_key=None):
-        """The real "begin gameplay" signal menu_scene.build_ui's own
-        on_start param is wired to - covers BOTH the lobby room's Start
-        button (LobbyRoom.on_game_start) and singleplayer (LobbyMenu's
-        own _start_singleplayer, which never shows a lobby room at all,
-        so in_lobby is already False there - this clear is a harmless
-        no-op in that case, not something singleplayer needs to care
-        about)."""
+        """The menu's "begin gameplay" signal: the lobby room's Start button, or singleplayer."""
         nonlocal in_lobby
         in_lobby = False
         request_start(map_key, mode_key)
@@ -1269,20 +742,16 @@ def main():
 
     paper_doll = None  # head of the local rat beside the health bar - built in start_game
 
-    def reset_weapon_ammo():
-        """Refills every carried weapon's magazine (not just the active one) - called
-        everywhere the player (re)spawns, alongside game_mode.choose_spawn_position/
-        choose_spawn_rotation. A weapon with no ammo tracking at all (magazine_size <= 0)
-        has nothing to refill - WeaponsBase.ammo just sits unused for those, same as
-        always."""
+    def refill_player():
+        """Full health and magazines, recoil settled - every (re)spawn."""
+        change_health(health["max"])
         for w in inventory.weapons:
-            if w.magazine_size > 0:
+            if w.magazine_size > 0:   # magazine_size <= 0: no ammo tracking
                 w.ammo = w.magazine_size
+        inventory.recoil.reset()
 
     def apply_spawn_rotation():
-        """Snaps the camera to game_mode's own fixed spawn facing (see its own docstring
-        for why this is deliberately fixed, not whatever the camera already happened to be
-        looking) - called alongside every player.teleport(game_mode.choose_spawn_position())."""
+        """Snaps the camera to the game mode's fixed spawn facing."""
         camera.yaw, camera.pitch = game_mode.choose_spawn_rotation()
         camera.update_vectors()
 
@@ -1290,65 +759,25 @@ def main():
         nonlocal in_menu, paper_doll, game_mode
         menu_ui.visible = False
         map_key = coerce_map(mode_key, map_key)   # e.g. the Sewer is Deathmatch only
-        # Reassigned here, every real game start, now that a mode is actually
-        # known (see MODES/request_start's own comments - module-level
-        # construction above is only ever the pre-lobby placeholder). mode_key
-        # can be None (no mode chosen) or an id the registry doesn't recognize
-        # (stale/corrupted lobby metadata) - both fall back to Deathmatch
-        # rather than silently leaving game_mode as whatever a PREVIOUS match
-        # happened to be using.
+        # No mode chosen, or one the registry doesn't know (stale lobby data): Deathmatch.
         game_mode = (
             create_game_mode(mode_key, net_mgr, spawn_points=[SPAWN_POSITION])
             or Deathmatch(net_mgr, spawn_points=[SPAWN_POSITION])
         )
-        # Starts the shared, Steam-lobby-metadata-backed round clock
-        # (see NetworkManager.start_round_timer/GameMode.round_remaining's
-        # own docstrings) - gated on is_host purely so only one peer
-        # ever writes the starting timestamp (every peer reads it back
-        # fresh afterward, so this is the ONLY privileged step in the
-        # whole mechanism, and the round itself stays correct even if
-        # THIS peer later disconnects - nothing after this write depends
-        # on it staying connected). `or not net_mgr.current_lobby_id`:
-        # singleplayer (lobby_menu.py's own _start_singleplayer) never
-        # creates a lobby at all, so is_host reads False there (no
-        # members to be first among) even though there's trivially only
-        # one "player" - that's still who should start the (locally-
-        # tracked, see start_round_timer's own docstring) timer. A mode
-        # with no round_duration set at all (the default - see
-        # GameMode's own class attribute) skips this entirely, same as
-        # before this feature existed.
+        # Only one peer writes the shared round start time (every peer reads it back); in singleplayer there's
+        # no lobby, so we're it.
         if (net_mgr.is_host or not net_mgr.current_lobby_id) and game_mode.round_duration is not None:
             net_mgr.start_round_timer(game_mode.round_duration)
-        # Every lobby join/host is a COMPLETE reload now - no "coming back
-        # to the map we disconnected from, everything's still built"
-        # shortcut any more (see setup_game's own comment for why: that
-        # reuse path let stale actor/physics/GL state from a PREVIOUS
-        # lobby session leak into a new one just because it happened to
-        # pick the same map). setup_game always tears down whatever
-        # existed and builds everything - scene, player, weapons, paper
-        # doll - fresh.
         setup_game(map_key)
-        # health/inventory ammo are module-level, not rebuilt by setup_game
-        # (loadout/cosmetics deliberately persist across games - see
-        # Inventory's own construction, once, outside setup_game) - reset
-        # both explicitly here so a fresh lobby always starts at full
-        # health/ammo regardless of how the LAST session ended, now that
-        # this runs on every single lobby join instead of only a true
-        # first-ever start (when both already happened to be full anyway).
-        change_health(health["max"])
-        reset_weapon_ammo()
-        inventory.recoil.reset()
-        health_bar.visible = True
-        round_timer_label.visible = True
-        crosshair.visible = True
-        weapon_hud.visible = True
-        name_tags.visible = True
+        refill_player()   # however the last match ended
+        set_game_hud_visible(True)
         if local_player_model is not None and local_player_model.obj is not None:
             local_player_model.set_hat(net_mgr.local_hat)
             local_player_model.set_tint(net_mgr.local_color)
             viewmodel.set_tint(net_mgr.local_color)
             paper_doll = PaperDoll(window.ctx, local_player_model.obj)
         prime_effects()
+        keep_other_threads_off_main_cores()
         in_menu = False
         ui.set_cursor_free(False)
         apply_spawn_rotation()
@@ -1357,7 +786,7 @@ def main():
         net_mgr.in_game = True
 
     def set_local_body_visible(visible):
-        """Shows or hides the local player's body (and gun) - hidden while dead."""
+        """Shows or hides the local player's body (and gun) - hidden while dead, seen only in third person."""
         for obj in (local_player_model.obj, *getattr(weapon, "worldmodel_objs", ())):
             if obj is not None:
                 obj["visible_in_color"] = visible and third_person
@@ -1369,19 +798,8 @@ def main():
         ui.set_cursor_free(on)
 
     def disconnect():
-        """Leaves the lobby and returns to the main menu. The scene/player/
-        weapons etc. are left alive here (just paused, via in_menu's own
-        `continue` in the main loop, which skips current_scene.update()
-        entirely - no physics step, no actor update, nothing) rather than
-        torn down on the spot - the NEXT start_game (see setup_game's own
-        comment) fully destroys and rebuilds everything from scratch
-        regardless of whether that next lobby reuses this same map, so
-        tearing down here too would just be redundant work for a session
-        that might end (app quit) without ever starting another game
-        anyway. net_mgr.leave_lobby() below already fully disconnects the
-        NETWORK side immediately - destroys every RemotePlayer, clears
-        remote_players/membership state, sets in_game=False - so no stale
-        peer or packet handling survives past this call either way."""
+        """Leaves the lobby and returns to the main menu. The scene is only paused (the menu branch of the main
+        loop doesn't update it); the next start_game rebuilds everything anyway."""
         nonlocal in_menu
         set_paused(False)
         net_mgr.leave_lobby()
@@ -1391,31 +809,27 @@ def main():
             death_screen.hide()
             set_local_body_visible(True)
         current_scene.sound_manager.pause_all()
-        health_bar.visible = False
-        round_timer_label.visible = False
-        crosshair.visible = False
-        weapon_hud.visible = False
-        name_tags.visible = False
+        set_game_hud_visible(False)
         menu_ui.visible = True
         in_menu = True
         ui.set_cursor_free(True)
         window.reset_frame_timer()
+
+    def stop_moving():
+        player.set_move_direction(glm.vec3(0.0))
+        player.set_sprinting(False)
 
     def begin_death():
         nonlocal third_person
         death["pending"] = False
         death["active"] = True
         death["eye_drop"] = 0.0
-        feet = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
+        controls.rumble(RUMBLE_DEATH)
+        feet = player.get_position() - glm.vec3(0.0, PLAYER_HEIGHT / 2.0, 0.0)
         push = death["push"] if time.perf_counter() - death["push_time"] < 1.0 else None
         death["push"] = None
         damage_class, death["damage_class"] = death["damage_class"], "bullet"
-        # No gibs for a dissolve death (Zap) - matches what everyone ELSE sees us do (see
-        # RemotePlayer's own dissolve state machine): the local player's own body is always
-        # hidden instantly either way regardless of the third-person switch just below (see
-        # set_local_body_visible - visible=False there forces it off no matter what
-        # third_person is set to), so there's no local dissolve ANIMATION to show, just this
-        # one difference in what flies out of us when we die.
+        # Our body is hidden either way; a dissolve death just throws no gibs (matching what others see).
         if current_scene.gibs is not None and get_damage_class(damage_class).death_effect != DISSOLVE:
             current_scene.gibs.spawn(feet, player.velocity, push=push, tint=net_mgr.local_color)
         smite, death["smite"] = death["smite"], False
@@ -1423,35 +837,20 @@ def main():
             spawn_smite(feet)
         net_mgr.notify_death(push=push, damage_class=damage_class)
         set_local_body_visible(False)
-        # A player who dies mid-emote shouldn't keep playing it into their death
-        # pose - cuts it short the same way moving/jumping/shooting would (see
-        # PlayerModel.cancel_emote's own docstring), restoring whatever upper-
-        # body pose (a held weapon's idle lock, if any) was active beforehand.
-        local_player_model.cancel_emote()
-        # Pulls the camera back (see the main loop's own `if third_person:` branch) for the
-        # death screen/gib view instead of staring at the inside of your own hidden-while-
-        # dead body - no manual toggle involved any more (see on_key_down's own removed V
-        # bind), purely state-driven: dead means third person, full stop.
-        third_person = True
+        local_player_model.cancel_emote()   # don't dance into the death pose
+        third_person = True   # watch the gibs instead of the inside of our hidden body
         crosshair.visible = False
         weapon_hud.visible = False
-        player.set_move_direction(glm.vec3(0.0))
-        player.set_sprinting(False)
+        stop_moving()
         death_screen.show()
 
     def end_death():
         nonlocal third_person
         death["active"] = False
-        # Back to first person BEFORE set_local_body_visible below - that call's own
-        # "visible and third_person" math (see its docstring) is what actually restores the
-        # normal first-person "my own body is shadow-only" state, which only works out
-        # correctly if third_person has already flipped back to False by the time it runs.
-        third_person = False
+        third_person = False   # before set_local_body_visible, whose result depends on it
         player.teleport(game_mode.choose_spawn_position())
         apply_spawn_rotation()
-        change_health(health["max"])
-        reset_weapon_ammo()
-        inventory.recoil.reset()
+        refill_player()
         set_local_body_visible(True)
         crosshair.visible = True
         weapon_hud.visible = True
@@ -1459,10 +858,8 @@ def main():
         net_mgr.notify_respawn()
 
     def prime_shooting(prime_camera):
-        """Plays a shot for real - the gun and arm animations (and the player rig's upper-body
-        override), the muzzle flash pass between the world and the viewmodels, a tracer, the
-        impact effects - for about a second into the back buffer, so the first real shot doesn't
-        build any of it (pose caches, buffers, blend setups) in the middle of a frame."""
+        """Plays a shot for real for about a second into the back buffer (gun/arm animations, upper-body
+        override, muzzle flash, tracer, impact), so the first real shot builds none of it mid-frame."""
         if weapon is None:
             return
         previous_hook = current_scene.before_viewmodels
@@ -1493,9 +890,8 @@ def main():
         inventory.recoil.reset()
 
     def prime_effects():
-        """Warms everything a first death, shot or hit would load or compile lazily - gib
-        meshes and materials, blood and impact textures, sounds, the hit marker and death screen
-        - so none of it hitches mid-game. All drawn into the back buffer only."""
+        """Warms everything a first death, shot or hit would load or compile lazily (gibs, blood and impact
+        textures, sounds, hit marker, death screen), drawing into the back buffer only."""
         show_loading_screen(window, "Loading effects...")
         eye = glm.vec3(player.get_position()) + glm.vec3(0.0, 0.5, 0.0)
         prime_camera = Camera(position=eye, aspect=camera.aspect)
@@ -1519,9 +915,9 @@ def main():
         death_screen.show()       # one invisible frame builds its text
         ui.render()
         death_screen.hide()
-        hide_loading_screen()     # the animated "Loading effects..." screen shown at the top
-        # Everything built so far lives for the rest of the game: keep the garbage collector from
-        # re-scanning it (a full collection mid-game is a visible hitch).
+        hide_loading_screen()
+        # Everything built so far lives for the whole match: keep the garbage collector from re-scanning it (a
+        # full collection mid-game is a visible hitch).
         gc.collect()
         gc.freeze()
         window.reset_frame_timer()
@@ -1532,62 +928,57 @@ def main():
     )
     ui.set_cursor_free(True)
 
-    def toggle_ui_demo(key):
-        if key == pygame.K_F1:
-            ui_demo.visible = not ui_demo.visible
-            ui.set_cursor_free(ui_demo.visible)
+    # Keyboard, mouse and controllers (Modules/Input - bindings.py says what does what).
+    controls = InputManager()
+    aim_assist = AimAssist()
 
-    trigger_clicks = [0]   # left clicks since the last frame's firing check
-    wheel_delta = [0]      # net scroll wheel motion since the last frame's weapon-switch check
-    # Set the instant B is released over a highlighted slot (see count_click's own
-    # K_b KEYUP branch below) and consumed once in the main loop - a single-slot
-    # flag rather than triggering play_emote/third_person/notify_emote directly
-    # from count_click, since count_click runs earlier in the frame than the main
-    # loop's own `alive`/death["active"] read and has no access to that local.
-    pending_emote = [None]
-    # Last frame's local_player_model.is_emoting() - lets the main loop detect
-    # the edge (was emoting, now isn't) that means "revert to first person",
-    # whether that's from the clip finishing naturally or being cancelled.
-    emote_was_playing = [False]
+    def controller_connected(name):
+        chatbox.push_system(f"Controller connected: {name}")
+
+    def controller_disconnected(name, was_in_use):
+        chatbox.push_system(f"Controller disconnected: {name}")
+        # Lost the controller mid-match (flat battery, cable): pause, like a console game, instead of running on.
+        if was_in_use and not in_menu and not in_lobby and not pause["on"]:
+            set_paused(True)
+
+    controls.on_connected = controller_connected
+    controls.on_disconnected = controller_disconnected
+
+    def controller_menu_input(dt):
+        """While the cursor is free (menus, the pause menu) and the controller is in use: the left stick moves the
+        cursor, the D-pad jumps between controls (and steps a slider), A clicks, the right stick scrolls, and B
+        closes an open dropdown, then the pause menu."""
+        directions = controls.nav_presses(dt)      # every frame, so a held direction repeats properly
+        if controls.device != CONTROLLER:
+            return
+        controls.drive_ui_cursor(dt, (window.width, window.height))
+        for direction in directions:
+            if gamepad_nav.navigate(ui, direction):
+                controls.cursor_moved()
+        if controls.pressed(Action.UI_BACK):
+            if ui.popup is not None:
+                ui.popup.close()
+            elif pause["on"]:
+                set_paused(False)
+    pending_emote = [None]   # set when the emote wheel's button is released over a slot, consumed by the main loop
+    emote_was_playing = [False]   # last frame's is_emoting(): its falling edge means back to first person
+
+    def line_of_sight(a, b):
+        return current_scene.physics.raycast(a, b, CollisionGroup.STATIC) is None
 
     def count_click(event):
-        """window.handle_events' event filter: counts left clicks (from the
-        event queue, so none is lost between frames) and then lets the UI have
-        the event as before."""
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and not in_menu and not in_lobby:
+        """window.handle_events' event filter: every event goes to the input manager first (it never consumes one),
+        then pause, then the UI. Keys and clicks only count as game input with the cursor captured and chat
+        closed, judged before the UI reacts - so the click on a menu's Resume button doesn't also fire."""
+        playing = not in_menu and not in_lobby
+        controls.handle_event(event, gameplay=playing and not ui.cursor_free and not chatbox.focused)
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and playing:
             if chatbox.focused:
-                return ui.handle_event(event)   # let TextInput's own Escape close chat instead of pausing
+                return ui.handle_event(event)   # Escape closes chat instead of pausing
             set_paused(not pause["on"])
             return True
-        # Hold B: opens the radial emote wheel (mouse freed, camera look stops via
-        # ui.cursor_free - see Modules/Window/window.py's own event_filter short-
-        # circuit); release confirms whatever slot the mouse was over (see
-        # EmoteWheel.confirmed_emote_name) and closes it. No on_key_up hook exists
-        # anywhere else in this file (window.handle_events' own on_key_down is
-        # KEYDOWN-only) - count_click, as the event_filter, is the one place that
-        # sees raw KEYUP events before camera/key handling does.
-        if (event.type == pygame.KEYDOWN and event.key == pygame.K_b
-                and not in_menu and not in_lobby and not chatbox.focused and not pause["on"]):
-            emote_wheel.open()
-            ui.set_cursor_free(True)
-            return True
-        if event.type == pygame.KEYUP and event.key == pygame.K_b and emote_wheel.visible:
-            pending_emote[0] = emote_wheel.confirmed_emote_name()
-            emote_wheel.close()
-            ui.set_cursor_free(False)
-            return True
-        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
-                and not in_menu and not in_lobby and not ui.cursor_free):
-            trigger_clicks[0] += 1
-        if event.type == pygame.MOUSEWHEEL and not in_menu and not in_lobby and not ui.cursor_free:
-            # Accumulated, not consumed here directly, in case several land in
-            # one frame - the main loop turns the total into at most one
-            # weapon switch (see wheel_delta below). Note: once the emote wheel
-            # sets ui.cursor_free=True, this branch no longer fires for its own
-            # scroll events - they fall through to ui.handle_event below instead,
-            # which is exactly what drives EmoteWheel's own page-scrolling (see
-            # its pick_scroll/scroll_by) with no extra wiring needed here.
-            wheel_delta[0] += event.y
+        # In play the wheel switches weapons (input manager); with the cursor free it scrolls the UI.
+        if event.type == pygame.MOUSEWHEEL and playing and not ui.cursor_free:
             return True
         return ui.handle_event(event)
 
@@ -1597,46 +988,27 @@ def main():
         if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not pause["on"] and not chatbox.focused:
             chatbox.open()
             return
-        # "/" opens chat so commands don't need Enter first, straight into command mode -
-        # passed explicitly as the opened box's initial text (see ChatBox.open's own
-        # docstring) rather than relying on the TEXTINPUT event that happens to follow this
-        # same keypress: that worked the first time chat was ever opened in a session, but
-        # not reliably on a second open (SDL's start_text_input, toggled off by the previous
-        # close and back on here in reaction to this very keydown, doesn't consistently
-        # still catch the OS's already-in-flight character event for THIS press the way it
-        # does from a cold start) - passing "/" directly sidesteps that timing dependency
-        # entirely.
+        # "/" opens chat straight into command mode. The "/" is passed in rather than left to the TEXTINPUT
+        # event that follows: SDL doesn't reliably deliver that one when text input was just switched back on.
         if key in (pygame.K_SLASH, pygame.K_KP_DIVIDE) and not pause["on"] and not chatbox.focused:
             chatbox.open("/")
             return
         if chatbox.focused:
-            return   # chat has keyboard focus - ui.handle_event already routed this, see count_click
+            return   # chat has keyboard focus - ui.handle_event already routed this
         if key == pygame.K_F9:
             prof.set_enabled(not prof.enabled)
             profile_label.visible = prof.enabled
             profile_label.text = ""
         if key == pygame.K_F6 and player is not None:
-            # Movement debug dump - see CharacterController.toggle_debug_log's own
-            # comment. Prints straight to the console (this is a one-off diagnostic for
-            # the jump-landing slide bug, not a feature), one line per physics tick.
-            enabled = player.toggle_debug_log()
-            print(f"[movedbg] {'ON' if enabled else 'OFF'}")
+            print(f"[movedbg] {'ON' if player.toggle_debug_log() else 'OFF'}")   # one line per physics tick
         if death["active"]:
             return
-        toggle_ui_demo(key)
-        if key == pygame.K_r and weapon is not None and not ui.cursor_free:
-            weapon.start_reload()
-        # Number row: jumps straight to that inventory slot (see WEAPON_SLOT_KEYS' own
-        # comment) - same switch_weapon() the scroll wheel already uses, same gating as
-        # the wheel's own (len(inventory) > 1 - nothing to switch TO with only one
-        # weapon) plus reload's own (not ui.cursor_free - a menu/chat open shouldn't
-        # react to background gameplay keys). switch_weapon itself already no-ops for
-        # a slot that's already the active one, and inventory.select wraps out-of-range
-        # indices rather than erroring, but the explicit length check below means a key
-        # for a slot that doesn't exist does nothing at all instead of wrapping around
-        # to some OTHER slot by surprise.
+        if key == pygame.K_F1:
+            ui_demo.visible = not ui_demo.visible
+            ui.set_cursor_free(ui_demo.visible)
         slot = WEAPON_SLOT_KEYS.get(key)
-        if slot is not None and weapon is not None and not ui.cursor_free and len(inventory) > 1 and slot < len(inventory):
+        if (slot is not None and weapon is not None and not ui.cursor_free
+                and len(inventory) > 1 and slot < len(inventory)):
             switch_weapon(slot)
         if key == pygame.K_t and weapon is not None and weapon.reloading and viewmodel is not None:
             reload_time = viewmodel.one_shot_time("reload")
@@ -1653,14 +1025,31 @@ def main():
         f"{'HOST' if net_mgr.is_host else 'CLIENT'}  other players: {len(net_mgr.remote_players)}  "
         f"window {window.width}x{window.height}  vsync {window.vsync}  "
         f"gpu {window.ctx.info.get('GL_RENDERER', '?')}  "
-        f"{cpu_affinity_label(cpu_tuner)}")
+        f"{cpu_affinity_label()}")
+
+    # Built once rather than as fresh closures every frame.
+    def camera_position():
+        return camera.position
+
+    def muzzle_position():
+        return weapon.muzzle_position(current_scene)
+
+    def camera_frame():
+        return camera.front, camera.up
+
+    def draw_overlay_particles():
+        """First-person muzzle flashes, drawn by the scene just before the viewmodels so the gun sits in front."""
+        particles.sync_followers()     # onto the gun's pose from this frame
+        particles.render(camera, overlay=True)
 
     running = True
     while running:
         prof.begin()
+        controls.begin_frame()
         running, dt = window.handle_events(
             camera, on_key_down=on_key_down, event_filter=count_click
         )
+        controls.update(dt)
 
         if pause["quit"]:
             break
@@ -1670,6 +1059,7 @@ def main():
         prof.mark("events")
 
         if in_menu or in_lobby:
+            controller_menu_input(dt)
             net_mgr.update()
             menu_scene.update(dt)
             if in_menu and menu_scene.menu is not None:
@@ -1677,89 +1067,83 @@ def main():
             menu_scene.apply_camera(camera)
             window.ctx.clear(0.1, 0.1, 0.1, 1.0)
             menu_scene.render(camera, None)
+            menu_scene.present()
             ui.render()
             window.flip()
             continue
 
-        keys = pygame.key.get_pressed()
-
-        # Ground-relative movement, driven by camera yaw (mouse-look)
-        # but ignoring pitch - walking shouldn't speed up/slow down
-        # just from looking up or down.
         if death["pending"] and not death["active"]:
             begin_death()
         alive = not death["active"]
-        move_dir = glm.vec3(0.0)
-        if keys[pygame.K_w]:
-            move_dir += camera.get_flat_forward()
-        if keys[pygame.K_s]:
-            move_dir -= camera.get_flat_forward()
-        if keys[pygame.K_a]:
-            move_dir -= camera.get_flat_right()
-        if keys[pygame.K_d]:
-            move_dir += camera.get_flat_right()
+        using_pad = controls.device == CONTROLLER
+        in_play = not ui.cursor_free and not chatbox.focused   # the cursor's free in menus, the pause menu, the wheel
+
+        # Controller: Menu toggles pause; in the pause menu the stick/D-pad/A/B drive it.
+        if controls.pressed(Action.PAUSE) and not chatbox.focused:
+            set_paused(not pause["on"])
+        elif ui.cursor_free and not emote_wheel.visible:
+            controller_menu_input(dt)
+
+        move_x, move_y = controls.move_vector()
+        # Right-stick look (the mouse turns the camera in window.handle_events), with aim assist on a controller.
+        if alive and in_play:
+            look_yaw, look_pitch = controls.look_delta(dt, scale=camera.fov / BASE_FOV)
+            if using_pad and settings.aim_assist:
+                targets = [(steam_id, other.body_center) for steam_id, other in net_mgr.remote_players.items()
+                           if not other.dead]
+                if test_dummy is not None and not test_dummy.dead:
+                    targets.append((TEST_DUMMY_STEAM_ID, test_dummy.body_center))
+                scale, pull_yaw, pull_pitch = aim_assist.update(
+                    camera, targets, bool(look_yaw or look_pitch or move_x or move_y), dt, line_of_sight)
+                look_yaw, look_pitch = look_yaw * scale + pull_yaw, look_pitch * scale + pull_pitch
+            if look_yaw or look_pitch:
+                camera.rotate(look_yaw, look_pitch)
+        # Ground-relative movement from the camera's yaw (pitch ignored); a stick's tilt sets the speed.
+        move_dir = camera.get_flat_forward() * move_y + camera.get_flat_right() * move_x
+
+        # Emote wheel: opens while its button is held, picks with the mouse or right stick, plays on release.
+        if controls.pressed(Action.EMOTE_WHEEL) and in_play and not emote_wheel.visible:
+            emote_wheel.open()
+            ui.set_cursor_free(True)
         if emote_wheel.visible:
-            # Hover picking stops the instant close() starts (see is_closing's
-            # own docstring) - a shrinking/fading wheel shouldn't still be
-            # changing its highlighted slot on the way out.
-            if not emote_wheel.is_closing():
-                mx, my = pygame.mouse.get_pos()
-                emote_wheel.update_hover(mx / ui.scale, my / ui.scale)
+            if not emote_wheel.is_closing():   # a closing wheel stops changing its highlight
+                if not controls.held(Action.EMOTE_WHEEL):
+                    pending_emote[0] = emote_wheel.confirmed_emote_name()
+                    emote_wheel.close()
+                    ui.set_cursor_free(False)
+                elif using_pad:
+                    sx, sy = controls.right_stick()
+                    if sx or sy:
+                        x, y, w, h = emote_wheel.rect
+                        emote_wheel.update_hover(x + w / 2.0 + sx * 150.0, y + h / 2.0 + sy * 150.0)
+                else:
+                    mx, my = pygame.mouse.get_pos()
+                    emote_wheel.update_hover(mx / ui.scale, my / ui.scale)
             emote_wheel.update()
         if pending_emote[0] is not None:
             name, pending_emote[0] = pending_emote[0], None
-            # Only from a standstill on solid ground - picking an emote mid-
-            # air or while still sliding to a stop would otherwise start a
-            # full-body dance animation the player's own momentum immediately
-            # cancels a frame or two later (see PlayerModel.update()'s own
-            # has_input/is_grounded cancel check) - requiring both up front
-            # means a selection either plays properly or does nothing at all,
-            # never a one-frame flash. Checked against the CharacterController's
-            # own real velocity, not input, since residual momentum with no
-            # key held should count as "not still" too.
+            # Only from a standstill on the ground (real velocity, not input): momentum would cancel the emote a
+            # frame or two in.
             still = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z)) < 0.1
             if alive and player.is_on_ground() and still:
                 local_player_model.play_emote(name)
                 third_person = True
-                # Re-evaluates visible_in_color (see set_local_body_visible's own
-                # "visible and third_person" formula) now that third_person just
-                # flipped True - without this, the body stays shadow-only (its
-                # last-computed value from whenever third_person was last False)
-                # since this function isn't re-run every frame on its own.
-                set_local_body_visible(True)
+                set_local_body_visible(True)   # re-evaluate now that third_person flipped
                 net_mgr.notify_emote(name)
         if alive and (pause["on"] or chatbox.focused or emote_wheel.visible):
-            player.set_move_direction(glm.vec3(0.0))
-            player.set_sprinting(False)
-            # move_dir itself is only ever the raw WASD vector (computed above
-            # regardless of pause/chat/wheel state) - zeroed here too so a key
-            # held while paused/typing/picking an emote doesn't ALSO reach
-            # local_player_model.update()'s own move_direction param further
-            # down and spuriously look like "the player moved" (e.g. instantly
-            # cancelling an emote the instant it starts, if a movement key
-            # happened to still be held from before the wheel closed).
+            stop_moving()
+            # Also zeroed for the player model below, so a held key doesn't read as moving (and cancel an emote).
             move_dir = glm.vec3(0.0)
         elif alive:
             player.set_move_direction(move_dir)
-            player.set_sprinting(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
-            player.set_crouching(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL])
-            if keys[pygame.K_SPACE]:
+            player.set_sprinting(controls.held(Action.SPRINT))
+            player.set_crouching(controls.held(Action.CROUCH))
+            if controls.held(Action.JUMP):
                 player.jump()
-        # No player.update(dt) here - CharacterController's Source-style
-        # ground/air movement math runs once per fixed physics tick (a
-        # PhysicsWorld pre-substep callback, registered in its __init__),
-        # not once per variable-length render frame; current_scene.update()
-        # below is what actually advances physics.
+        # Movement itself runs per fixed physics tick (CharacterController's pre-substep callback), inside
+        # current_scene.update() below.
 
-        # Call update to drive scene animations (like the rotating
-        # torus) and step physics - camera position then follows
-        # wherever physics moved the player capsule to this frame.
-        # player_positions feeds Modules/Actors' own proximity detection
-        # (see ActorBase.update's own docstring) - built fresh every frame
-        # here since player positions are an app.py-level concern Scene
-        # itself has no other access to; skips the local player entirely
-        # while dead, same "not really in the world" reasoning the existing
-        # me=None-while-dead check (see kill_targets) already applies.
+        # Positions for actor proximity triggers (Modules/Actors) - without us while dead.
         player_positions = [
             (steam_id, other.body_center) for steam_id, other in net_mgr.remote_players.items()
         ]
@@ -1773,187 +1157,113 @@ def main():
         if current_scene.gibs is not None:
             current_scene.gibs.update(dt)     # before particles.update: the blood follows the gibs
         prof.mark("game mode + gibs")
-        # Fell out of the map (see Scene.min_height's own docstring) - same death path as
-        # /kill (kill_self), just triggered by height instead of a command. alive-gated so
-        # this can't re-fire every frame once death becomes active (death["pending"] already
-        # debounces change_health itself from going below 0, but damage_class would keep
-        # getting stomped back to "bullet" every frame otherwise - harmless, but pointless).
+        # Fell out of the map (Scene.min_height): the same death as /kill.
         if alive and current_scene.min_height is not None and player.get_position().y < current_scene.min_height:
-            death["damage_class"] = "bullet"
-            change_health(-(health["max"] + 1.0))
-        eye_position = player.get_position() + glm.vec3(
-            0.0, player.get_eye_offset(), 0.0
-        )
+            kill_local("bullet")
+        eye_position = player.get_position() + glm.vec3(0.0, player.get_eye_offset(), 0.0)
         if not alive:
             # The view sinks to the floor over half a second, like the body dropping.
             death["eye_drop"] = min(1.0, death["eye_drop"] + dt / 0.5)
             ease = death["eye_drop"] * death["eye_drop"] * (3.0 - 2.0 * death["eye_drop"])
             eye_position.y -= (player.get_eye_offset() - 0.25) * ease
+        # Third person only moves where the camera sits; the look direction and movement are unchanged.
         if third_person:
-            # Same pivot first-person already uses (the player's own eye
-            # position) - camera.front/yaw/pitch (mouse look) and all
-            # movement math are completely unaffected by this branch,
-            # only WHERE the camera itself sits changes.
-            camera.position = boom_arm.get_camera_position(
-                eye_position, camera.yaw, camera.pitch
-            )
+            camera.position = boom_arm.get_camera_position(eye_position, camera.yaw, camera.pitch)
         else:
             camera.position = eye_position
-        # After the camera has its final position/look for this frame.
-        # Recoil moves the camera a little further each frame (see Recoil) -
-        # after mouse look, before anything reads camera.front for this frame. The player's own
-        # (Inventory.recoil), applied whichever weapon - or none - is out, so a kick keeps settling
-        # after a weapon switch.
+        # Recoil (the inventory's, so a kick keeps settling across a weapon switch), before anything reads
+        # camera.front this frame.
         if alive:
             inventory.recoil.apply(camera, dt)
-        # Right-click: eases the VIEWMODEL (not the world camera - see ViewModel.
-        # update's own scope_blend docstring for why moving camera.position has no
-        # visible effect on a camera-space-rendered viewmodel at all) toward the active
-        # weapon's own scope point. update_scope just advances/returns the eased 0..1
-        # blend fraction; the actual transform math lives in ViewModel.update, which
-        # needs this same value.
+        # Right-click ADS: update_scope eases a 0..1 blend that moves the viewmodel to the scope and narrows the
+        # FOV; sensitivity scales by the same ratio (felt from the next frame's mouse motion).
         scope_blend = 0.0
         if weapon is not None:
-            aiming = (alive and not third_person and not ui.cursor_free
-                      and pygame.mouse.get_pressed()[2])
+            aiming = alive and not third_person and not ui.cursor_free and controls.held(Action.AIM)
             scope_blend = weapon.update_scope(aiming, dt)
-        # Narrows the FOV right alongside the same eased fraction driving the viewmodel's
-        # own ADS move above - always reset to BASE_FOV outright (not just "left alone")
-        # for a weapon with no scope, or no active weapon at all, so a stale zoomed FOV
-        # from whatever was equipped before a switch can never linger.
         camera.fov = BASE_FOV + (weapon.scope_fov - BASE_FOV) * scope_blend if (
             weapon is not None and weapon.has_scope) else BASE_FOV
-        # Mouse sensitivity scales down by the exact same ratio the FOV just did - takes
-        # effect on the NEXT frame's own mouse motion (window.handle_events, which reads
-        # camera.sensitivity, already ran earlier THIS frame - one frame of lag here is
-        # the same tolerance scope_point()'s own measurement already accepts elsewhere).
         camera.sensitivity = BASE_SENSITIVITY * (camera.fov / BASE_FOV)
         viewmodel.update(camera, not third_person and alive, dt, scope_blend)
         if weapon is not None:
-            weapon.update(follow=lambda: camera.position)   # finishes an in-progress reload once its time is up
-        # Once the ADS ease above has FULLY finished (WeaponsBase.scoped - not just
-        # scope_blend > 0, which is still mid-transition with the viewmodel still
-        # visibly sliding toward the eye), swap the ordinary crosshair for the scope's
-        # own full-screen sight picture - "looking through the sight" rather than a
-        # crosshair floating over a half-raised gun. Also gated on the same conditions
-        # that let aiming start in the first place, so pausing/dying instantly drops
-        # the overlay rather than waiting for scope_blend to ease back down to 0 first.
+            weapon.update(follow=camera_position)   # finishes an in-progress reload once its time is up
+        # Once ADS has fully eased in, the scope's sight picture replaces the crosshair. Same gating as aiming,
+        # so pausing or dying drops it at once.
         fully_scoped = (weapon is not None and weapon.has_scope and weapon.scoped
-                         and alive and not third_person and not ui.cursor_free)
+                        and alive and not third_person and not ui.cursor_free)
         reticle.visible = fully_scoped
-        # Only touches crosshair.visible during otherwise-legitimate active-play frames
-        # (same condition the firing block below uses) - crosshair already has its own
-        # baseline on/off from set_paused/begin_death/end_death (pause, death, menus),
-        # and unconditionally setting it here would stomp that: e.g. forcing it back to
-        # visible while paused, just because fully_scoped also reads False then.
+        # Only during active play: pause/death/menus own the crosshair's visibility otherwise.
         if weapon is not None and not ui.cursor_free and alive:
             crosshair.visible = not fully_scoped
 
-        # Scroll wheel switches weapons (see switch_weapon) - up goes to the
-        # previous slot, down to the next, wrapping around either way.
-        # Ignored with only one weapon (nothing to switch to) or dead.
-        wheel, wheel_delta[0] = wheel_delta[0], 0
-        if wheel != 0 and alive and len(inventory) > 1:
-            switch_weapon(inventory.index + (-1 if wheel > 0 else 1))
+        # Next/previous weapon (wheel, RB/LB/Y/D-pad), wrapping; reload (R, X).
+        steps = controls.pressed(Action.NEXT_WEAPON) - controls.pressed(Action.PREV_WEAPON)
+        if steps and alive and in_play and len(inventory) > 1:
+            switch_weapon(inventory.index + (1 if steps > 0 else -1))
+        if controls.pressed(Action.RELOAD) and weapon is not None and alive and in_play:
+            weapon.start_reload()
 
-        # Left mouse fires: how many times is up to the weapon's own
-        # fire_mode (see WeaponsBase.shots_this_frame) - one shot per click
-        # for SEMI, continuously while held (paced by fire_interval) for
-        # AUTO. Clicks are only counted with the cursor captured (see
-        # count_click), so clicking menus/UI never shoots.
-        clicks, trigger_clicks[0] = trigger_clicks[0], 0
+        # Fire (left mouse, RT); the weapon's fire mode decides how many shots (one per press for SEMI, paced while
+        # held for AUTO). Presses only count as game input with the cursor captured, so clicking UI never shoots.
         if weapon is not None:
             crosshair.set_spread(weapon.spread_degrees(), camera.fov)
             weapon_hud.update(weapon, inventory.weapons, inventory.index)
         shots_fired_this_frame = 0
-        if weapon is not None and not ui.cursor_free and alive:
-            shots = weapon.shots_this_frame(clicks, pygame.mouse.get_pressed()[0])
+        if weapon is not None and in_play and alive:
+            shots = weapon.shots_this_frame(controls.pressed(Action.FIRE), controls.held(Action.FIRE))
             shots_fired_this_frame = shots
+            if shots:
+                controls.rumble(RUMBLE_FIRE)
             for _ in range(shots):
-                # A line trace from the camera along the aim (see PhysicsWorld.
-                # raycast): the first thing it meets - wall, prop or another
-                # player's hitbox - is what the shot hit.
-                shot = weapon.fire(
-                    current_scene, camera.position, direction=camera.front,
-                    follow=lambda: camera.position,
-                )
-                if shot is not None:
-                    end = (shot.hit.position if shot.hit is not None
-                           else camera.position + shot.direction * weapon.max_range)
-                    net_mgr.notify_shot(glm.vec3(end))
-                    # From the gun's muzzle bone to where the trace ended.
-                    muzzle = weapon.muzzle_position(current_scene)
-                    if muzzle is None:   # no gun model posed yet: from just off the eye
-                        right = glm.normalize(glm.cross(camera.front, camera.up))
-                        muzzle = camera.position + camera.front * 0.6 + right * 0.14 - camera.up * 0.12
-                    tracers.add(muzzle, end, style=weapon.tracer_style)
-                    weapon.spawn_tracer_spiral(particles, muzzle, end, camera_pos=camera.position)
-                    if weapon.impact_particle and shot.hit is not None:
-                        particles.spawn_surface(
-                            weapon.impact_particle, shot.hit.position, shot.hit.normal,
-                            colors=weapon.impact_color, size=weapon.impact_size, group=IMPACT_GROUP)
-                        play_impact_sound(current_scene.sound_manager, shot.hit, gun=weapon)
+                # A line trace along the aim: the first wall, prop or player hitbox it meets is what was hit.
+                shot = weapon.fire(current_scene, camera.position, direction=camera.front, follow=camera_position)
+                if shot is None:
+                    continue
+                end = (shot.hit.position if shot.hit is not None
+                       else camera.position + shot.direction * weapon.max_range)
+                net_mgr.notify_shot(glm.vec3(end))
+                muzzle = weapon.muzzle_position(current_scene)
+                if muzzle is None:   # no gun model posed yet: from just off the eye
+                    right = glm.normalize(glm.cross(camera.front, camera.up))
+                    muzzle = camera.position + camera.front * 0.6 + right * 0.14 - camera.up * 0.12
+                tracers.add(muzzle, end, style=weapon.tracer_style)
+                weapon.spawn_tracer_spiral(particles, muzzle, end, camera_pos=camera.position)
+                spawn_shot_impact(weapon, shot.hit)
+                if weapon.explosion is not None and shot.hit is not None:
+                    explode(weapon, shot.hit)
+                if weapon.muzzle_particle:
+                    # overlay while the first-person gun is on screen (its depth is squashed)
+                    particles.spawn(weapon.muzzle_particle, muzzle, forward=shot.direction,
+                                    up=camera.up, overlay=not third_person,
+                                    colors=weapon.muzzle_color, size=weapon.muzzle_size,
+                                    offset_scale=weapon.muzzle_offset_scale,
+                                    follow=muzzle_position, follow_frame=camera_frame)
+                if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
+                    hitmarker.trigger(headshot=shot.headshot)
+                    controls.rumble(RUMBLE_HIT, 1.0 if shot.headshot else 0.6)
+                    # Flat, in both ears, at any distance: feedback for us, not a sound in the world.
+                    hit_emitter = current_scene.sound_manager.add_sound(
+                        HITMARKER_SOUND, camera.position, volume=HITMARKER_VOLUME, loop=False,
+                        universal=True, channel=hit_sound_channel[0], gain=HITMARKER_GAIN,
+                        pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
+                    hit_sound_channel[0] = hit_emitter["channel"]
+                    if shot.victim == TEST_DUMMY_STEAM_ID:
+                        damage_dummy(shot.damage, weapon.name, shot.headshot, damage_class=weapon.damage_class.name)
                     else:
-                        spawn_impact(particles, shot.hit, sound_manager=current_scene.sound_manager, gun=weapon)
-                    if weapon.explosion is not None and shot.hit is not None:
-                        explode(weapon, shot.hit)
-                    if weapon.muzzle_particle:
-                        # overlay while the first-person gun is what's on screen (its depth is squashed)
-                        particles.spawn(weapon.muzzle_particle, muzzle, forward=shot.direction,
-                                        up=camera.up, overlay=not third_person,
-                                        colors=weapon.muzzle_color, size=weapon.muzzle_size,
-                                        offset_scale=weapon.muzzle_offset_scale,
-                                        follow=lambda: weapon.muzzle_position(current_scene),
-                                        follow_frame=lambda: (camera.front, camera.up))
-                    if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
-                        hitmarker.trigger(headshot=shot.headshot)
-                        # Flat, in both ears, at any distance: it's feedback for us, not a sound in the world.
-                        hit_emitter = current_scene.sound_manager.add_sound(
-                            HITMARKER_SOUND, camera.position, volume=HITMARKER_VOLUME, loop=False,
-                            universal=True, channel=hit_sound_channel[0], gain=HITMARKER_GAIN,
-                            pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
-                        hit_sound_channel[0] = hit_emitter["channel"]
-                        if shot.victim == TEST_DUMMY_STEAM_ID:
-                            # Not a real match participant - no network traffic,
-                            # no real health/score, just an instant "kill" (any
-                            # hit, any number of times) via the same kill_dummy
-                            # the /kill command's own dummy-target path uses.
-                            damage_dummy(shot.damage, weapon.name, shot.headshot,
-                                        damage_class=weapon.damage_class.name)
-                        else:
-                            # origin: where the shot came FROM, for the victim's own damage-
-                            # direction indicator (see on_damaged/DamageIndicator) - our own
-                            # position at the moment we fired, not shot.hit.position (where the
-                            # bullet struck THEM, a point on their own hitbox a few tenths of a
-                            # metre across that has nothing to do with our direction from them;
-                            # confirmed as exactly why the indicator read as inaccurate,
-                            # especially at range, where a few tenths of a metre of "where on my
-                            # body did it land" noise swings the shown bearing by a lot more
-                            # degrees than it does up close).
-                            net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot,
-                                                damage_class=weapon.damage_class.name,
-                                                origin=tuple(camera.position))
+                        # origin = where we fired from, for their damage indicator (not where it hit their
+                        # hitbox: that noise swung the arrow badly at range).
+                        net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot,
+                                            damage_class=weapon.damage_class.name,
+                                            origin=tuple(camera.position))
 
         prof.mark("camera + weapons")
 
-        # get_position() is the hull CENTER, not feet - subtract half
-        # the standing height (the same player_height passed to
-        # CharacterController above, not a re-read of any private/
-        # crouch-varying internal) to get where the model should
-        # actually stand. horiz_speed matches the flat/horizontal
-        # convention already used elsewhere in this file (get_flat_
-        # forward, footstep gating) so vertical jump/fall speed never
-        # triggers a "running" pose.
-        feet_position = player.get_position() - glm.vec3(0.0, player_height / 2.0, 0.0)
+        # get_position() is the hull centre; the model stands at the feet. Horizontal speed only, so jumping or
+        # falling never reads as running.
+        feet_position = player.get_position() - glm.vec3(0.0, PLAYER_HEIGHT / 2.0, 0.0)
         horiz_speed = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z))
-        # A one-shot consumed event (see CharacterController.pop_jumped's
-        # own docstring, mirroring pop_footstep below) - popped BEFORE
-        # the update() call it feeds, so PlayerModel can play the jump
-        # takeoff pose the instant a jump actually executes instead of
-        # waiting on is_on_ground()'s own debounced reading (see
-        # PlayerModel.update()'s own just_jumped docstring for why that
-        # debounce alone made a real jump feel delayed).
-        just_jumped = player.pop_jumped()
+        just_jumped = player.pop_jumped()   # the takeoff pose plays the moment a jump executes
+        grounded = player.is_on_ground() or player.is_on_ladder()
         if weapon is not None:
             weapon.set_moving(horiz_speed)
         local_player_model.update(
@@ -1962,49 +1272,24 @@ def main():
             camera.yaw,
             horiz_speed,
             is_crouched=player.is_crouched(),
-            is_grounded=player.is_on_ground() or player.is_on_ladder(),
-            # Walk-vs-run is now driven by the actual sprint key input,
-            # not momentum - see PlayerModel.update()'s own is_sprinting
-            # docstring for why (this was the real fix for the run
-            # animation "randomly restarting", which turned out to be
-            # physics speed noise crossing a threshold, not an animation
-            # data or looping-code problem).
-            is_sprinting=player.is_sprinting(),
-            # Same raw WASD-derived direction vector already passed to
-            # player.set_move_direction() above - drives
-            # player_directional_clips' facing-relative N/S/E/W walk
-            # selection (see PlayerModel.update()'s own move_direction
-            # docstring). Reused as-is rather than reading it back off
-            # CharacterController, since that's exactly the vector this
-            # was built from a few lines up.
-            move_direction=move_dir,
+            is_grounded=grounded,
+            is_sprinting=player.is_sprinting(),   # sprint input, not speed: speed noise restarted the run clip
+            move_direction=move_dir,              # picks the directional walk clip
             just_jumped=just_jumped,
-            # Firing cancels an in-progress emote (see PlayerModel.update()'s
-            # own just_shot docstring) - shots_fired_this_frame was already
-            # computed above, before this call, by the firing block.
-            just_shot=shots_fired_this_frame > 0,
+            just_shot=shots_fired_this_frame > 0,   # firing cancels an emote
         )
         was_emoting, is_emoting_now = emote_was_playing[0], local_player_model.is_emoting()
         if was_emoting and not is_emoting_now and not death["active"]:
-            # Natural finish or a cancel (movement/jump/shot) just happened this
-            # frame - back to first person, unless death got there first (begin_
-            # death's own third_person=True must win - see its cancel_emote()
-            # call, which makes is_emoting_now already False by the time this
-            # runs on the SAME frame a player dies mid-emote).
+            # The emote finished or was cancelled: back to first person (unless dying, which wants third).
             third_person = False
-            # Re-evaluates visible_in_color back to shadow-only now that
-            # third_person just flipped False again - mirrors the matching
-            # call where the emote started (see above).
             set_local_body_visible(True)
         emote_was_playing[0] = is_emoting_now
         if test_dummy is not None:
             test_dummy.update(dt)
-        # The same values driving the local model, sent to other players so
-        # their copy of us moves and animates identically (see NetworkManager.
-        # set_local_state for why this isn't just the camera position).
+        # The same values driving our model, so other players' copy of us moves and animates identically.
         net_mgr.set_local_state(
             feet_position, camera.yaw, camera.pitch, horiz_speed,
-            player.is_crouched(), player.is_on_ground() or player.is_on_ladder(), player.is_sprinting(),
+            player.is_crouched(), grounded, player.is_sprinting(),
             move_dir, just_jumped,
         )
 
@@ -2025,10 +1310,6 @@ def main():
             if death_screen.finished:
                 end_death()
         kill_feed.update()
-        # Round countdown - see GameMode.round_remaining's own docstring.
-        # None (no round_duration on the active mode, or the shared
-        # timer just hasn't started/propagated yet) hides the label
-        # entirely rather than showing a blank/stale string.
         _t_round = time.perf_counter() if prof.enabled else 0.0
         remaining = game_mode.round_remaining()
         if prof.enabled:
@@ -2043,36 +1324,24 @@ def main():
                 and test_dummy is not None):
             dummy_state["respawn_at"] = None
             dummy_state["health"] = TEST_DUMMY_HEALTH
-            test_dummy.receive_state({
-                "p": list(dummy_state["pos"]), "y": dummy_state["yaw"], "v": 0.0,
-                "c": 0, "g": 1, "s": 0, "d": [0.0, 0.0], "j": 0,
-                "x": dummy_state["deaths"], "a": 1,
-            })
+            test_dummy.receive_state(dummy_packet(alive=True))
 
         prof.mark("death screen")
         net_mgr.update()
         prof.mark("net_mgr.update")
         tagged_players = net_mgr.remote_players
         if test_dummy is not None:
-            # Not a real network peer (no steam_id in net_mgr.remote_players at all - see
-            # spawn_test_dummy's own docstring), so it needs adding here for a tag same as
-            # everyone else gets. A fresh dict each frame (cheap - at most a handful of
-            # players) rather than mutating remote_players itself, which would leak a
-            # fake "peer" into every OTHER place that dict is used (scoreboard, kill credit).
+            # A copy with the dummy added: putting it in remote_players itself would leak a fake peer into the
+            # scoreboard and kill credit.
             tagged_players = dict(tagged_players)
             tagged_players[TEST_DUMMY_STEAM_ID] = test_dummy
         name_tags.update(tagged_players, camera, window.ctx.screen.size, scene=current_scene)
-        scoreboard.visible = bool(keys[pygame.K_TAB]) and not chatbox.focused
+        scoreboard.visible = controls.held(Action.SCOREBOARD) and not chatbox.focused
         if scoreboard.visible:
             scoreboard.update(net_mgr, game_mode)
         prof.mark("name tags")
 
         window.ctx.clear(0.1, 0.1, 0.1, 1.0)
-        # First-person muzzle flashes (overlay effects) are drawn by the scene just
-        # before the viewmodels, so the gun and arms sit in front of them.
-        def draw_overlay_particles():
-            particles.sync_followers()     # muzzle flash onto the gun's pose from this frame
-            particles.render(camera, overlay=True)
         current_scene.before_viewmodels = draw_overlay_particles
         current_scene.render(camera, None)
         prof.mark("scene.render (CPU)")
@@ -2082,7 +1351,7 @@ def main():
         prof.mark("particles.update")
         particles.render(camera, overlay=False)
         prof.mark("particles.render")
-        current_scene.present()      # copies an offscreen scene (SSR) to the window; a no-op otherwise
+        current_scene.present()      # resolves the scene's offscreen MSAA target into the window
         prof.mark("present")
         if prof.enabled:
             text = "\n".join(prof.lines)
@@ -2097,7 +1366,6 @@ def main():
         window.flip()
         prof.mark("flip (GPU wait / vsync)")
         prof.end_frame()
-        cpu_tuner.update()
 
     particles.destroy()
     tracers.destroy()
@@ -2107,34 +1375,8 @@ def main():
 
 
 def _write_crash_log(exc):
-    """Appends a full traceback (plus a few basics: frozen or not,
-    platform) to crash_log.txt next to the running exe (or the project
-    root, for a dev `python app.py` run - see _is_frozen_build's own
-    docstring for that distinction). Exists specifically because
-    BuildCMD_Nuitka builds with --windows-console-mode=disable - a
-    frozen build has NO console for an unhandled exception's traceback
-    to print to at all, so today an unhandled crash (a GL context that
-    fails to create because a given GPU/driver doesn't support some
-    requested feature is the leading suspect for a reported AMD-only
-    crash - see the entry point below) is completely silent: the window
-    just flashes and closes, with nothing anywhere explaining why. This
-    doesn't fix any particular crash - it exists so the NEXT one leaves
-    behind something to actually diagnose it from, rather than staying
-    a guess. Never lets a failure IN this logging itself replace the
-    original exception - see the entry point's own re-raise.
-
-    Deliberately NOT written "next to the exe" via sys.executable - a
-    first version of this did exactly that, and it was WRONG for a
-    --onefile build specifically: Nuitka's own onefile bootstrap
-    unpacks the real program into a TEMPORARY directory and runs it
-    from there (confirmed directly in Nuitka's own C source,
-    OnefileBootstrap.c) - sys.executable inside that process points
-    INTO that temp directory, which the bootstrap deletes the moment
-    this process exits, crash or not. A crash log written there was
-    already gone by the time anyone went looking for it - it looked
-    exactly like no log had been written at all. ~/.ratwar isn't
-    touched by that cleanup and survives the process exiting, which is
-    the entire point of a crash log."""
+    """Appends the traceback to ~/.ratwar/crash_log.txt: a build has no console to print it to. Not next to the
+    exe - a onefile build runs from a temp dir that's deleted on exit. Never replaces the original exception."""
     import traceback
     import datetime
     try:

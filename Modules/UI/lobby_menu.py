@@ -23,13 +23,13 @@ expected to defer the real work (app.py just records a pending start/
 pending lobby-room-entry for its main loop).
 """
 
-from .controls import Checkbox, ColorWheel, ScrollBox, Slider
+from .controls import ColorWheel, ScrollBox, Slider
 from .inputs import Dropdown, TextInput
 from . import theme
+from .settings_panel import add_settings_options
 from .widgets import Anchor, Button, Image, Label, Panel
 from Modules.Player.hats import available_hats, display_name
 from Modules.Player.rat_colors import hsv_to_rgb, rgb_to_hsv
-from Modules.settings import settings
 
 # Where the fur color's brightness slider starts (and returns to on reset) -
 # well below full so a freshly picked color isn't blown out.
@@ -250,8 +250,7 @@ class LobbyMenu:
             self.color_brightness.set_value(v, notify=False)
 
     def _build_settings(self, stage):
-        """A gear button beside the palette button that opens a card of graphics options
-        (Modules/settings.py) - they take effect immediately and are saved."""
+        """A gear button beside the palette button that opens a card of the player options (settings_panel.py)."""
         card = stage.add(Panel(color=theme.CARD, anchor=Anchor.TOP_RIGHT, offset=(-40, 140),
                               layout="vertical", spacing=14, padding=22, fit_content=True,
                               visible=False))
@@ -261,21 +260,7 @@ class LobbyMenu:
             anchor=Anchor.TOP_RIGHT, offset=(-140, 40), **theme.BUTTON))
         self.settings_button.add(Image("Assets/Textures/UI/Settings.png", size=(56, 56),
                                        anchor=Anchor.CENTER))
-        card.add(Label("SETTINGS", font_size=28, color=theme.ACCENT))
-
-        def option(text, name):
-            def changed(checked):
-                setattr(settings, name, checked)
-                settings.save()
-            card.add(Checkbox(text, checked=getattr(settings, name), on_toggle=changed,
-                              font_size=26, size=(380, 40)))
-
-        option("Reflections (SSR)", "ssr")
-        option("Gibs on death", "gibs")
-        option("Bloom", "bloom")
-        card.add(Label("Off: water uses a cheap reflection,", font_size=20, color=_MUTED))
-        card.add(Label("deaths are a blood burst, not gibs,", font_size=20, color=_MUTED))
-        card.add(Label("and lights don't glow.", font_size=20, color=_MUTED))
+        add_settings_options(card)
 
     def _set_settings_open(self, show):
         if not hasattr(self, "settings_card"):

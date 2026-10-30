@@ -515,17 +515,17 @@ def _flatten_scene(scene):
         if all(u is not None for u in all_uvs): combined.visual.uv = np.concatenate(all_uvs, axis=0)
     return combined, used_node_names
 
-def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg, raw_factors, load_textures=None):
-    """The GPU-upload half of load_glb - given an already-flattened
-    (mesh, node_order) pair (see _flatten_scene/_flatten_scene_by_
-    material) plus the file's raw material factors (see
-    _read_raw_gltf_material_factors, computed once by the caller and
-    passed in here rather than re-parsed per call - matters for load_glb_
-    by_material, which calls this once per material group from the same
-    file), returns the same dict shape load_glb always has, or None on
-    failure (after releasing whatever GL resources this call already
-    created, exactly as load_glb's own try/except used to do inline)."""
+def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg, raw_factors,
+                     load_textures=None, extra_programs=None):
+    """The GPU-upload half of load_glb, for an already-flattened (mesh, node_order) and the file's raw material
+    factors (read once by the caller). Returns load_glb's dict, or None on failure (releasing what it made).
+
+    extra_programs: optional {result key: program} - each gets its own VAO under that key, built on the SAME
+    vertex/index buffers as prog's (a shadow or lightmap-bake pass), instead of the caller loading the file again
+    per program. "buffers" lists every buffer made, for whoever releases the object."""
+    extra_programs = extra_programs or {}
     buffers, vao, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj = [], None, None, None, None, None
+    extra_vaos = {}
     try:
         if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0: raise RuntimeError("Invalid or empty mesh.")
 
@@ -536,24 +536,8 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         lightmap_uvs = _read_gltf_uv1(path, node_order) if node_order else None
         has_lightmap_uv = lightmap_uvs is not None and len(lightmap_uvs) == len(vertices)
 
-        # Only the actual PBR/color-pass program's own VAO build needs a
-        # decoded/uploaded texture - the lightmap bake_program's shader
-        # declares no u_texture at all, and shadow_program's now DOES
-        # (see its own fragment shader in scene_base.py - an alpha-
-        # tested discard for MASK/BLEND casters) but never uses one
-        # loaded via THIS path: Scene._bind_shadow_alpha rebinds the
-        # object's already-loaded PBR-pass texture at draw time instead
-        # (see that method's own docstring), so a second, separate
-        # decode/upload just for the shadow VAO build would be pure
-        # duplicated waste - confirmed via cProfile as a real, multi-
-        # second-per-material cost earlier in this project's history
-        # (see _parse_gltf2_cached's own docstring) once a scene grew to
-        # 100+ materials, which is exactly the class of regression
-        # skipping this explicitly avoids reintroducing. load_textures=
-        # None (every existing caller) keeps the automatic "does prog
-        # declare u_texture" heuristic; a caller building specifically
-        # the SHADOW VAO passes load_textures=False explicitly to opt
-        # out of that heuristic.
+        # Textures only for a program that samples them (decoding them again for another pass measured as seconds
+        # per 100 materials); load_textures overrides the guess.
         needs_textures = ("u_texture" in prog) if load_textures is None else load_textures
         (
             base_color, metallic, roughness, emissive, base_alpha, alpha_mode, alpha_cutoff, double_sided,
@@ -564,29 +548,9 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
         colors = _extract_vertex_colors(mesh, base_color, len(vertices))
 
         if not has_lightmap_uv:
-            # No authored TEXCOORD_1 - generate one instead of falling
-            # back to an all-zero UV (which used to just leave the
-            # object out of lightmap baking entirely - see has_
-            # lightmap_uv's other read sites in scene_base.py). See
-            # lightmap_uv_generator.py's own docstring for the actual
-            # unwrap approach. This RE-INDEXES the mesh (charts can't
-            # share vertices across a UV seam - see generate_lightmap_
-            # uvs' own vertex_remap docstring), so every other per-
-            # vertex array has to be rebuilt to match via the same
-            # vertex_remap before anything below reads len(vertices)
-            # again.
-            #
-            # Cached to disk (lightmap_uv_cache_io.py) keyed on (path,
-            # node_order, vertex/face count) - this chart-building +
-            # packing pass is real per-triangle work that otherwise
-            # reran from scratch on every single scene load for every
-            # mesh shipped without an authored lightmap UV channel
-            # (confirmed as the dominant remaining load-time cost once
-            # recalculate_shadows=False already skips the lighting bake
-            # itself). node_order can be empty for a non-Scene input
-            # (see _flatten_scene's own docstring) - no stable per-node
-            # key to cache against in that case, so this just always
-            # regenerates, same as before this cache existed.
+            # No authored TEXCOORD_1: generate one (lightmap_uv_generator.py). That re-indexes the mesh (charts can't
+            # share vertices across a seam), so every per-vertex array is remapped. Cached on disk by (path,
+            # node_order, counts) - it was the biggest load cost left; without a node_order it always regenerates.
             orig_vertex_count, orig_face_count = len(vertices), len(faces)
             cached = (
                 load_uv_cache(path, node_order, orig_vertex_count, orig_face_count)
@@ -608,31 +572,31 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             has_lightmap_uv = True
 
         attr_data = {"in_position": (vertices, "3f"), "in_normal": (normals, "3f"), "in_color": (colors, "3f"), "in_uv": (uvs, "2f"), "in_lightmap_uv": (lightmap_uvs, "2f")}
-        # Only pbr_program's own vertex shader declares in_tangent at all
-        # (shadow_program/bake_program use their own separate, unrelated
-        # vertex shaders - see scene_base.py - so _has_attribute is
-        # always False for them here) - same "don't build data a VAO
-        # won't even read" reasoning as needs_textures above, and
-        # _compute_tangents is real per-triangle numpy work, not free.
-        # Computed AFTER the lightmap-UV remap above (not before) so it
-        # always matches whatever the FINAL vertices/faces/uvs/normals
-        # arrays actually are.
-        # Skipped for a material with no normal map (the shader only reads tangents when it
-        # has one): 16 of a vertex's 68 bytes, and a per-triangle numpy pass at load. A VAO
-        # without the attribute just leaves the constant default in place.
+        # Tangents only for a normal-mapped material (the shader reads them only then): 16 of a vertex's 68 bytes,
+        # and a per-triangle numpy pass. After the remap above, so they match the final arrays.
         if _has_attribute(prog, "in_tangent") and normal_tex_obj is not None:
             attr_data["in_tangent"] = (_compute_tangents(vertices, normals, uvs, faces), "4f")
-        vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items() if _has_attribute(prog, name)}
+        programs = [prog, *extra_programs.values()]
+        vbos = {name: ctx.buffer(data.tobytes()) for name, (data, fmt) in attr_data.items()
+                if any(_has_attribute(p, name) for p in programs)}
         # 16-bit indices whenever the mesh is small enough (most are): half the index bandwidth.
         small = len(vertices) <= 65536
+        index_size = 2 if small else 4
         ibo = ctx.buffer(faces.astype("u2" if small else "u4").tobytes())
         buffers = list(vbos.values()) + [ibo]
 
-        vao_content = [(vbos[name], attr_data[name][1], name) for name in vbos]
-        if not vao_content: raise RuntimeError("No recognized vertex attributes.")
-        vao = ctx.vertex_array(prog, vao_content, ibo, index_element_size=2 if small else 4)
+        def make_vao(program):
+            content = [(vbos[name], attr_data[name][1], name) for name in vbos if _has_attribute(program, name)]
+            return ctx.vertex_array(program, content, ibo, index_element_size=index_size) if content else None
+
+        vao = make_vao(prog)
+        if vao is None: raise RuntimeError("No recognized vertex attributes.")
+        for key, program in extra_programs.items():
+            extra_vaos[key] = make_vao(program)
 
         return {
+            **extra_vaos,
+            "buffers": buffers,
             "vao": vao, "vbo": vbos.get("in_position"), "normal_vbo": vbos.get("in_normal"),
             "color_vbo": vbos.get("in_color"), "uv_vbo": vbos.get("in_uv"),
             "lightmap_uv_vbo": vbos.get("in_lightmap_uv"), "has_lightmap_uv": has_lightmap_uv, "ibo": ibo,
@@ -644,34 +608,19 @@ def _build_mesh_data(mesh, node_order, path, scene, ctx, prog, recompute_normals
             "has_texture": 1 if tex_obj else 0, "has_metallic_roughness_texture": 1 if mr_tex_obj else 0,
             "has_normal_texture": 1 if normal_tex_obj else 0,
             "has_emissive_texture": 1 if emissive_tex_obj else 0,
-            # "OPAQUE" | "MASK" | "BLEND" (glTF alphaMode - see
-            # _extract_material's own docstring) plus the cutoff MASK
-            # uses and the material's own base alpha factor (multiplied
-            # with the base color texture's own alpha, if any, in the
-            # fragment shader - see pbr_shader.py). Scene._render_scene
-            # uses alpha_mode to decide per-object blend/cull-face state:
-            # OPAQUE renders exactly as before (back-face culled, no
-            # blending); MASK/BLEND both render double-sided (no
-            # culling) per this project's own choice to treat "not fully
-            # opaque" as "render both sides" - MASK additionally discards
-            # below alpha_cutoff in the shader instead of blending; BLEND
-            # draws in a separate, depth-write-disabled pass after
-            # every opaque/cutout object, with real alpha blending. An
-            # OPAQUE material can ALSO ask for double-sided rendering via
-            # glTF's own separate doubleSided flag (e.g. a water plane
-            # meant to be seen from both above and below) - see
-            # "double_sided" below, read independently of alpha_mode.
+            # glTF alphaMode: OPAQUE is back-face culled; MASK (discard below the cutoff) and BLEND (a later,
+            # depth-write-free blended pass) render double-sided. An OPAQUE material can still ask for double_sided.
             "alpha_mode": alpha_mode, "alpha_cutoff": alpha_cutoff, "base_alpha": base_alpha,
             "double_sided": double_sided,
         }
     except Exception as e:
         print(f"[Error] Failed to parse model {path}: {e}")
-        for res in [vao, *buffers, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj]:
+        for res in [vao, *extra_vaos.values(), *buffers, tex_obj, mr_tex_obj, normal_tex_obj, emissive_tex_obj]:
             if res: res.release()
         return None
 
 def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,
-              load_textures=None):
+              load_textures=None, extra_programs=None):
     path = Path(filepath)
     if not path.exists(): return print(f"[Warning] Model file not found: {path.resolve()}") or None
     try:
@@ -682,7 +631,7 @@ def load_glb(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFA
     mesh, node_order = _flatten_scene(scene)
     return _build_mesh_data(
         mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg,
-        _read_raw_gltf_material_factors(path), load_textures=load_textures,
+        _read_raw_gltf_material_factors(path), load_textures=load_textures, extra_programs=extra_programs,
     )
 
 def _material_key(geom):
@@ -932,15 +881,9 @@ def load_mesh_groups_by_object(model_path, scale=None):
     return results
 
 def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_angle_deg=DEFAULT_CREASE_ANGLE_DEG,
-                          load_textures=None):
-    """Like load_glb, but returns a LIST of per-material mesh-data dicts
-    (each shaped exactly like load_glb's own single return value, empty
-    list on total failure) instead of one dict merging every material in
-    the file into one - see _flatten_scene_by_material's own docstring
-    for why this exists. _read_raw_gltf_material_factors(path) is read
-    once here and shared across every group's _build_mesh_data call,
-    rather than re-parsing the file's raw glTF once per material just
-    for that lookup."""
+                          load_textures=None, extra_programs=None):
+    """Like load_glb, but a list of per-material dicts (see _flatten_scene_by_material); empty on failure.
+    extra_programs: see _build_mesh_data."""
     path = Path(filepath)
     if not path.exists(): return print(f"[Warning] Model file not found: {path.resolve()}") or []
     try:
@@ -957,19 +900,10 @@ def load_glb_by_material(filepath, ctx, prog, recompute_normals=False, crease_an
     for mesh, node_order in groups:
         data = _build_mesh_data(
             mesh, node_order, path, scene, ctx, prog, recompute_normals, crease_angle_deg, raw_factors,
-            load_textures=load_textures,
+            load_textures=load_textures, extra_programs=extra_programs,
         )
         if data is not None:
-            # Same key _flatten_scene_by_material itself grouped this
-            # mesh by (name if the material has one, else id(mat) - see
-            # _material_key) - exposed here so a caller (Scene.add_
-            # static's own alpha_mode_overrides) can target a SPECIFIC
-            # material by name without needing to re-export the source
-            # file just to fix how one material's alphaMode was
-            # authored (e.g. a foliage material exported as BLEND/
-            # Alpha Blend in Blender when it should behave like
-            # Unreal's Masked - hard cutout, full depth write/test, no
-            # sort-order dependence - see that override's own docstring).
+            # The grouping key, so add_static's *_overrides can target one material by name.
             data["material_name"] = _material_key(mesh)
             data["bloom"] = bool(node_order) and all(is_bloom_node(n) for n in node_order)
             data["node_names"] = list(node_order)

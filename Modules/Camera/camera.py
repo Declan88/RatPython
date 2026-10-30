@@ -54,18 +54,13 @@ class Camera:
             self.position += glm.normalize(glm.cross(self.front, self.up)) * velocity
 
     def process_mouse(self, xoffset, yoffset):
-        xoffset *= self.sensitivity
-        yoffset *= self.sensitivity
+        # Screen y grows downward, so moving the mouse down looks down.
+        self.rotate(xoffset * self.sensitivity, -yoffset * self.sensitivity)
 
-        self.yaw += xoffset
-        self.pitch -= yoffset  # Reversed since screen coordinates start top-left
-
-        # Clamp pitch to prevent camera flipping upside down
-        if self.pitch > 89.0:
-            self.pitch = 89.0
-        if self.pitch < -89.0:
-            self.pitch = -89.0
-
+    def rotate(self, yaw_degrees, pitch_degrees):
+        """Turns the view; pitch is clamped short of straight up/down so the camera can't flip."""
+        self.yaw += yaw_degrees
+        self.pitch = max(-89.0, min(89.0, self.pitch + pitch_degrees))
         self.update_vectors()
 
     def update_vectors(self):

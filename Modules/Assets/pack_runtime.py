@@ -24,7 +24,6 @@ import os
 import pathlib
 import shutil
 import stat as stat_module
-import sys
 import tempfile
 from collections import OrderedDict
 
@@ -70,7 +69,9 @@ def _entry(path):
 
 
 def _relative_key(p):
-    full = os.path.normcase(os.path.abspath(p)).replace("\\", "/")
+    # Lower-cased explicitly, like the index keys (pack_format.normalize): os.path.normcase only lower-cases on
+    # Windows, so on macOS/Linux every path with a capital letter used to miss the pack.
+    full = os.path.abspath(p).replace("\\", "/").lower()
     if full == _root_norm:
         return ""
     if full.startswith(_root_norm + "/"):
@@ -315,7 +316,7 @@ def install():
         print(f"[assets] pack found but not readable ({e}) - using plain files")
         return False
     _root_abs = os.path.abspath(ASSETS_DIR)
-    _root_norm = os.path.normcase(_root_abs).replace("\\", "/")
+    _root_norm = _root_abs.replace("\\", "/").lower()
 
     _dirs = {"": {}}
     for norm, entry in _index.items():

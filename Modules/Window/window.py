@@ -125,17 +125,15 @@ class WindowManager:
         pygame.display.gl_set_attribute(
             pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE
         )
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
-        # 2x rather than 4x - MSAA resolve cost is a real bandwidth tax
-        # on the Arc iGPU this project targets (shared system memory,
-        # no dedicated VRAM - see this file's own vsync comment below
-        # for the same class of hardware-specific tradeoff). Dropping
-        # to 2x roughly halves the resolve/edge-shading cost while
-        # keeping most of the anti-aliasing benefit over no MSAA at
-        # all - if edges still look acceptable, this is a cheap frame-
-        # time win; raise back to 4 if the difference in quality isn't
-        # worth it.
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 2)
+        # No MSAA on the window itself: scenes render anti-aliased into their own offscreen target (Modules/Graphics/
+        # scene_target.py) and present() resolves it into the window once. A multisampled window made that a
+        # full-screen MSAA-to-MSAA copy plus a second resolve when the frame was shown. (It also avoids the
+        # set_mode failure some drivers had with MSAA requested.)
+        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
+        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
+        # RGBA8 like the target: a multisample resolve needs identical colour formats (the default here was RGB8 -
+        # NVIDIA lets that pass, the spec and stricter drivers don't).
+        pygame.display.gl_set_attribute(pygame.GL_ALPHA_SIZE, 8)
 
         icon_path = resource_path("Assets/icon/icon.png")
         icon_image = pygame.image.load(icon_path)
@@ -172,31 +170,7 @@ class WindowManager:
         # vs ~0.01% with it off. It costs screen tearing instead, but
         # this scene renders at ~500fps uncapped so tears are very brief.
         self.vsync = 0
-        try:
-            self.screen = pygame.display.set_mode(
-                (self.width, self.height), self.flags, vsync=self.vsync
-            )
-        except pygame.error as e:
-            # A GPU/driver that can't satisfy the requested MSAA sample
-            # count for this pixel format is a well-known, genuinely
-            # cross-vendor way for context creation to fail outright
-            # instead of just silently downgrading - and with this
-            # project's own --windows-console-mode=disable build (see
-            # BuildCMD_Nuitka), an uncaught failure here has no console
-            # to ever print to, so it reads as the whole window just
-            # flashing and closing with no visible error at all (see
-            # app.py's own _write_crash_log for the other half of
-            # making that diagnosable). Retrying once with MSAA
-            # disabled entirely costs nothing on hardware that didn't
-            # need this fallback (this branch never runs there) and
-            # turns a hard crash into "runs without anti-aliasing" on
-            # hardware that does.
-            print(f"[WindowManager] set_mode failed with MSAA requested ({e}) - retrying without it.")
-            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
-            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
-            self.screen = pygame.display.set_mode(
-                (self.width, self.height), self.flags, vsync=self.vsync
-            )
+        self.screen = pygame.display.set_mode((self.width, self.height), self.flags, vsync=self.vsync)
         # set_mode with (0, 0) resolves to the actual desktop resolution -
         # read it back so self.width/height (and anything computing
         # camera aspect from them) reflect reality, not the (0, 0) request.

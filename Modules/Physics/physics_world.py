@@ -290,6 +290,7 @@ class PhysicsWorld:
         self.world = BulletWorld()
         self.world.setGravity(Vec3(0, 0, -gravity))
         self._node_paths = []
+        self._owner_nodes = []   # nodes carrying an "owner" tag (players' ghosts, hitboxes) - see overlapping_owners
         self._accumulator = 0.0
         self._pre_substep_callbacks = []
         # Climbable volumes (ladders.py), read by CharacterController every tick.
@@ -706,20 +707,6 @@ class PhysicsWorld:
         """The body's rotation as a render-space glm.quat."""
         return to_render_quat(node_path.getQuat())
 
-    def remove_body(self, node_path):
-        """Takes a rigid body out of the world for good."""
-        node = node_path.node()
-        if isinstance(node, BulletRigidBodyNode):
-            try:
-                self.world.removeRigidBody(node)
-            except Exception:
-                pass
-        node_path.removeNode()
-        try:
-            self._node_paths.remove(node_path)
-        except ValueError:
-            pass
-
     # ---------------------------------------------------------------
     # BOUNDS-DERIVED COLLIDERS (box/sphere sized automatically from a
     # model's own vertex bounds - convenient when a cheap collider just
@@ -882,7 +869,7 @@ class PhysicsWorld:
         shape = BulletBoxShape(to_physics_extent(half_extents))
         node = BulletGhostNode("hitbox")
         node.addShape(shape)
-        node.setPythonTag("owner", owner)
+        self.tag_owner(node, owner)
         node.setIntoCollideMask(collision_mask)
 
         node_path = self._root.attachNewNode(node)
@@ -916,7 +903,7 @@ class PhysicsWorld:
         shape = BulletSphereShape(float(radius))
         node = BulletGhostNode("sphere_trigger")
         node.addShape(shape)
-        node.setPythonTag("owner", owner)
+        self.tag_owner(node, owner)
         node.setIntoCollideMask(collision_mask)
 
         node_path = self._root.attachNewNode(node)
@@ -945,9 +932,30 @@ class PhysicsWorld:
         rather than waiting for scene teardown, or it leaks in the
         Bullet world for the rest of the process."""
         self.world.removeGhost(node_path.node())
+        self.untag_owner(node_path.node())
         node_path.removeNode()
         if node_path in self._node_paths:
             self._node_paths.remove(node_path)
+
+    def tag_owner(self, node, owner):
+        """Tags a node with whose body it is (a steam id) - what a contact query reads back to tell who it found.
+        Tagged nodes are tracked, so overlapping_owners only has to test against them."""
+        node.setPythonTag("owner", owner)
+        if owner is not None:
+            self._owner_nodes.append(node)
+
+    def untag_owner(self, node):
+        self._owner_nodes = [n for n in self._owner_nodes if n != node]
+
+    def overlapping_owners(self, node):
+        """The owners of every tagged node overlapping `node` right now - the same answer as a full contactTest
+        filtered by owner tag, but tested pairwise against the few tagged nodes only. A full contactTest of a
+        detector sphere on Boardwalk returned ~1,700 map-triangle contacts for Python to loop over."""
+        owners = set()
+        for other in self._owner_nodes:
+            if other != node and self.world.contactTestPair(node, other).getNumContacts():
+                owners.add(other.getPythonTag("owner"))
+        return owners
 
     def remove_body(self, node_path):
         """Generic teardown for ANY node_path this class returned - a rigid
@@ -963,6 +971,7 @@ class PhysicsWorld:
             self.world.removeRigidBody(node)
         else:
             self.world.removeGhost(node)
+        self.untag_owner(node)
         node_path.removeNode()
         if node_path in self._node_paths:
             self._node_paths.remove(node_path)
@@ -977,3 +986,4 @@ class PhysicsWorld:
                     pass
             node_path.removeNode()
         self._node_paths.clear()
+        self._owner_nodes.clear()

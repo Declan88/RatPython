@@ -207,6 +207,7 @@ class UIRenderer:
             self.vao.release()
             self.vbo.release()
         self._capacity = max(quads, self._capacity * 2)
+        self._uploaded = None   # the new buffer holds nothing yet
         self.vbo = self.ctx.buffer(reserve=self._capacity * 6 * _FLOATS_PER_VERTEX * 4, dynamic=True)
         self.vao = self.ctx.vertex_array(
             self.prog, [(self.vbo, "2f 2f 4f", "in_pos", "in_uv", "in_color")]
@@ -227,19 +228,21 @@ class UIRenderer:
             return
         self._ensure_capacity(len(quads))
 
-        verts = []
-        for _, corners, uvs, c, _clip in quads:
-            # corners/uvs are already in this exact (top-left, top-right, bottom-right,
-            # bottom-left) winding for every quad, axis-aligned or not - see DrawList's
-            # own docstring.
-            (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
-            (u0, v0), (u1, v1), (u2, v2), (u3, v3) = uvs
-            verts.extend((
-                x0, y0, u0, v0, *c,  x1, y1, u1, v1, *c,  x2, y2, u2, v2, *c,
-                x0, y0, u0, v0, *c,  x2, y2, u2, v2, *c,  x3, y3, u3, v3, *c,
-            ))
-        self.vbo.orphan()     # a fresh buffer: writing the one the GPU may still be reading would stall
-        self.vbo.write(np.asarray(verts, dtype="f4").tobytes())
+        # The HUD is usually identical from one frame to the next: then the buffer already holds exactly these
+        # vertices, and building and uploading them again is skipped.
+        if quads != self._uploaded:
+            verts = []
+            for _, corners, uvs, c, _clip in quads:
+                # (top-left, top-right, bottom-right, bottom-left) for every quad - see DrawList.
+                (x0, y0), (x1, y1), (x2, y2), (x3, y3) = corners
+                (u0, v0), (u1, v1), (u2, v2), (u3, v3) = uvs
+                verts.extend((
+                    x0, y0, u0, v0, *c,  x1, y1, u1, v1, *c,  x2, y2, u2, v2, *c,
+                    x0, y0, u0, v0, *c,  x2, y2, u2, v2, *c,  x3, y3, u3, v3, *c,
+                ))
+            self.vbo.orphan()     # a fresh buffer: writing the one the GPU may still be reading would stall
+            self.vbo.write(np.asarray(verts, dtype="f4").tobytes())
+            self._uploaded = quads
 
         ctx = self.ctx
         ctx.screen.use()

@@ -313,13 +313,8 @@ class CharacterController:
         self.node = BulletGhostNode("player")
         self.node.addShape(self._standing_shape)
         self.node.setIntoCollideMask(CollisionGroup.PLAYER)
-        # Same "owner" python-tag convention PhysicsWorld.add_hitbox/
-        # add_sphere_trigger already use for a remote player's own hitbox -
-        # lets a contactTest-based query (e.g. Modules/Actors/actor_base.py's
-        # own player-proximity trigger) identify the LOCAL player the exact
-        # same way it already identifies a remote one, rather than needing a
-        # separate "is this literally player.node" special case.
-        self.node.setPythonTag("owner", owner)
+        # Tagged like a remote player's hitbox, so actor triggers (PhysicsWorld.overlapping_owners) find us too.
+        physics_world.tag_owner(self.node, owner)
         self.node_path = physics_world._root.attachNewNode(self.node)
         self.node_path.setPos(to_physics_pos(position))
         physics_world.world.attachGhost(self.node)
@@ -903,10 +898,8 @@ class CharacterController:
     # -----------------------------------------------------------------
 
     def set_move_direction(self, direction):
-        """direction: glm.vec3 (or anything glm.vec3() accepts) on the
-        render XZ ground plane - Y is ignored. Only the direction
-        matters (this is normalized internally to get wishdir); pass a
-        zero vector when no movement key is held."""
+        """direction: glm.vec3 on the render XZ ground plane (Y ignored) - zero when there's no movement input. Its
+        length, capped at 1, scales the speed: a half-tilted stick walks, WASD (length 1 or more) is full speed."""
         self._move_direction = glm.vec3(direction)
         self._move_direction.y = 0.0
 
@@ -981,7 +974,7 @@ class CharacterController:
         if length <= 1e-6:
             return glm.vec3(0.0), 0.0
         wishdir = self._move_direction / length
-        wishspeed = self.sprint_speed if self._sprinting else self.ground_speed
+        wishspeed = (self.sprint_speed if self._sprinting else self.ground_speed) * min(1.0, length)
         if self._is_crouched:
             wishspeed *= self.crouch_speed_multiplier
         return wishdir, wishspeed
@@ -1577,4 +1570,5 @@ class CharacterController:
         self._physics_world.world.removeGhost(self._stand_check_ghost)
         self._stand_check_ghost_np.removeNode()
         self._physics_world.world.removeGhost(self.node)
+        self._physics_world.untag_owner(self.node)
         self.node_path.removeNode()

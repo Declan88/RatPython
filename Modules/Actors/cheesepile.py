@@ -59,16 +59,7 @@ _DETECTOR_RADIUS = 6
 
 class CheesePile(ActorBase):
     actor_id = "cheesepile"
-    # The "detector" sphere below is a pure proximity/event print, not
-    # anything needing frame-perfect response - checking it every 4th
-    # frame (~15Hz at 60fps) instead of every single one cuts most of
-    # the cost confirmed to be the actual cause of a measurable fps
-    # drop (ActorBase.shape_check_interval's own docstring has the full
-    # numbers: contactTest's cost scales with how many OTHER bodies
-    # exist in the level - ~0.15ms/call on mainmap.glb's 88 separate
-    # static colliders vs ~0.0002ms in an empty world - not with this
-    # actor's own tiny sphere).
-    shape_check_interval = 4
+    shape_check_interval = 4   # who's at the pile doesn't need frame-perfect timing
     # dynamic=True (-> Scene.add_dynamic_morph, not Scene.add_static) is
     # what keeps the visible wedge out of bake_static_lighting(), which
     # only ever iterates static_objects (see its own docstring) -

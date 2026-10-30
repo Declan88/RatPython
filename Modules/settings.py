@@ -1,5 +1,5 @@
 """
-Player-facing graphics options, kept in ~/.ratwar/settings.json.
+Player-facing options, kept in ~/.ratwar/settings.json.
 
 `settings` is one shared object: systems read its attributes when they need
 them (the scene each frame, the death effect when someone dies), so a change
@@ -10,14 +10,21 @@ import json
 import os
 
 _PATH = os.path.join(os.path.expanduser("~"), ".ratwar", "settings.json")
-_DEFAULTS = {"ssr": True, "gibs": True, "bloom": True}
+_DEFAULTS = {
+    "ssr": True,                      # screen-space reflections (water)
+    "gibs": True,                     # physical gibs on death (off = a cheap blood burst)
+    "bloom": True,                    # glow on "bloom_" objects (see Modules/Graphics/bloom.py)
+    "controller_sensitivity": 1.0,    # right-stick look speed multiplier
+    "controller_invert_y": False,
+    "aim_assist": True,               # controller only (Modules/Input/aim_assist.py)
+    "controller_vibration": True,
+}
 
 
 class Settings:
     def __init__(self):
-        self.ssr = _DEFAULTS["ssr"]        # screen-space reflections (water)
-        self.gibs = _DEFAULTS["gibs"]      # physical gibs on death (off = a cheap blood burst)
-        self.bloom = _DEFAULTS["bloom"]    # glow on "bloom_" objects (see Modules/Graphics/bloom.py)
+        for key, default in _DEFAULTS.items():
+            setattr(self, key, default)
         self.load()
 
     def load(self):
@@ -27,7 +34,11 @@ class Settings:
         except (OSError, ValueError):
             return
         for key, default in _DEFAULTS.items():
-            setattr(self, key, bool(data.get(key, default)))
+            if key in data:
+                try:
+                    setattr(self, key, type(default)(data[key]))   # same type as the default (bool, float)
+                except (TypeError, ValueError):
+                    pass
 
     def save(self):
         try:
