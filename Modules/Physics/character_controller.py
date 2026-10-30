@@ -98,8 +98,14 @@ _EYE_SMOOTH_TAU = 0.05
 
 # Source's AirAccelerate add-speed cap is 30 units/s; 1 Source unit is
 # 1 inch (0.0254m), so 30 * 0.0254 = 0.762 m/s - the exact conversion,
-# not a rounded guess.
+# not a rounded guess. Air control no longer uses it to limit steering, only
+# how fast strafing can push speed above run speed (see _air_accelerate).
 _AIR_SPEED_CAP = 30.0 * 0.0254
+
+# How hard air control steers, as a fraction of the air acceleration (1 = as
+# snappy as on the ground). Strafing still gets Source's full step - see
+# _air_accelerate.
+_AIR_CONTROL = 0.6
 
 # Ratio of eye_height/crouch_eye_height to height/crouch_height when
 # not given explicitly - matches this project's original hardcoded
@@ -357,6 +363,7 @@ class CharacterController:
         self._move_direction = glm.vec3(0.0)
         self._sprinting = False
         self._jump_requested = False
+        self.frozen = False   # held still, gravity included (see halt) until the next teleport
         # True from the instant a REAL jump executes (see _on_pre_substep) until its
         # rise is over (velocity.y drops back to <=0 - see _categorize_position's own
         # clear condition) - what _categorize_position actually skips the ground probe
@@ -926,10 +933,26 @@ class CharacterController:
         requiring a fresh press each time)."""
         self._jump_requested = True
 
+    def halt(self):
+        """Stops dead and stays put (the owner died): no velocity, movement input, queued jump or gravity - the
+        hull is frozen where it is, even in mid-air, until the next teleport (the respawn) releases it."""
+        self.velocity = glm.vec3(0.0)
+        self._move_direction = glm.vec3(0.0)
+        self._sprinting = False
+        self._jump_requested = False
+        self._leave_ladder()
+        # Pinned where it's drawn right now (between two physics ticks), so stopping doesn't snap the view.
+        shown = self.get_position()
+        self.node_path.setPos(to_physics_pos(shown))
+        self._prev_position = glm.vec3(shown)
+        self._smoothed_position = glm.vec3(shown)
+        self.frozen = True
+
     def teleport(self, position):
         """Puts the hull at `position` (render space, hull CENTER) with no velocity
-        and no interpolation smear - for respawning."""
+        and no interpolation smear - for respawning (so it also releases a halt)."""
         self.node_path.setPos(to_physics_pos(position))
+        self.frozen = False
         self.velocity = glm.vec3(0.0)
         self._prev_position = to_render_pos(self.node_path.getPos())
         self._smoothed_position = glm.vec3(self._prev_position)
@@ -1004,20 +1027,27 @@ class CharacterController:
         self.velocity.z += accel_speed * wishdir.z
 
     def _air_accelerate(self, wishdir, wishspeed, accel, dt):
-        # The add-speed check uses the CAPPED wishspeed (limits how much
-        # a single tick's air control can redirect existing momentum),
-        # but accel_speed's magnitude still comes from the UNCAPPED
-        # wishspeed - see the module docstring for why this asymmetry
-        # is intentional, not a typo.
-        capped_wishspeed = min(wishspeed, _AIR_SPEED_CAP)
+        # Air control: the add-speed check uses the full wishspeed (Source
+        # caps it at _AIR_SPEED_CAP), so the player can steer, stop and
+        # reach run speed in mid-air, at _AIR_CONTROL of the acceleration
+        # (but never less than Source's own step, so strafing is unchanged).
+        # Speed above run speed may still only grow as fast as Source's
+        # capped strafing would allow, so air control doesn't turn into
+        # a much faster bunny hop.
         horiz = glm.vec3(self.velocity.x, 0.0, self.velocity.z)
         current_speed = glm.dot(horiz, wishdir)
-        add_speed = capped_wishspeed - current_speed
+        step = accel * dt * wishspeed
+        add_speed = wishspeed - current_speed
         if add_speed <= 0.0:
             return
-        accel_speed = min(accel * dt * wishspeed, add_speed)
-        self.velocity.x += accel_speed * wishdir.x
-        self.velocity.z += accel_speed * wishdir.z
+        source_add = min(step, max(_AIR_SPEED_CAP - current_speed, 0.0))
+        speed_limit = max(glm.length(horiz + wishdir * source_add), wishspeed)
+        new = horiz + wishdir * max(min(step * _AIR_CONTROL, add_speed), source_add)
+        new_speed = glm.length(new)
+        if new_speed > speed_limit:
+            new *= speed_limit / new_speed
+        self.velocity.x = new.x
+        self.velocity.z = new.z
 
     # -----------------------------------------------------------------
     # Crouching (shape swap is now trivial - see the module docstring)
@@ -1204,6 +1234,11 @@ class CharacterController:
     # -----------------------------------------------------------------
 
     def _on_pre_substep(self, dt):
+        if self.frozen:
+            # Halted (see halt): no movement, gravity or footsteps, and nothing left to interpolate.
+            self.velocity = glm.vec3(0.0)
+            self._prev_position = self._smoothed_position
+            return
         raw = to_render_pos(self.node_path.getPos())
 
         # Only while grounded - airborne there's no ground-contact
@@ -1537,6 +1572,12 @@ class CharacterController:
         walking; X/Z are exact, unfiltered physics positions."""
         alpha = self._physics_world.get_interpolation_alpha()
         return glm.mix(self._prev_position, self._smoothed_position, alpha)
+
+    def get_feet_position(self):
+        """Render-space glm.vec3 - the bottom of the hull (where a character model's feet go), from its CURRENT
+        height: crouching on the ground shrinks the hull and lowers its centre, so the standing height would put
+        the feet that far below the floor."""
+        return self.get_position() - glm.vec3(0.0, self._current_height / 2.0, 0.0)
 
     def _eye_offset_for(self, current_height, crouch_amount):
         """Render-space Y offset from a hull center to where the camera

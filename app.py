@@ -68,7 +68,7 @@ from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
 from Modules.Input import Action, AimAssist, InputManager, CONTROLLER
-from Modules.Input.bindings import RUMBLE_DAMAGE, RUMBLE_DEATH, RUMBLE_FIRE, RUMBLE_HIT
+from Modules.Input.bindings import RUMBLE_DAMAGE, RUMBLE_DEATH, RUMBLE_FIRE, RUMBLE_HIT, WHEEL_STICK_SPEED
 from Modules.UI import gamepad_nav
 from Modules.settings import settings
 
@@ -124,10 +124,26 @@ PLAYER_ANIMATION_STATES = (
     ("walk", "rifle_walk", 90.0 * 0.0254),
     ("run", "rifle_run", 220.0 * 0.0254),
 )
-# Facing-relative walk clips (no directional run set exists yet, so "run" always plays rifle_run).
+# Facing-relative walk and crouch-walk clips (no directional run set exists yet, so "run" always plays rifle_run).
+# The crouch-walk names are remote_player.CROUCH_WALK_CLIPS' (loaded below).
 PLAYER_DIRECTIONAL_CLIPS = {
     "walk": {"N": "rifle_walk",
              **{d.upper(): f"rifle_walk_{d}" for d in ("s", "e", "w", "ne", "nw", "se", "sw")}},
+    "crouch_walk": {"N": "crouch_walk",
+                    **{d.upper(): f"crouch_walk_{d}" for d in ("s", "e", "w", "ne", "nw", "se", "sw")}},
+}
+# How a weapon's held pose is layered over the locomotion: HL2's own weightlist for its gun-holding layers
+# ("weights_layer_walk_aiming" in male_shared.qc - the hips and spine ease in, chest/arms/neck/head fully, legs not at
+# all; unlisted joints take their nearest listed ancestor's weight), blended in component space as those layers'
+# "worldspace" flag does, so the chest keeps the pose's facing while the running hips twist under it.
+WEAPON_POSE_WEIGHTS = {
+    "ValveBiped.Bip01_Pelvis": 0.1,
+    "ValveBiped.Bip01_Spine": 0.2,
+    "ValveBiped.Bip01_Spine1": 0.4,
+    "ValveBiped.Bip01_Spine2": 0.6,
+    "ValveBiped.Bip01_Spine4": 1.0,
+    "ValveBiped.Bip01_L_Thigh": 0.0,
+    "ValveBiped.Bip01_R_Thigh": 0.0,
 }
 # Rat eye level is 1.39225 m above the feet; CharacterController puts the eye at height * 8/9.
 PLAYER_HEIGHT = 1.39225 * 9 / 8
@@ -135,6 +151,7 @@ PLAYER_HEIGHT = 1.39225 * 9 / 8
 from Modules.Graphics.paper_doll import PaperDoll
 from Modules.UI.killfeed import KillFeed
 from Modules.UI.damage_indicator import DamageIndicator
+from Modules.UI.damage_numbers import DamageNumbers
 from Modules.UI.chatbox import ChatBox
 from Modules.Chat import commands
 from Modules.Camera.camera import Camera
@@ -182,7 +199,8 @@ def load_steam_api_dll():
 load_steam_api_dll()
 
 from Modules.Networking.network_manager import NetworkManager
-from Modules.Networking.remote_player import RemotePlayer
+from Modules.Networking.remote_player import (
+    AIM_LEVEL_JOINT, AIM_PITCH_JOINTS, CROUCH_STATES, CROUCH_WALK_CLIPS, CROUCH_WALK_FILE, ROOT_OFFSETS, RemotePlayer)
 from Modules.GameModes import Deathmatch, coerce_map, create_game_mode, game_mode_ids, get_game_mode_class
 
 
@@ -285,19 +303,22 @@ def main():
             tint_mask_path=RAT_TINT_MASK_PATH,
             states=PLAYER_ANIMATION_STATES,
             directional_clips=PLAYER_DIRECTIONAL_CLIPS,
+            root_offsets=ROOT_OFFSETS,         # per-clip body offsets (the crouch pose's raised feet)
+            aim_pitch_joints=AIM_PITCH_JOINTS,  # the spine bends to where we look...
+            aim_level_joint=AIM_LEVEL_JOINT,    # ...and the head faces straight ahead at pitch 0
             # Locomotion splits at the clavicles, not their parent Spine4: Spine4 also parents the neck and
             # head, which must keep following the lower body's locomotion clip.
             upper_body_root_joints=[
                 "ValveBiped.Bip01_R_Clavicle",
                 "ValveBiped.Bip01_L_Clavicle",
             ],
-            # A weapon's held pose (set_upper_override) splits at Spine4 instead: those clips were authored with
-            # their own Spine4/neck rotation, and splitting them at the clavicles posed the arms off the wrong
-            # parent transform.
-            override_upper_body_root_joints=["ValveBiped.Bip01_Spine4"],
+            # A weapon's held pose (set_upper_override) is layered on the way Source layers HL2's gun-holding
+            # poses: its weightlist, blended in component space (see WEAPON_POSE_WEIGHTS).
+            override_upper_body_root_joints=WEAPON_POSE_WEIGHTS,
+            override_upper_body_component_space=True,
             upper_states=PLAYER_ANIMATION_STATES,
             jump_animation="rifle_jump",       # held on both bodies while airborne
-            crouch_animation="rifle_crouch",   # held on both bodies while crouched
+            crouch_animation=CROUCH_STATES,    # both bodies while crouched: the pose, then the crouch walk
         )
         if local_player_model.obj is not None:
             local_player_model.obj["specular_strength"] = 0   # flat shading, like the torus scene's rat
@@ -306,6 +327,8 @@ def main():
             current_scene.load_additional_animations(
                 local_player_model.obj, f"{RIFLE_POSE_DIR}/{filename}", rename={"New": clip},
                 time_scale=RAT_ANIM_TIME_SCALE if fix_fps else 1.0)
+        current_scene.load_additional_animations(
+            local_player_model.obj, CROUCH_WALK_FILE, rename=CROUCH_WALK_CLIPS, time_scale=RAT_ANIM_TIME_SCALE)
         # Whatever clips Emotes.glb holds become the emote wheel's catalogue (none collide with the names above).
         emote_catalogue = current_scene.load_additional_animations(
             local_player_model.obj, "Assets/Animations/Emotes/Emotes.glb",
@@ -415,7 +438,8 @@ def main():
     weapon_hud = ui.root.add(WeaponHUD())   # current weapon + ammo, other slots dim above it
     hitmarker = ui.root.add(Hitmarker())   # ticks over the crosshair when one of our shots hits a player
     damage_indicator = ui.root.add(DamageIndicator())   # arrow pointing at whoever just hurt us
-    game_hud = (health_bar, round_timer_label, crosshair, weapon_hud, name_tags)   # shown only in a match
+    damage_numbers = DamageNumbers(ui)   # the damage each of our hits did, popping up where it landed
+    game_hud = (health_bar, round_timer_label, crosshair, weapon_hud, name_tags, damage_numbers)   # shown only in a match
 
     def set_game_hud_visible(on):
         for widget in game_hud:
@@ -559,7 +583,8 @@ def main():
 
     def explode(source_weapon, hit):
         """Sets off source_weapon.explosion where `hit` landed: everyone inside its radius takes damage (the
-        shooter only a proportion of it, see Explosion) and, if it kills them, their gibs fly away from it."""
+        shooter only a proportion of it, see Explosion) and, if it kills them, their gibs fly away from it.
+        Returns {target id: (position, damage)} for every other player it hurt (for the damage numbers)."""
         explosion = source_weapon.explosion
         damage_class = source_weapon.damage_class.name
         origin = glm.vec3(hit.position) + glm.vec3(hit.normal) * 0.1     # just off the surface
@@ -571,22 +596,39 @@ def main():
         blast_hits = explosion.hits(
             origin, targets, invoker=me,
             blocked=lambda a, b: current_scene.physics.raycast(a, b, CollisionGroup.STATIC) is not None)
-        hurt_someone = False
+        target_positions = dict(targets)
+        splash = {}
         for blast in blast_hits:
             if blast.is_invoker:
                 death["damage_class"] = damage_class
                 change_health(-blast.damage)
                 controls.rumble(RUMBLE_DAMAGE, blast.damage / 40.0)
                 point_damage_indicator(origin)   # our own splash never comes through net_mgr.on_damage
-            elif blast.target_id == TEST_DUMMY_STEAM_ID:
-                hurt_someone = True
+                continue
+            splash[blast.target_id] = (target_positions.get(blast.target_id, origin), blast.damage)
+            if blast.target_id == TEST_DUMMY_STEAM_ID:
                 damage_dummy(blast.damage, source_weapon.name, False, push=blast.push, damage_class=damage_class)
             else:
-                hurt_someone = True
                 net_mgr.send_damage(blast.target_id, blast.damage, source_weapon.name, push=blast.push,
                                     damage_class=damage_class, origin=tuple(origin))
-        if hurt_someone:
+        if splash:
             hitmarker.trigger(headshot=False)
+        return splash
+
+    def show_damage_numbers(shot, splash):
+        """Damage numbers for one of our shots: the direct hit (if it struck a player) and its explosion's splash
+        (explode's result) on each player it caught. With combine_explosion_damage on, a player both hit and caught
+        in the blast gets one number for the total instead of two."""
+        if not settings.damage_numbers:
+            return
+        splash = dict(splash)
+        if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
+            total = shot.damage
+            if settings.combine_explosion_damage and shot.victim in splash:
+                total += splash.pop(shot.victim)[1]
+            damage_numbers.add(shot.hit.position, total, shot.headshot)
+        for position, amount in splash.values():
+            damage_numbers.add(position, amount)
 
     def die_by_command(damage_class, message):
         """/kill or /smite on ourselves (also what an admin's remote /kill or /smite runs here). Always this
@@ -825,7 +867,7 @@ def main():
         death["active"] = True
         death["eye_drop"] = 0.0
         controls.rumble(RUMBLE_DEATH)
-        feet = player.get_position() - glm.vec3(0.0, PLAYER_HEIGHT / 2.0, 0.0)
+        feet = player.get_feet_position()
         push = death["push"] if time.perf_counter() - death["push_time"] < 1.0 else None
         death["push"] = None
         damage_class, death["damage_class"] = death["damage_class"], "bullet"
@@ -841,7 +883,11 @@ def main():
         third_person = True   # watch the gibs instead of the inside of our hidden body
         crosshair.visible = False
         weapon_hud.visible = False
-        stop_moving()
+        player.halt()          # the body's gone: no sliding or flying on with the momentum we died with
+        for w in inventory.weapons:
+            w.reset()          # a reload, rack or scope from this life doesn't carry on (or play sounds) while dead
+        if weapon is not None:
+            weapon.play("idle")
         death_screen.show()
 
     def end_death():
@@ -851,6 +897,8 @@ def main():
         player.teleport(game_mode.choose_spawn_position())
         apply_spawn_rotation()
         refill_player()
+        if weapon is not None:
+            weapon.set_active(True)   # draws the gun afresh, like a weapon switch (before the visibility below)
         set_local_body_visible(True)
         crosshair.visible = True
         weapon_hud.visible = True
@@ -945,13 +993,25 @@ def main():
     controls.on_disconnected = controller_disconnected
 
     def controller_menu_input(dt):
-        """While the cursor is free (menus, the pause menu) and the controller is in use: the left stick moves the
-        cursor, the D-pad jumps between controls (and steps a slider), A clicks, the right stick scrolls, and B
-        closes an open dropdown, then the pause menu."""
-        directions = controls.nav_presses(dt)      # every frame, so a held direction repeats properly
+        """While the cursor is free (menus, the pause menu) and the controller is in use (the cursor is hidden): the
+        D-pad or left stick jumps between controls (steps a slider, moves through an open dropdown's options, and on
+        a colour wheel the stick moves its marker), A clicks, the right stick scrolls, and B closes an open dropdown,
+        then the pause menu."""
+        wheel = gamepad_nav.hovered_wheel(ui)
+        directions = controls.nav_presses(dt, stick=wheel is None)   # every frame, so a held direction repeats
         if controls.device != CONTROLLER:
             return
-        controls.drive_ui_cursor(dt, (window.width, window.height))
+        dropdown = ui.popup if hasattr(ui.popup, "pick_hovered") else None
+        controls.drive_ui_cursor(dt, click=dropdown is None)
+        if dropdown is not None and controls.pressed(Action.UI_CLICK):
+            # Pick the highlighted option and put the cursor back on the box, not on whatever is under the list.
+            dropdown.pick_hovered()
+            x, y, w, h = dropdown.rect
+            pygame.mouse.set_pos((round((x + w / 2) * ui.scale), round((y + h / 2) * ui.scale)))
+            controls.cursor_moved()
+            return
+        if wheel is not None and gamepad_nav.drive_wheel(ui, wheel, controls.left_stick(), dt, WHEEL_STICK_SPEED):
+            controls.cursor_moved()
         for direction in directions:
             if gamepad_nav.navigate(ui, direction):
                 controls.cursor_moved()
@@ -983,6 +1043,7 @@ def main():
         return ui.handle_event(event)
 
     def on_key_down(key):
+        nonlocal third_person
         if in_menu or in_lobby:
             return
         if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not pause["on"] and not chatbox.focused:
@@ -1006,6 +1067,10 @@ def main():
         if key == pygame.K_F1:
             ui_demo.visible = not ui_demo.visible
             ui.set_cursor_free(ui_demo.visible)
+        if key == pygame.K_v:
+            # TEMPORARY (animation checking): V toggles third person. Remove before release.
+            third_person = not third_person
+            set_local_body_visible(True)   # re-evaluated for the new view (body and world model)
         slot = WEAPON_SLOT_KEYS.get(key)
         if (slot is not None and weapon is not None and not ui.cursor_free
                 and len(inventory) > 1 and slot < len(inventory)):
@@ -1050,6 +1115,7 @@ def main():
             camera, on_key_down=on_key_down, event_filter=count_click
         )
         controls.update(dt)
+        ui.set_cursor_hidden(controls.pointer_hidden)
 
         if pause["quit"]:
             break
@@ -1093,8 +1159,7 @@ def main():
                            if not other.dead]
                 if test_dummy is not None and not test_dummy.dead:
                     targets.append((TEST_DUMMY_STEAM_ID, test_dummy.body_center))
-                scale, pull_yaw, pull_pitch = aim_assist.update(
-                    camera, targets, bool(look_yaw or look_pitch or move_x or move_y), dt, line_of_sight)
+                scale, pull_yaw, pull_pitch = aim_assist.update(camera, targets, dt, line_of_sight)
                 look_yaw, look_pitch = look_yaw * scale + pull_yaw, look_pitch * scale + pull_pitch
             if look_yaw or look_pitch:
                 camera.rotate(look_yaw, look_pitch)
@@ -1212,13 +1277,12 @@ def main():
         if weapon is not None and in_play and alive:
             shots = weapon.shots_this_frame(controls.pressed(Action.FIRE), controls.held(Action.FIRE))
             shots_fired_this_frame = shots
-            if shots:
-                controls.rumble(RUMBLE_FIRE)
             for _ in range(shots):
                 # A line trace along the aim: the first wall, prop or player hitbox it meets is what was hit.
                 shot = weapon.fire(current_scene, camera.position, direction=camera.front, follow=camera_position)
-                if shot is None:
+                if shot is None:      # not ready (fire rate, reloading, empty): no shot, no rumble
                     continue
+                controls.rumble(RUMBLE_FIRE)
                 end = (shot.hit.position if shot.hit is not None
                        else camera.position + shot.direction * weapon.max_range)
                 net_mgr.notify_shot(glm.vec3(end))
@@ -1229,8 +1293,10 @@ def main():
                 tracers.add(muzzle, end, style=weapon.tracer_style)
                 weapon.spawn_tracer_spiral(particles, muzzle, end, camera_pos=camera.position)
                 spawn_shot_impact(weapon, shot.hit)
+                splash = {}
                 if weapon.explosion is not None and shot.hit is not None:
-                    explode(weapon, shot.hit)
+                    splash = explode(weapon, shot.hit)
+                show_damage_numbers(shot, splash)
                 if weapon.muzzle_particle:
                     # overlay while the first-person gun is on screen (its depth is squashed)
                     particles.spawn(weapon.muzzle_particle, muzzle, forward=shot.direction,
@@ -1258,9 +1324,9 @@ def main():
 
         prof.mark("camera + weapons")
 
-        # get_position() is the hull centre; the model stands at the feet. Horizontal speed only, so jumping or
-        # falling never reads as running.
-        feet_position = player.get_position() - glm.vec3(0.0, PLAYER_HEIGHT / 2.0, 0.0)
+        # The model stands at the hull's bottom (crouched, that's the shorter hull's). Horizontal speed only, so
+        # jumping or falling never reads as running.
+        feet_position = player.get_feet_position()
         horiz_speed = glm.length(glm.vec3(player.velocity.x, 0.0, player.velocity.z))
         just_jumped = player.pop_jumped()   # the takeoff pose plays the moment a jump executes
         grounded = player.is_on_ground() or player.is_on_ladder()
@@ -1277,6 +1343,7 @@ def main():
             move_direction=move_dir,              # picks the directional walk clip
             just_jumped=just_jumped,
             just_shot=shots_fired_this_frame > 0,   # firing cancels an emote
+            pitch_degrees=camera.pitch,           # bends the spine toward where we look (others get it too)
         )
         was_emoting, is_emoting_now = emote_was_playing[0], local_player_model.is_emoting()
         if was_emoting and not is_emoting_now and not death["active"]:
@@ -1320,6 +1387,7 @@ def main():
             round_timer_label.text = f"{minutes}:{seconds:02d}"
         chatbox.update()
         damage_indicator.update(camera)
+        damage_numbers.update(camera, window.ctx.screen.size)
         if (dummy_state["respawn_at"] is not None and time.perf_counter() >= dummy_state["respawn_at"]
                 and test_dummy is not None):
             dummy_state["respawn_at"] = None

@@ -1148,7 +1148,7 @@ class Scene:
                       upper_body_root_joints=None, upper_animation=None,
                       loop=True, upper_loop=True,
                       upper_rotation_offset_degrees=(0.0, 0.0, 0.0),
-                      time_scale=1.0, skin_index=0, node_names=None):
+                      time_scale=1.0, skin_index=0, node_names=None, material_names=None):
         """Loads a skinned/animated glb - see skeletal_loader.py for
         format constraints (one skin, one mesh primitive, LINEAR/STEP
         interpolation only).
@@ -1244,9 +1244,11 @@ class Scene:
         with that region desaturated. Nothing changes until a tint is set.
 
         skin_index: which skin to load from a glb that has several - see
-        skeletal_loader.load_skinned_glb."""
+        skeletal_loader.load_skinned_glb, as for node_names/material_names
+        (load only those mesh nodes / only primitives with those
+        materials)."""
         data = load_skinned_glb(model_path, ctx=self.ctx, time_scale=time_scale, skin_index=skin_index,
-                                node_names=node_names)
+                                node_names=node_names, material_names=material_names)
         if data is None:
             return None
 
@@ -1647,7 +1649,8 @@ class Scene:
             blend_duration = 0.0
         _apply_upper_rotation_offsets(obj, new_offsets, blend_duration)
 
-    def set_skeletal_upper_joint_mask(self, obj, root_joint_names, blend_duration=_DEFAULT_ANIM_BLEND_DURATION):
+    def set_skeletal_upper_joint_mask(self, obj, root_joint_names, blend_duration=_DEFAULT_ANIM_BLEND_DURATION,
+                                      component_space=False):
         """Replaces which joints obj's upper-body clip actually drives -
         recomputes both obj["upper_joint_mask"] (via Skeleton.
         compute_joint_mask) and obj["upper_root_indices"] (via
@@ -1683,13 +1686,26 @@ class Scene:
         pose it sits on top of) - see Skeleton.compute_blended_bone_
         matrices' own upper_joint_mask_prev/mask_blend_weight docstring.
 
+        root_joint_names may instead be a {joint name: weight} weightlist
+        (Source's $weightlist - see Skeleton.compute_joint_weights): the
+        upper clip then drives each joint by its weight, a partial weight
+        blending the two. component_space blends the driven joints'
+        rotations relative to the skeleton root rather than their parent
+        (Source's "worldspace" layers - see Skeleton.compute_blended_bone_
+        matrices).
+
         Takes effect on the very next Scene.update()."""
         skeleton = obj["skeleton"]
         if _begin_pose_snapshot(obj, blend_duration):
             blend_duration = 0.0
         obj["upper_joint_mask_prev"] = obj["upper_joint_mask"]
-        obj["upper_joint_mask"] = skeleton.compute_joint_mask(root_joint_names)
+        if isinstance(root_joint_names, dict):
+            obj["upper_joint_mask"] = skeleton.compute_joint_weights(root_joint_names)
+            root_joint_names = [name for name, weight in root_joint_names.items() if weight > 0.0]
+        else:
+            obj["upper_joint_mask"] = skeleton.compute_joint_mask(root_joint_names)
         obj["upper_root_indices"] = skeleton.resolve_joint_indices(root_joint_names)
+        obj["upper_component_space"] = bool(component_space)
         _apply_upper_rotation_offsets(obj, {}, blend_duration)
 
     def load_additional_animations(self, obj, path, rename=None, time_scale=1.0, skin_index=0):
@@ -3105,6 +3121,9 @@ class Scene:
                 continue   # hidden first-person arms: no need to animate
             skeleton = obj["skeleton"]
             upper_mask = obj.get("upper_joint_mask")
+            # {joint index: glm.quat} component-space rotations on top of the animation (e.g. a player's spine
+            # bending toward where they look - PlayerModel's aim_pitch_joints), or None.
+            aim = obj.get("aim_offsets")
 
             # The clocks below (clip time, locomotion phase, crossfade progress) advance every
             # frame, but the pose itself - sampling every bone of every blended clip, the
@@ -3169,21 +3188,22 @@ class Scene:
                 # A single-pose clip (a held weapon model: duration 0) that has finished blending
                 # in never changes: compute it once, not every tick.
                 only = weighted_lower[0][0] if len(weighted_lower) == 1 else None
-                if (only is not None and lower_blend_weight >= 1.0 and obj.get("pose_snap") is None
+                if (only is not None and lower_blend_weight >= 1.0 and obj.get("pose_snap") is None and not aim
                         and obj.get("_static_pose") == only and obj.get("bone_matrices") is not None):
                     continue
                 clip = skeleton.animations.get(only) if only is not None else None
                 obj["_static_pose"] = only if (clip is not None and clip.duration <= 0.0
                                                and lower_blend_weight >= 1.0) else None
                 request = pose_batch.make_request(
-                    skeleton, weighted_lower, obj["prev_animation"], obj["prev_anim_time"], lower_blend_weight)
+                    skeleton, weighted_lower, obj["prev_animation"], obj["prev_anim_time"], lower_blend_weight,
+                    rotation_offsets=aim)
                 if request is not None:
                     pose_requests.append((obj, request))
                     continue
                 obj["bone_matrices"] = skeleton.compute_bone_matrices_multi(
                     weighted_lower,
                     prev_animation_name=obj["prev_animation"], prev_time=obj["prev_anim_time"],
-                    blend_weight=lower_blend_weight,
+                    blend_weight=lower_blend_weight, rotation_offsets=aim,
                 )
                 continue
 
@@ -3201,6 +3221,12 @@ class Scene:
             upper_blend_weight = _advance_blend(obj, step, "upper_anim_blend_elapsed", "upper_anim_blend_duration")
 
             blended_offsets, offset_blend_weight = _advance_upper_offset_blend(obj, step)
+            if aim:
+                # Both are component-space turns at a joint: the aim goes on top of the pose's own correction.
+                merged = dict(blended_offsets or {})
+                for joint, rotation in aim.items():
+                    merged[joint] = rotation * merged[joint] if joint in merged else rotation
+                blended_offsets = merged
 
             if skip_pose:
                 continue
@@ -3213,6 +3239,7 @@ class Scene:
                 upper_rotation_offsets=blended_offsets,
                 upper_joint_mask_prev=obj["upper_joint_mask_prev"],
                 mask_blend_weight=offset_blend_weight,   # shares the offset crossfade's timer
+                component_space=obj.get("upper_component_space", False),
             )
 
         if pose_requests:

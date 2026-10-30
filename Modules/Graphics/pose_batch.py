@@ -106,6 +106,7 @@ class _SkeletonTables:
         depth = []
         for i, p in enumerate(self.parents):
             depth.append(0 if p == -1 else depth[p] + 1)
+        self.depth = depth
         self.levels = []
         for d in range(max(depth) + 1 if depth else 0):
             joints_here = [i for i, dd in enumerate(depth) if dd == d]
@@ -183,9 +184,10 @@ def structure_key(skeleton):
     return key
 
 
-def make_request(skeleton, weighted, prev_name, prev_time, blend_weight):
+def make_request(skeleton, weighted, prev_name, prev_time, blend_weight, rotation_offsets=None):
     """A pose request for evaluate(), or None when the reference path must be used. `weighted` is
-    Skeleton.compute_bone_matrices_multi's list of (clip name, time, weight)."""
+    Skeleton.compute_bone_matrices_multi's list of (clip name, time, weight); rotation_offsets its
+    {joint index: glm.quat} component-space rotations on top of the pose (see Skeleton._world_matrices)."""
     if getattr(skeleton, "_pose_snap", None) is not None or getattr(skeleton, "_pose_fast", True) is False:
         return None
     entries = []
@@ -204,7 +206,11 @@ def make_request(skeleton, weighted, prev_name, prev_time, blend_weight):
         if table is None:
             return None
         prev = (table, prev_time, blend_weight)
-    return (skeleton, entries, prev)
+    offsets = None
+    if rotation_offsets:
+        # Row-major 3x3 per joint (glm's to_list gives columns).
+        offsets = {j: np.array(glm.mat3_cast(q).to_list(), "f8").T for j, q in rotation_offsets.items()}
+    return (skeleton, entries, prev, offsets)
 
 
 def _rows(table, time):
@@ -253,11 +259,13 @@ def evaluate(requests):
     # 1. Collect every (request, clip, time) sample - blend entries and crossfade sources - as row
     # indices into the baked tables, and gather them all at once.
     ta, tb, qa, qb, sa, sb, frac = [], [], [], [], [], [], []
-    owner = []          # request index of each sample
     first = [0] * R     # sample index of each request's first entry
     later = {}          # level -> (request indices, sample indices, blend factors)
     fades = []          # (request index, sample index, weight)
-    for r, (skeleton, entries, prev) in enumerate(requests):
+    rotate = {}         # hierarchy depth -> [(request index, joint, row-major 3x3)] - see make_request
+    for r, (skeleton, entries, prev, offsets) in enumerate(requests):
+        for joint, matrix in (offsets or {}).items():
+            rotate.setdefault(tables.depth[joint], []).append((r, joint, matrix))
         total = sum(w for _, _, w in entries)
         running = 0.0
         for level, (table, time, w) in enumerate(entries):
@@ -324,11 +332,15 @@ def evaluate(requests):
 
     # Hierarchy walk: one batched product per joint (parents come first).
     W = np.empty_like(L)
-    for joints_here, parents_here, external in tables.levels:
+    for depth, (joints_here, parents_here, external) in enumerate(tables.levels):
         if external is not None:           # roots: their (usually identity) external matrix
             W[:, joints_here] = external[None] @ L[:, joints_here]
         else:
             W[:, joints_here] = W[:, parents_here] @ L[:, joints_here]
+        # Component-space rotations turn a joint about its own origin (the deeper levels inherit it) - the same
+        # as Skeleton._world_matrices' rotation_offsets.
+        for r, joint, matrix in rotate.get(depth, ()):
+            W[r, joint, :3, :3] = matrix @ W[r, joint, :3, :3]
     B = (W @ tables.inverse_bind[None]).astype("f4")           # (R, J, 4, 4)
 
     from Modules.Graphics.skeletal_shader import MAX_BONES     # (imported late: avoids a cycle)

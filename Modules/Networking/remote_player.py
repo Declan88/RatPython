@@ -71,6 +71,13 @@ _DEFAULT_ANIMATION_STATES = (
 # torus_scene.py for the same per-file split applied to the local
 # player and the decorative prop.
 _RAT_ANIM_TIME_SCALE = 24.0 / 30.0
+# The 8-direction crouch walk (HL2's a_Crouch_walk*, one action per direction in one file): action name -> clip name
+# on the skeleton ("crouch_walk" forward, "crouch_walk_<dir>" for the rest). Shared with the local player (app.py).
+CROUCH_WALK_FILE = "Assets/Animations/Poses/CrouchDirs.glb"
+CROUCH_WALK_CLIPS = {
+    f"a_Crouch_walk{d}Action": "crouch_walk" if d == "N" else f"crouch_walk_{d.lower()}"
+    for d in ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+}
 _POSE_FILES = {
     "Assets/Animations/Poses/Rifle/rifleidle.glb": ({"New": "rifle_idle"}, _RAT_ANIM_TIME_SCALE),
     "Assets/Animations/Poses/Rifle/RifleWalkN.glb": ({"New": "rifle_walk"}, 1.0),
@@ -84,13 +91,46 @@ _POSE_FILES = {
     "Assets/Animations/Poses/Rifle/RifleWalkNW.glb": ({"New": "rifle_walk_nw"}, _RAT_ANIM_TIME_SCALE),
     "Assets/Animations/Poses/Rifle/RifleWalkSE.glb": ({"New": "rifle_walk_se"}, _RAT_ANIM_TIME_SCALE),
     "Assets/Animations/Poses/Rifle/RifleWalkSW.glb": ({"New": "rifle_walk_sw"}, _RAT_ANIM_TIME_SCALE),
+    # Exported at 24 fps from a 30 fps source (HL2's a_Crouch_walk*), hence the fix.
+    CROUCH_WALK_FILE: (CROUCH_WALK_CLIPS, _RAT_ANIM_TIME_SCALE),
 }
-# Same facing-relative walk clips the local player uses (see app.py).
+# Crouched: the held crouch pose when still, blending into the crouch walk by speed (crouched top speed is about
+# 1.4 m/s). Shared with the local player (app.py).
+CROUCH_STATES = (
+    ("crouch_idle", "rifle_crouch", 0.0),
+    ("crouch_walk", "crouch_walk", 0.4),
+)
+# Per-clip root offsets (PlayerModel's root_offsets: metres, model frame, +y up) for clips authored with their feet
+# somewhere other than the rest of the set's. Measured from the files' foot joints (forward kinematics over each
+# clip): rifle_idle stands its feet at 0.140 m and the walks/crouch walks plant theirs at about the same, but
+# RifleCrouch.glb holds them at 0.290 m - so it moves down by the difference. Shared with the local player (app.py).
+ROOT_OFFSETS = {
+    "rifle_crouch": (0.0, 0.140 - 0.290, 0.0),
+}
+# How the look pitch bends the body (PlayerModel's aim_pitch_joints, {joint: (reach, limit degrees)} - reach is how
+# much of the look the body has turned by once past that joint). The lower spine hardly moves (15% of the look, 13
+# degrees at most); the chest carries most of the lean; then two branches finish the look on their own: the arms lift
+# from the clavicles (pivots close together at the top of the chest, so both hands stay on the gun) and the neck and
+# head tilt - so the gun and the face point where the player looks without the back folding. Some of it is spent
+# levelling a pose that holds the gun low (see AIM_LEVEL_JOINT). Shared with app.py.
+AIM_PITCH_JOINTS = {
+    "ValveBiped.Bip01_Spine": (0.05, 4.0),
+    "ValveBiped.Bip01_Spine1": (0.1, 4.0),
+    "ValveBiped.Bip01_Spine2": (0.15, 5.0),
+    "ValveBiped.Bip01_Spine4": (0.55, 25.0),
+    "ValveBiped.Bip01_R_Clavicle": (1.0, 40.0),
+    "ValveBiped.Bip01_L_Clavicle": (1.0, 40.0),
+    "ValveBiped.Bip01_Neck1": (0.75, 30.0),
+    "ValveBiped.Bip01_Head1": (1.0, 40.0),
+}
+AIM_LEVEL_JOINT = "ValveBiped.Bip01_Head1"
+# Same facing-relative walk and crouch-walk clips the local player uses (see app.py).
 _DIRECTIONAL_CLIPS = {
     "walk": {
         "N": "rifle_walk", "S": "rifle_walk_s", "E": "rifle_walk_e", "W": "rifle_walk_w",
         "NE": "rifle_walk_ne", "NW": "rifle_walk_nw", "SE": "rifle_walk_se", "SW": "rifle_walk_sw",
     },
+    "crouch_walk": {action[len("a_Crouch_walk"):-len("Action")]: clip for action, clip in CROUCH_WALK_CLIPS.items()},
 }
 # A static box approximation of the player capsule - placeholder
 # "groundwork" per this feature's scope (no damage/weapon system exists
@@ -153,8 +193,9 @@ class RemotePlayer:
             visible_in_color=True, cast_shadow=True,
             states=animation_states, forward_offset_degrees=forward_offset_degrees,
             scale=scale, time_scale=_RAT_ANIM_TIME_SCALE, tint_mask_path=RAT_TINT_MASK_PATH,
-            directional_clips=_DIRECTIONAL_CLIPS,
-            jump_animation="rifle_jump", crouch_animation="rifle_crouch",
+            directional_clips=_DIRECTIONAL_CLIPS, root_offsets=ROOT_OFFSETS, aim_pitch_joints=AIM_PITCH_JOINTS,
+            aim_level_joint=AIM_LEVEL_JOINT,
+            jump_animation="rifle_jump", crouch_animation=CROUCH_STATES,
         )
         # Matches torus_scene.py's own decorative rat.glb character's
         # shading exactly (same flat "character["specular_strength"] = 0"
@@ -339,6 +380,11 @@ class RemotePlayer:
         """Call once per frame (NetworkManager.update does)."""
         if not self._snapshots:
             return
+        if self.dead and self._alive_wanted and not self._pending_death:
+            # Respawned: the newest packet is the first from the new spawn point. Drop the older ones (where they
+            # died) so the body appears there, instead of being interpolated across the map from the death spot.
+            del self._snapshots[:-1]
+            self._set_dead(False)
         now = time.perf_counter()
         feet_pos, yaw = self._sample(now - INTERP_DELAY)
         self._voice_position = feet_pos + glm.vec3(0.0, _BODY_HEIGHT * 0.8, 0.0)
@@ -359,6 +405,7 @@ class RemotePlayer:
                 move_direction=None if stale else glm.vec3(move[0], 0.0, move[1]),
                 just_jumped=self._pending_jump,
                 just_shot=self._pending_shot_cancel,
+                pitch_degrees=float(s.get("pt", 0.0)),   # where they're looking: bends their spine
             )
             self._model_debt = 0.0
             self._pending_jump = False
@@ -378,8 +425,6 @@ class RemotePlayer:
                     # gibs.spawn carries 0.6 of a body's velocity, so scale up to give the push its full strength.
                     velocity += glm.vec3(*push) / 0.6
                 self.on_death(feet_pos, velocity, self._color_wanted, damage_class)
-        elif self.dead and self._alive_wanted:
-            self._set_dead(False)
         if self._dissolving:
             self._dissolve_t += dt
             obj = self.model.obj

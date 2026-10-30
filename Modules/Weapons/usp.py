@@ -2,7 +2,7 @@
 WeaponsBase's pistol defaults; the class attributes are spelled out anyway so
 this file is the one place that says exactly which assets make up the USP."""
 
-from .weapons_base import WeaponsBase, FireMode, _POSE_DIR
+from .weapons_base import PISTOL_HOLD_POSE, WeaponsBase, FireMode, _POSE_DIR
 
 
 class USP(WeaponsBase):
@@ -85,7 +85,9 @@ class USP(WeaponsBase):
     # is the idle), and the pose of the character's arms holding it.
     worldmodel = f"{_POSE_DIR}/pistolWM.glb"
     worldmodel_animations = {"idle": None}
-    player_animations = {"idle": "Assets/Animations/Poses/Pistol/pistolidle.glb"}
-    # Tuned in-game against this pose.
-    player_upper_rotation_degrees = {"ValveBiped.Bip01_Spine4": (-10, 60, 10)}
-    player_moving_yaw_degrees = -20.0
+    player_animations = {"idle": PISTOL_HOLD_POSE}
+    # Tuned in-game against this pose ((-10, 60, 10) under the old hard split at Spine4), converted for the
+    # component-space weightlist blend (app.py's WEAPON_POSE_WEIGHTS) so it stands exactly as before. No moving
+    # correction: that blend keeps the chest facing ahead while running (it used to turn ~27 degrees left).
+    player_upper_rotation_degrees = {"ValveBiped.Bip01_Spine4": (18.4, -22.7, -2.1)}
+    player_moving_yaw_degrees = 0.0

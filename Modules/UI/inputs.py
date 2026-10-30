@@ -273,8 +273,8 @@ class TextInput(Widget):
 
 class Dropdown(Widget):
     """A closed box showing the current option; click to open a list of
-    all options below it, click one to select. on_change(index, option)
-    fires when the selection changes."""
+    the other options below it, click one to select. on_change(index,
+    option) fires when the selection changes."""
 
     interactive = True
     TEXT_PAD = 10.0
@@ -324,18 +324,41 @@ class Dropdown(Widget):
 
     # ---- popup ---------------------------------------------------------
 
+    def _rows(self):
+        """The option indices listed in the open popup: every option but the
+        one already selected (it's shown in the box itself)."""
+        return [i for i in range(len(self.options)) if i != self.selected]
+
     def _popup_top(self):
         """Y of the option list's top edge: just below the box, or - if the
         list wouldn't fit above the window's bottom edge - just above it."""
         x, y, w, h = self.rect
-        n = len(self.options)
+        n = len(self._rows())
         if self.manager is not None and y + h + h * n > self.manager.root.rect[3] and y - h * n >= 0:
             return y - h * n
         return y + h
 
     def _popup_rect(self):
         x, y, w, h = self.rect
-        return x, self._popup_top(), w, h * len(self.options)
+        return x, self._popup_top(), w, h * len(self._rows())
+
+    def _row_at(self, x, y):
+        """Index into _rows() of the popup row at (x, y), or -1."""
+        return int((y - self._popup_top()) // self.rect[3]) if self.popup_contains(x, y) else -1
+
+    def row_centres(self):
+        """Logical (x, y) centre of each popup row, top to bottom (controller
+        navigation moves the cursor between these)."""
+        x, y, w, h = self.rect
+        top = self._popup_top()
+        return [(x + w / 2.0, top + h * (i + 0.5)) for i in range(len(self._rows()))]
+
+    def pick_hovered(self):
+        """Selects the highlighted row, if any, and closes the popup."""
+        rows = self._rows()
+        if 0 <= self._hover_index < len(rows):
+            self.set_selected(rows[self._hover_index])
+        self.close()
 
     def popup_contains(self, x, y):
         if not self.open:
@@ -351,10 +374,11 @@ class Dropdown(Widget):
 
     def on_press(self, x, y):
         if self.open:
-            if self.popup_contains(x, y):
-                self.set_selected(int((y - self._popup_top()) // self.rect[3]))
+            row = self._row_at(x, y)
+            if row >= 0:
+                self.set_selected(self._rows()[row])
             self.close()
-        else:
+        elif self._rows():
             self.open = True
             self.manager.popup = self
 
@@ -362,8 +386,7 @@ class Dropdown(Widget):
         pass
 
     def on_hover(self, x, y):
-        self._hover_index = (int((y - self._popup_top()) // self.rect[3])
-                             if self.popup_contains(x, y) else -1)
+        self._hover_index = self._row_at(x, y)
 
     # ---- draw ----------------------------------------------------------
 
@@ -377,7 +400,8 @@ class Dropdown(Widget):
         x, y, w, h = self.rect
         out.rect(self._popup_rect(), _color(self.popup_color))
         top = self._popup_top()
-        for i, lbl in enumerate(self._option_labels):
+        for i, option in enumerate(self._rows()):
+            lbl = self._option_labels[option]
             row_y = top + h * i
             if i == self._hover_index:
                 out.rect((x, row_y, w, h), _color(self.highlight_color))

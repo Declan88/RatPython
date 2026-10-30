@@ -20,7 +20,7 @@ class Action:
     EMOTE_WHEEL = "emote_wheel"
     SCOREBOARD = "scoreboard"
     PAUSE = "pause"
-    UI_CLICK = "ui_click"     # menus: click where the (stick-driven) cursor is
+    UI_CLICK = "ui_click"     # menus: click the selected control
     UI_BACK = "ui_back"       # menus: back out (close a dropdown, then the pause menu)
     UI_UP = "ui_up"           # menus: jump to the next control in that direction (Modules/UI/gamepad_nav.py)
     UI_DOWN = "ui_down"
@@ -79,9 +79,10 @@ LOOK_YAW_SPEED = 260.0        # degrees/second at full right-stick deflection
 LOOK_PITCH_SPEED = 180.0
 LOOK_CURVE = 2.2              # >1: fine control near centre, full speed at the edge
 SPRINT_RELEASE = 0.3          # L3 sprint stays on until the left stick drops below this
-CURSOR_SPEED = 1400.0         # pixels/second at full deflection, menus
 SCROLL_INTERVAL = 0.12        # seconds between wheel steps with the right stick held, menus
-NAV_REPEAT_DELAY = 0.35       # menus: a held D-pad direction repeats after this...
+NAV_STICK_THRESHOLD = 0.5     # menus: the left stick pushed this far counts as a D-pad direction
+WHEEL_STICK_SPEED = 0.9       # menus: colour-wheel radii/second the left stick moves its marker at full tilt
+NAV_REPEAT_DELAY = 0.35       # menus: a held D-pad direction (or stick) repeats after this...
 NAV_REPEAT_INTERVAL = 0.09    # ...then this often
 
 # Rumble: (low-frequency motor, high-frequency motor, seconds) - the game scales the motors by strength.

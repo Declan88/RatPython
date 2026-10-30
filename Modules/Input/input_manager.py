@@ -62,7 +62,8 @@ class InputManager:
         self._left = self._right = (0.0, 0.0)
         self._triggers = {}               # axis -> 0..1
         self._sprint_latched = False
-        self._cursor_moved_at = 0.0       # when the stick last moved the menu cursor (its own motion events)
+        self._cursor_moved_at = 0.0       # when menu navigation last moved the cursor (its own motion events)
+        self._mouse_used = True           # False from the controller's last input until the mouse is used again
         self._scroll_wait = 0.0
         self._nav_held = {}               # D-pad direction -> seconds until it repeats
         self._keys = None
@@ -132,6 +133,7 @@ class InputManager:
                     self._pressed[action] += 1
         elif t == pygame.MOUSEBUTTONDOWN:
             self.device = KEYBOARD
+            self._mouse_used = True
             if gameplay:
                 for action in _MOUSE_ACTIONS.get(event.button, ()):
                     self._pressed[action] += 1
@@ -143,6 +145,7 @@ class InputManager:
             # The stick moving the menu cursor makes motion events too: only a real, deliberate move counts.
             if time.perf_counter() - self._cursor_moved_at > 0.15 and abs(event.rel[0]) + abs(event.rel[1]) > 3:
                 self.device = KEYBOARD
+                self._mouse_used = True
 
     def update(self, dt):
         """Polls keyboard/mouse state and the controllers, once per frame after the events."""
@@ -177,6 +180,7 @@ class InputManager:
             self._pressed[action] += 1
         if held or left != (0.0, 0.0) or right != (0.0, 0.0) or any(v > 0.05 for v in triggers.values()):
             self.device = CONTROLLER
+            self._mouse_used = False
         self._pad_held, self._left, self._right, self._triggers = held, left, right, triggers
         # L3 sprint latches on until the stick (nearly) stops.
         if Action.SPRINT in newly:
@@ -225,6 +229,15 @@ class InputManager:
     def right_stick(self):
         return self._right
 
+    def left_stick(self):
+        return self._left
+
+    @property
+    def pointer_hidden(self):
+        """The mouse cursor should be hidden: the controller was used last and the mouse hasn't moved or clicked
+        since (a key press alone doesn't bring it back)."""
+        return not self._mouse_used
+
     def rumble(self, effect, strength=1.0):
         """Vibrates the controllers - effect: (low motor, high motor, seconds), see bindings.RUMBLE_*. Only while
         the controller is the device in use, and if vibration is on in the settings."""
@@ -245,12 +258,16 @@ class InputManager:
         causes isn't taken for the mouse being used."""
         self._cursor_moved_at = time.perf_counter()
 
-    def nav_presses(self, dt):
-        """D-pad directions ("up", "down", "left", "right") to move menu focus this frame: on press, then
-        repeating while held."""
+    def nav_presses(self, dt, stick=True):
+        """Directions ("up", "down", "left", "right") to move menu focus this frame, from the D-pad and (with
+        `stick`) the left stick pushed past NAV_STICK_THRESHOLD: on press, then repeating while held."""
+        x, y = self._left if stick else (0.0, 0.0)
+        stick_dir = None
+        if max(abs(x), abs(y)) >= bindings.NAV_STICK_THRESHOLD:
+            stick_dir = ("right" if x > 0 else "left") if abs(x) > abs(y) else ("down" if y > 0 else "up")
         out = []
         for action, direction in _NAV:
-            if action not in self._pad_held:
+            if action not in self._pad_held and direction != stick_dir:
                 self._nav_held.pop(direction, None)
             elif direction not in self._nav_held:
                 self._nav_held[direction] = bindings.NAV_REPEAT_DELAY
@@ -262,23 +279,14 @@ class InputManager:
                     out.append(direction)
         return out
 
-    def drive_ui_cursor(self, dt, window_size):
-        """While the controller is in use and the cursor is free (menus): the left stick (or the right stick's
-        vertical, for scrolling) drives the real mouse cursor and A clicks - as synthetic pygame events, so the UI
-        needs no controller code."""
+    def drive_ui_cursor(self, dt, click=True):
+        """While the controller is in use and the cursor is free (menus): A clicks where the (hidden) cursor is and
+        the right stick's vertical scrolls - as synthetic pygame events, so the UI needs no controller code. The
+        cursor itself is moved between controls by gamepad_nav. click=False: A is handled by the caller."""
         if self.device != CONTROLLER:
             return
-        x, y = self._left
-        if x or y:
-            magnitude = math.hypot(x, y)
-            speed = bindings.CURSOR_SPEED * magnitude ** 1.5 / magnitude * dt
-            cx, cy = pygame.mouse.get_pos()
-            nx = min(max(cx + x * speed, 0), window_size[0] - 1)
-            ny = min(max(cy + y * speed, 0), window_size[1] - 1)
-            pygame.mouse.set_pos((round(nx), round(ny)))
-            self.cursor_moved()
         pos = pygame.mouse.get_pos()
-        for _ in range(self.pressed(Action.UI_CLICK)):
+        for _ in range(self.pressed(Action.UI_CLICK) if click else 0):
             for kind in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                 pygame.event.post(pygame.event.Event(kind, button=1, pos=pos, synthetic=True))
         scroll = self._right[1]

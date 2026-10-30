@@ -1,5 +1,5 @@
 """
-The Pencil - a second weapon built on the USP rig, same as GoudaGun (see its
+The Pencil Pusher (the pencil sniper) - a second weapon built on the USP rig, same as GoudaGun (see its
 own module docstring for the general shape of this). Most of it is inherited
 from USP as-is (fire mode, magazine, third-person world model/animations)
 since the gun still rides the pistol's own arms - the gun model/animations,
@@ -33,6 +33,7 @@ the named action actually lives in.
 """
 
 from .usp import USP
+from .weapons_base import RIFLE_HOLD_POSE
 
 _PENCIL_FILE = "Assets/Models/Arms/New Folder/Pencil/Pencil.glb"
 _RACK_FILE = "Assets/Models/Arms/New Folder/Pencil/SniperRackAnim.glb"
@@ -40,9 +41,16 @@ _PENCIL_WM_FILE = "Assets/Models/Arms/New Folder/Pencil/WM_Pencil.glb"
 
 
 class Pencil(USP):
-    name = "Pencil"
-    weapon_id = "pencil"
+    name = "Pencil Pusher"
+    weapon_id = "pencil"     # the id in /give, loadouts and network messages - unchanged by the rename
+    # Its own clip names on the player rig: the USP's "pistol" would make its arm pose the USP's pistol_idle.
+    animation_prefix = "pencil"
     icon = "Assets/Textures/Icons/Pencil/Pencil.png"
+    # Third person: a long gun, held two-handed in the rifle pose rather than the USP's pistol pose (whose
+    # Spine4 corrections are tuned for that pose only, so they're cleared here).
+    player_animations = {"idle": RIFLE_HOLD_POSE}
+    player_upper_rotation_degrees = {}
+    player_moving_yaw_degrees = 0.0
     damage = 60
     fire_interval = 1
     draw_speed = 1

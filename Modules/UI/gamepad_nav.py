@@ -1,14 +1,65 @@
 """
-D-pad navigation for the mouse-driven UI: moves the real cursor onto the nearest control in a direction, so the
-UI's own hover and click handling (A posts a click - Modules/Input) work unchanged. Left/right on a slider steps
-its value instead of moving away.
+Controller navigation for the mouse-driven UI: moves the real (hidden) cursor onto the nearest control in a
+direction, so the UI's own hover and click handling (A posts a click - Modules/Input) work unchanged. Left/right on
+a slider steps its value instead of moving away; up/down in an open dropdown moves between its options; the left
+stick on a colour wheel moves its marker.
 """
+
+import math
 
 import pygame
 
-from .controls import Slider
+from .controls import ColorWheel, Slider
 
 SLIDER_STEP = 0.05    # of the slider's range, per D-pad press
+
+
+def _move_cursor(ui, x, y):
+    pygame.mouse.set_pos((round(x * ui.scale), round(y * ui.scale)))
+
+
+def hovered_wheel(ui):
+    """The colour wheel under the cursor, if any (the left stick then drives its marker, not navigation)."""
+    return ui._hover if isinstance(ui._hover, ColorWheel) else None
+
+
+def drive_wheel(ui, wheel, stick, dt, speed):
+    """Moves `wheel`'s marker by the left stick (`speed` radii/second at full tilt), and the cursor with it so a
+    click (A) lands on the same colour. Returns whether the cursor moved."""
+    sx, sy = stick
+    if not sx and not sy:
+        return False
+    x, y, w, h = wheel.rect
+    radius = min(w, h) / 2.0
+    cx, cy = x + w / 2.0, y + h / 2.0
+    angle = wheel.hue * 2.0 * math.pi
+    mx = math.cos(angle) * wheel.saturation * radius + sx * speed * radius * dt
+    my = -math.sin(angle) * wheel.saturation * radius + sy * speed * radius * dt
+    distance = math.hypot(mx, my)
+    if distance > radius:
+        mx, my = mx / distance * radius, my / distance * radius
+    wheel._set_from_point(cx + mx, cy + my)
+    _move_cursor(ui, cx + mx * 0.99, cy + my * 0.99)    # just inside, so the cursor stays over the wheel
+    return True
+
+
+def _navigate_dropdown(ui, dropdown, direction):
+    """Up/down between an open dropdown's options; left/right do nothing."""
+    if direction not in ("up", "down"):
+        return False
+    mx, my = pygame.mouse.get_pos()
+    y = my / ui.scale
+    rows = dropdown.row_centres()
+    if direction == "down":
+        after = [r for r in rows if r[1] > y + 1.0]
+        target = after[0] if after else None
+    else:
+        before = [r for r in rows if r[1] < y - 1.0]
+        target = before[-1] if before else None
+    if target is None:
+        return False
+    _move_cursor(ui, *target)
+    return True
 
 
 def _candidates(ui):
@@ -42,6 +93,8 @@ def _score(dx, dy, direction):
 def navigate(ui, direction):
     """Moves the cursor to the best control in `direction` ("up", "down", "left", "right"). Returns whether the
     cursor moved (the caller tells the input manager, so the motion isn't taken for the mouse)."""
+    if ui.popup is not None and hasattr(ui.popup, "row_centres"):
+        return _navigate_dropdown(ui, ui.popup, direction)
     mx, my = pygame.mouse.get_pos()
     x, y = mx / ui.scale, my / ui.scale
     current = ui._pick(x, y)
@@ -65,5 +118,5 @@ def navigate(ui, direction):
         best = min(options) if options else None
     if best is None:
         return False
-    pygame.mouse.set_pos((round(best[1] * ui.scale), round(best[2] * ui.scale)))
+    _move_cursor(ui, best[1], best[2])
     return True

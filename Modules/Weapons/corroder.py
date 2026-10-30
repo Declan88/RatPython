@@ -4,26 +4,34 @@ the long-form notes on how its rig, animations, scope and bolt-action rack
 work). Deliberately a standalone copy of the Pencil's settings rather than a
 subclass of it, so tuning either weapon never changes the other.
 
-First person now uses its OWN model, Corroder.glb (an M4-style rig: arms + the
-Battery/Body gun parts in one skin, with its own named animations). The arms
+First person now uses its OWN model (an M4-style rig: arms + the Battery/Body
+gun parts in one skin, with its own named animations in Corroder.glb). The arms
 still come from pistol.glb (so fur tint works) and the gun parts are loaded
-from Corroder.glb by node, exactly like the Gouda gun does. The third-person
-world model and audio are still the Pencil's - swap them as they get made.
+from CorroderReload.glb by node, exactly like the Gouda gun does. The third-person
+world model is its own too (CorroderWM.glb, on the same w_pist_usp rig as the
+Pencil's).
 """
 
 from .usp import USP
 from .damage_classes import Zap
-from .weapons_base import FireMode
+from .weapons_base import RIFLE_HOLD_POSE, FireMode
 
 _CORRODER_FILE = "Assets/Models/Arms/New Folder/Corroder/Corroder.glb"
 _RELOAD_FILE = "Assets/Models/Arms/New Folder/Corroder/CorroderReload.glb"
-_CORRODER_WM_FILE = "Assets/Models/Arms/New Folder/Pencil/WM_Pencil.glb"
+_CORRODER_WM_FILE = "Assets/Models/Arms/New Folder/Corroder/CorroderWM.glb"
 
 
 class Corroder(USP):
     name = "The Corroder"
     weapon_id = "corroder"
+    # Its own clip names on the player rig: the USP's "pistol" would make its arm pose the USP's pistol_idle.
+    animation_prefix = "corroder"
     icon = "Assets/Textures/Icons/Corroder/Corroder.png"
+    # Third person: a rifle, held two-handed in the rifle pose rather than the USP's pistol pose (whose Spine4
+    # corrections are tuned for that pose only, so they're cleared here).
+    player_animations = {"idle": RIFLE_HOLD_POSE}
+    player_upper_rotation_degrees = {}
+    player_moving_yaw_degrees = 0.0
     damage = 7.5  # well under the USP's 15: 14 body shots (1.3 s of held fire) to kill (was 12 -> 9 shots, 0.8 s)
     headshot_multiplier = 1.8  # head = 13.5, so 8 head shots (0.7 s) - the base multiplier of 2.0 would make it 7
     fire_mode = FireMode.AUTO  # hold the trigger to keep firing
@@ -75,13 +83,18 @@ class Corroder(USP):
     viewmodel_muzzle_bone = "v_weapon.m4_Silencer"
     viewmodel_muzzle_offset = (-0.16, -1.5, -21.71)
 
+    # CorroderWM.glb: one unskinned mesh node ("Battery") under the w_pist_usp rig's root, so it loads as a rigid
+    # prop on that rig (muzzle bone ValveBiped.flash included); its two materials share the node, so it's split
+    # into one object per material to keep both textures.
     worldmodel = _CORRODER_WM_FILE
+    worldmodel_materials = ("Battery", "Body")
     worldmodel_animations = {"idle": None}
 
-    # Gun parts come from Corroder.glb's single skin, one object per mesh node (a
-    # skinned object keeps only one material). Its c_arms node is skipped on
-    # purpose - the arms come from pistol.glb (WeaponsBase.viewmodel_model).
-    viewmodel_gun_model = _CORRODER_FILE
+    # Gun parts come from CorroderReload.glb's single skin, one object per mesh node
+    # (a skinned object keeps only one material). Same rig, parts and textures as
+    # Corroder.glb, but with the Body's corrected normals. Its c_arms node is skipped
+    # on purpose - the arms come from pistol.glb (WeaponsBase.viewmodel_model).
+    viewmodel_gun_model = _RELOAD_FILE
     viewmodel_gun_skin = 0
     viewmodel_gun_nodes = ("Battery", "Body")
     # The file bakes 17 named actions; the plain ones are used, not the *_unsil

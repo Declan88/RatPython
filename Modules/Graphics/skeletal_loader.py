@@ -389,6 +389,7 @@ class Skeleton:
         self.last_pose = None
         self._pose_snap = None
         self._bind_trs = {}
+        self._order = None   # see _parent_first_order
 
     def _empty_pose(self):
         joint_count = len(self.joints)
@@ -656,7 +657,8 @@ class Skeleton:
         )
         return self._world_matrices(translations, rotations, scales)
 
-    def compute_bone_matrices_multi(self, weighted, prev_animation_name=None, prev_time=0.0, blend_weight=1.0):
+    def compute_bone_matrices_multi(self, weighted, prev_animation_name=None, prev_time=0.0, blend_weight=1.0,
+                                    rotation_offsets=None):
         """The blend-space counterpart to compute_bone_matrices: weighted
         is a list of (clip_name, time, weight) - see _sample_weighted for
         exactly how those combine into one pose, instead of a single
@@ -666,11 +668,12 @@ class Skeleton:
         skips it entirely) - the same crossfade mechanism bridges a
         discrete state (e.g. a held jump/crouch pose) into or out of a
         continuous blend space without needing any special-casing at the
-        transition itself."""
+        transition itself. rotation_offsets: component-space per-joint
+        rotations on top of the pose - see _world_matrices."""
         pose = self._sample_weighted(weighted)
         if prev_animation_name is not None and blend_weight < 1.0:
             pose = self._blend_pose_sets(self._sample_clip(prev_animation_name, prev_time), pose, blend_weight)
-        return self._world_matrices(*pose)
+        return self._world_matrices(*pose, rotation_offsets=rotation_offsets)
 
     def resolve_joint_indices(self, joint_names):
         """Returns the list of joint indices matching joint_names (by
@@ -716,12 +719,53 @@ class Skeleton:
                 j = self.joints[j].parent_joint_index
         return mask
 
+    def compute_joint_weights(self, weightlist):
+        """Per-joint upper-track weights (list[float], len(self.joints)) from a {joint name: weight} weightlist with
+        Source's $weightlist rules: a joint takes the weight of the nearest listed joint among itself and its
+        ancestors, or 0 with none - so listing a joint covers its whole subtree unless a descendant is listed too
+        (e.g. {"Pelvis": 0.1, "L_Thigh": 0.0}). Unknown names are ignored. {root: 1.0} is compute_joint_mask(root)."""
+        listed = {index: float(weightlist[self.joints[index].name])
+                  for index in self.resolve_joint_indices(list(weightlist))}
+        weights = [0.0] * len(self.joints)
+        for i in range(len(self.joints)):
+            j = i
+            while j != -1:
+                if j in listed:
+                    weights[i] = listed[j]
+                    break
+                j = self.joints[j].parent_joint_index
+        return weights
+
+    def _parent_first_order(self):
+        """Joint indices with every parent before its children (cached) - for walks that need the parent's result
+        first without recursing."""
+        order = self._order
+        if order is None:
+            depth = []
+            for joint in self.joints:
+                d, j = 0, joint.parent_joint_index
+                while j != -1:
+                    d, j = d + 1, self.joints[j].parent_joint_index
+                depth.append(d)
+            order = self._order = sorted(range(len(self.joints)), key=depth.__getitem__)
+        return order
+
+    def _component_rotations(self, pose):
+        """Each joint's rotation relative to the skeleton root (component space) for a sampled local pose."""
+        translations, rotations, scales = pose
+        result = [None] * len(self.joints)
+        for i in self._parent_first_order():
+            local = self._concrete_trs(i, translations[i], rotations[i], scales[i])[1]
+            parent = self.joints[i].parent_joint_index
+            result[i] = local if parent == -1 else result[parent] * local
+        return result
+
     def compute_blended_bone_matrices(self, lower_animation, lower_time,
                                        upper_animation, upper_time, upper_joint_mask,
                                        lower_prev_animation=None, lower_prev_time=0.0, lower_blend_weight=1.0,
                                        upper_prev_animation=None, upper_prev_time=0.0, upper_blend_weight=1.0,
                                        upper_rotation_offsets=None,
-                                       upper_joint_mask_prev=None, mask_blend_weight=1.0):
+                                       upper_joint_mask_prev=None, mask_blend_weight=1.0, component_space=False):
         """Like compute_bone_matrices, but each joint's LOCAL pose comes
         from upper_animation (sampled at upper_time) where
         upper_joint_mask[joint_index] is True, and from lower_animation
@@ -795,7 +839,20 @@ class Skeleton:
         control get slerped between their old and new pose source, using
         mask_blend_weight as the interpolation factor. upper_joint_mask_
         prev=None or mask_blend_weight>=1.0 (the defaults) skip this
-        entirely, matching every caller before this param existed."""
+        entirely, matching every caller before this param existed.
+
+        upper_joint_mask may also hold per-joint WEIGHTS (floats 0..1, see
+        compute_joint_weights) instead of bools: a joint between 0 and 1
+        blends the two tracks by its weight - and a mask change eases
+        each joint's weight from the old to the new value.
+
+        component_space: blend the weighted joints' ROTATIONS relative to
+        the skeleton root instead of their parent (Source's "worldspace"
+        layers, e.g. HL2's gun-holding ones): a weight-1 joint then has
+        exactly the upper track's facing, whatever the lower track's
+        joints below it are doing - a held-gun chest keeps facing ahead
+        while the running hips twist under it, instead of inheriting
+        their twist. Translations/scales still blend locally."""
         lower_pose = self._sample_track(
             lower_animation, lower_time, lower_prev_animation, lower_prev_time, lower_blend_weight
         )
@@ -804,14 +861,16 @@ class Skeleton:
             else self._sample_track(upper_animation, upper_time, upper_prev_animation, upper_prev_time, upper_blend_weight)
         )
         return self._composite_bone_matrices(
-            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight
+            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight,
+            component_space,
         )
 
     def compute_blended_bone_matrices_multi(self, lower_weighted, upper_weighted, upper_joint_mask,
                                              lower_prev_animation=None, lower_prev_time=0.0, lower_blend_weight=1.0,
                                              upper_prev_animation=None, upper_prev_time=0.0, upper_blend_weight=1.0,
                                              upper_rotation_offsets=None,
-                                             upper_joint_mask_prev=None, mask_blend_weight=1.0):
+                                             upper_joint_mask_prev=None, mask_blend_weight=1.0,
+                                             component_space=False):
         """The upper/lower-split counterpart to compute_bone_matrices_
         multi: each track's pose comes from a weighted list of clips (see
         _sample_weighted) instead of one named clip, then composited by
@@ -840,12 +899,13 @@ class Skeleton:
                 )
 
         return self._composite_bone_matrices(
-            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight
+            lower_pose, upper_pose, upper_joint_mask, upper_rotation_offsets, upper_joint_mask_prev, mask_blend_weight,
+            component_space,
         )
 
     def _composite_bone_matrices(self, lower_pose, upper_pose, upper_joint_mask,
                                   upper_rotation_offsets=None,
-                                  upper_joint_mask_prev=None, mask_blend_weight=1.0):
+                                  upper_joint_mask_prev=None, mask_blend_weight=1.0, component_space=False):
         """Shared tail of compute_blended_bone_matrices and compute_
         blended_bone_matrices_multi: given each track's already-sampled
         pose (translations, rotations, scales), composites them per-joint
@@ -862,53 +922,53 @@ class Skeleton:
 
         upper_t, upper_r, upper_s = upper_pose
 
-        mask_transitioning = (
-            upper_joint_mask_prev is not None and mask_blend_weight < 1.0
-            and upper_joint_mask_prev != upper_joint_mask
-        )
-        if not mask_transitioning:
-            translations = [upper_t[i] if upper_joint_mask[i] else lower_t[i] for i in range(len(self.joints))]
-            rotations = [upper_r[i] if upper_joint_mask[i] else lower_r[i] for i in range(len(self.joints))]
-            scales = [upper_s[i] if upper_joint_mask[i] else lower_s[i] for i in range(len(self.joints))]
+        if upper_joint_mask_prev is not None and mask_blend_weight < 1.0 and upper_joint_mask_prev != upper_joint_mask:
+            # Mid mask change: each joint's weight eases from its old value to its new one.
+            weights = [old + (new - old) * mask_blend_weight
+                       for old, new in zip(map(float, upper_joint_mask_prev), map(float, upper_joint_mask))]
         else:
-            identity_translation = glm.vec3(0.0)
-            identity_rotation = glm.quat(1.0, 0.0, 0.0, 0.0)
-            identity_scale = glm.vec3(1.0)
-            translations, rotations, scales = [], [], []
-            for i in range(len(self.joints)):
-                if upper_joint_mask[i] == upper_joint_mask_prev[i]:
-                    translations.append(upper_t[i] if upper_joint_mask[i] else lower_t[i])
-                    rotations.append(upper_r[i] if upper_joint_mask[i] else lower_r[i])
-                    scales.append(upper_s[i] if upper_joint_mask[i] else lower_s[i])
-                    continue
-                # This joint's mask assignment just changed - slerp/mix
-                # between its old and new pose source instead of a hard
-                # cut. None (an unanimated channel) resolves to identity
-                # here, matching _local_matrix's own None convention
-                # elsewhere, NOT the joint's bind pose.
-                old_t = upper_t[i] if upper_joint_mask_prev[i] else lower_t[i]
-                new_t = upper_t[i] if upper_joint_mask[i] else lower_t[i]
-                old_r = upper_r[i] if upper_joint_mask_prev[i] else lower_r[i]
-                new_r = upper_r[i] if upper_joint_mask[i] else lower_r[i]
-                old_s = upper_s[i] if upper_joint_mask_prev[i] else lower_s[i]
-                new_s = upper_s[i] if upper_joint_mask[i] else lower_s[i]
-                translations.append(glm.mix(
-                    old_t if old_t is not None else identity_translation,
-                    new_t if new_t is not None else identity_translation,
-                    mask_blend_weight,
-                ))
-                rotations.append(glm.slerp(
-                    old_r if old_r is not None else identity_rotation,
-                    new_r if new_r is not None else identity_rotation,
-                    mask_blend_weight,
-                ))
-                scales.append(glm.mix(
-                    old_s if old_s is not None else identity_scale,
-                    new_s if new_s is not None else identity_scale,
-                    mask_blend_weight,
-                ))
+            weights = upper_joint_mask
+        translations, rotations, scales = [], [], []
+        for i in range(len(self.joints)):
+            w = weights[i]
+            if w >= 1.0:
+                translations.append(upper_t[i])
+                rotations.append(upper_r[i])
+                scales.append(upper_s[i])
+            elif w <= 0.0:
+                translations.append(lower_t[i])
+                rotations.append(lower_r[i])
+                scales.append(lower_s[i])
+            else:
+                # Partly each track (an unanimated joint is its bind pose on that side).
+                lt, lr, ls = self._concrete_trs(i, lower_t[i], lower_r[i], lower_s[i])
+                ut, ur, us = self._concrete_trs(i, upper_t[i], upper_r[i], upper_s[i])
+                translations.append(glm.mix(lt, ut, w))
+                rotations.append(glm.slerp(lr, ur, w))
+                scales.append(glm.mix(ls, us, w))
+        if component_space:
+            self._blend_rotations_in_component_space(lower_pose, upper_pose, weights, translations, rotations, scales)
 
         return self._world_matrices(translations, rotations, scales, rotation_offsets=upper_rotation_offsets)
+
+    def _blend_rotations_in_component_space(self, lower_pose, upper_pose, weights, translations, rotations, scales):
+        """Redoes the rotation of every joint with a weight above 0 (in place) so that, relative to the skeleton
+        root, it faces slerp(lower track's facing, upper track's facing, weight) - see compute_blended_bone_
+        matrices' component_space. Weight-0 joints keep their local rotation and so follow whatever their parent
+        became (the legs ride the blended pelvis)."""
+        lower_c = self._component_rotations(lower_pose)
+        upper_c = self._component_rotations(upper_pose)
+        final_c = [None] * len(self.joints)
+        for i in self._parent_first_order():
+            parent = self.joints[i].parent_joint_index
+            w = weights[i]
+            if w > 0.0:
+                target = upper_c[i] if w >= 1.0 else glm.slerp(lower_c[i], upper_c[i], w)
+                local = target if parent == -1 else glm.inverse(final_c[parent]) * target
+                t, _, s = self._concrete_trs(i, translations[i], rotations[i], scales[i])
+                translations[i], rotations[i], scales[i] = t, glm.normalize(local), s
+            rotation = self._concrete_trs(i, translations[i], rotations[i], scales[i])[1]
+            final_c[i] = rotation if parent == -1 else final_c[parent] * rotation
 
 
 def _extract_material(ctx, gltf, blob, material_index, glb_dir):
@@ -1212,7 +1272,52 @@ def load_hat(hat_source, name, ctx):
     return data
 
 
-def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=None):
+def _node_world_matrix(node_index, parent_map, gltf):
+    """A node's matrix in the file's scene space (all its ancestors applied)."""
+    return _external_ancestor_matrix(node_index, parent_map, gltf) * _node_local_matrix(gltf["nodes"][node_index])
+
+
+def _rigid_skin(gltf):
+    """A skin for a file without one (see load_skinned_glb): every non-mesh node that has a parent is a joint
+    (a parentless node - the armature's own root - is left out, as a real skin leaves it, and becomes the joints'
+    external transform), parents first, each bound where it rests. None if there are no such nodes."""
+    parent_map = _build_parent_map(gltf)
+    nodes = gltf.get("nodes", [])
+    joints = [i for i, node in enumerate(nodes) if "mesh" not in node and parent_map.get(i, -1) != -1]
+    if not joints:
+        return None
+
+    def depth(i):
+        d = 0
+        while parent_map.get(i, -1) != -1:
+            i, d = parent_map[i], d + 1
+        return d
+
+    joints.sort(key=depth)
+    return {"joints": joints, "inverse_binds": [glm.inverse(_node_world_matrix(i, parent_map, gltf)) for i in joints],
+            "parent_map": parent_map}
+
+
+def _rigid_vertices(skin, node_index, count):
+    """Binds a rigid mesh node's `count` vertices fully to the node's nearest joint ancestor (the first joint
+    without one), so they follow it as it moves. The vertices stay as written: like a skinned mesh's (whose node
+    transform glTF ignores), they're already in the rig's own space - which is how Blender writes a mesh parented
+    to an armature without being weighted to it, the node transform it writes alongside being a leftover (applying
+    it shrank CorroderWM.glb to 4 cm, while the raw vertices put its barrel tip on its flash bone). Returns
+    (joints_0, weights_0)."""
+    parent_map = skin["parent_map"]
+    joints = skin["joints"]
+    joint = parent_map.get(node_index, -1)
+    while joint != -1 and joint not in joints:
+        joint = parent_map.get(joint, -1)
+    joints_0 = np.zeros((count, 4), dtype=np.uint32)
+    joints_0[:, 0] = joints.index(joint) if joint != -1 else 0
+    weights_0 = np.zeros((count, 4), dtype=np.float32)
+    weights_0[:, 0] = 1.0
+    return joints_0, weights_0
+
+
+def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=None, material_names=None):
     """Returns a dict:
         {
             "positions": (N, 3) float32,
@@ -1250,20 +1355,35 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
     node_names: if given, only mesh nodes with these names load. One
     skinned object only keeps ONE material (the first primitive's), so a
     model with several materials (body/cheese/glass) is loaded as one
-    object per node, each with its own material and alphaMode."""
+    object per node, each with its own material and alphaMode.
+
+    material_names: if given, only primitives with these materials load -
+    the same one-object-per-material split for a node that carries several
+    materials itself.
+
+    A file with NO skin (a mesh simply parented under an armature's
+    root, e.g. a held weapon exported without an armature modifier) loads
+    as a rigid object: its non-mesh nodes become the skeleton (so bone
+    lookups like a muzzle bone still work) and each mesh node moves wholly
+    with its nearest joint ancestor (or the first joint) - see
+    _rigid_vertices for where its vertices are taken to be."""
     result = _read_glb_json_and_blob(path)
     if result is None:
         return None
     gltf, blob = result
 
     skins = gltf.get("skins", [])
-    if not skins:
-        print(f"[skeletal_loader] {path} has no skin - not a skeletal mesh.")
-        return None
-    if not 0 <= skin_index < len(skins):
+    rigid = not skins
+    if rigid:
+        skin = _rigid_skin(gltf)
+        if skin is None:
+            print(f"[skeletal_loader] {path} has no skin and no bone nodes - not a skeletal mesh.")
+            return None
+    elif not 0 <= skin_index < len(skins):
         print(f"[skeletal_loader] {path} has no skin {skin_index} (it has {len(skins)}).")
         return None
-    skin = skins[skin_index]
+    else:
+        skin = skins[skin_index]
 
     # Gather primitives via the NODES that reference each mesh, not by
     # flattening every mesh in the file unconditionally - a node's own
@@ -1274,9 +1394,10 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
     # impossible) contributes its primitives once per non-hidden node
     # that references it.
     meshes = gltf.get("meshes", [])
-    prims = []
+    materials = gltf.get("materials", [])
+    prims = []              # (node index, primitive)
     hat_prims = {}
-    for node in gltf.get("nodes", []):
+    for node_index, node in enumerate(gltf.get("nodes", [])):
         mesh_index = node.get("mesh")
         if mesh_index is None:
             continue
@@ -1289,13 +1410,17 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
             if node_name.lower().startswith(_HAT_PREFIX):
                 hat_prims[node_name[len(_HAT_PREFIX):]] = list(meshes[mesh_index].get("primitives", []))
             continue
-        prims.extend(meshes[mesh_index].get("primitives", []))
+        for prim in meshes[mesh_index].get("primitives", []):
+            if material_names is not None and (
+                    prim.get("material") is None or materials[prim["material"]].get("name") not in material_names):
+                continue
+            prims.append((node_index, prim))
 
     if not prims:
         print(f"[skeletal_loader] {path} has no visible mesh primitives, aborting.")
         return None
 
-    required = ("POSITION", "NORMAL", "JOINTS_0", "WEIGHTS_0")
+    required = ("POSITION", "NORMAL") if rigid else ("POSITION", "NORMAL", "JOINTS_0", "WEIGHTS_0")
 
     # Merge every primitive sharing this skin into one combined mesh -
     # a glTF node's skin applies to ALL of its mesh's primitives (skin is
@@ -1312,7 +1437,7 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
     vertex_offset = 0
     material_indices = []
 
-    for prim in prims:
+    for node_index, prim in prims:
         attrs = prim.get("attributes", {})
         if not all(name in attrs for name in required):
             print(f"[skeletal_loader] {path} is missing one of {required} on a primitive, aborting.")
@@ -1324,8 +1449,11 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
             _read_accessor(gltf, blob, attrs["TEXCOORD_0"]) if "TEXCOORD_0" in attrs
             else np.zeros((len(prim_positions), 2), dtype=np.float32)
         )
-        prim_joints = _read_accessor(gltf, blob, attrs["JOINTS_0"]).astype(np.uint32)
-        prim_weights = _read_accessor(gltf, blob, attrs["WEIGHTS_0"]).astype(np.float32)
+        if rigid:
+            prim_joints, prim_weights = _rigid_vertices(skin, node_index, len(prim_positions))
+        else:
+            prim_joints = _read_accessor(gltf, blob, attrs["JOINTS_0"]).astype(np.uint32)
+            prim_weights = _read_accessor(gltf, blob, attrs["WEIGHTS_0"]).astype(np.float32)
 
         indices_accessor = prim.get("indices")
         if indices_accessor is not None:
@@ -1354,7 +1482,10 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
 
     # --- Skin / joint hierarchy ---
     joint_node_indices = skin["joints"]
-    inv_bind_raw = _read_accessor(gltf, blob, skin["inverseBindMatrices"]) if "inverseBindMatrices" in skin else None
+    if rigid:
+        inv_bind_raw = skin["inverse_binds"]
+    else:
+        inv_bind_raw = _read_accessor(gltf, blob, skin["inverseBindMatrices"]) if "inverseBindMatrices" in skin else None
 
     parent_map = _build_parent_map(gltf)
     node_to_joint_index = {node_idx: i for i, node_idx in enumerate(joint_node_indices)}
@@ -1367,7 +1498,9 @@ def load_skinned_glb(path, ctx=None, time_scale=1.0, skin_index=0, node_names=No
 
         local_bind = _node_local_matrix(node)
 
-        if inv_bind_raw is not None:
+        if rigid:
+            inv_bind = inv_bind_raw[i]
+        elif inv_bind_raw is not None:
             inv_bind = glm.mat4(*inv_bind_raw[i])
         else:
             inv_bind = glm.mat4(1.0)

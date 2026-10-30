@@ -44,6 +44,10 @@ from Modules.Weapons.damage_classes import Bullet
 from Modules.Weapons.recoil import Recoil
 
 _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
+# Third-person arm poses for holding a weapon (a weapon's player_animations "idle"): one-handed, or two-handed long
+# guns (the same rifle idle the player's locomotion uses).
+PISTOL_HOLD_POSE = "Assets/Animations/Poses/Pistol/pistolidle.glb"
+RIFLE_HOLD_POSE = "Assets/Animations/Poses/Rifle/rifleidle.glb"
 _SPINE4 = "ValveBiped.Bip01_Spine4"
 
 
@@ -513,10 +517,12 @@ class WeaponsBase:
     # per mesh node instead of one combined object - same reason and same shape as viewmodel_
     # gun_nodes (a skinned object keeps only ONE material - see skeletal_loader.py's own
     # multi-material scope note). None (most weapons - one material) keeps the existing single-
-    # object behavior exactly. Every node needs a skin (this is still add_skeletal underneath,
-    # not the static multi-material loader) - a rigid one-bone skin is enough for a prop that
-    # doesn't deform, but it still has to actually be skinned in the source file.
+    # object behavior exactly. A file with no skin at all loads as a rigid prop (see
+    # skeletal_loader.load_skinned_glb).
     worldmodel_nodes = None
+    # The same split by MATERIAL name, for a world model whose materials share one mesh node
+    # (one object per material). Used when worldmodel_nodes is None.
+    worldmodel_materials = None
     worldmodel_alpha_mode_overrides = {}
     worldmodel_node_alpha_mode_overrides = {}
     worldmodel_roughness_overrides = {}
@@ -581,7 +587,7 @@ class WeaponsBase:
     # body - see equip_player), and a rotation correction for it per joint
     # ({joint name: (x, y, z) degrees}, component space - see
     # PlayerModel.set_upper_rotation_offset).
-    player_animations = {"idle": "Assets/Animations/Poses/Pistol/pistolidle.glb"}
+    player_animations = {"idle": PISTOL_HOLD_POSE}
     player_upper_rotation_degrees = {}
     # While the owner is MOVING the pose reads as looking too far to one side:
     # an override pose is absolute, so it doesn't follow the lean/twist the
@@ -976,13 +982,31 @@ class WeaponsBase:
         if not active:
             return
         self.play("draw")
-        idle = self._clips.get(("player", "idle"))
-        if (idle is not None and self._player_model is not None
-                and getattr(self._player_model, "_override_upper_body_root_joints", None) is not None):
-            self._player_model.set_upper_override(idle)
-            offsets = self._upper_offsets()
-            if offsets:
-                self._player_model.set_upper_rotation_offset(offsets)
+        self._hold_player_pose(self._clips.get(("player", "idle")))
+
+    def _hold_player_pose(self, clip):
+        """Makes `clip` the player's upper-body pose, with this weapon's rotation correction on it
+        (player_upper_rotation_degrees) - set_upper_override clears corrections, so it's always reapplied here.
+        Nothing without a clip or on a player model without an override split."""
+        if (clip is None or self._player_model is None
+                or getattr(self._player_model, "_override_upper_body_root_joints", None) is None):
+            return
+        self._player_model.set_upper_override(clip)
+        offsets = self._upper_offsets()
+        if offsets:
+            self._player_model.set_upper_rotation_offset(offsets)
+
+    def reset(self):
+        """Back to how a fresh life starts (the owner died or respawned): drops an in-progress reload, an owed
+        rack, the scope and the spread and fire timing built up by the last life. Doesn't touch the animations -
+        play("idle") stops a playing one-shot, set_active(True) draws the gun afresh."""
+        self._reloading = False
+        self._rack_pending = False
+        self._scope_blend = 0.0
+        self._was_aiming = False
+        self._handling_last = (None, 0.0)
+        self._last_fire = float("-inf")
+        self._spread_at_last_shot = self.spread_min
 
     def deactivate(self):
         """Hides this weapon WITHOUT unloading it - see equip_player's own
@@ -1027,14 +1051,18 @@ class WeaponsBase:
     def _attach_worldmodel(self, scene, player_obj):
         if not self.worldmodel:
             return
-        if self.worldmodel_nodes:
-            # One skinned object per material node - see worldmodel_nodes' own docstring.
+        if self.worldmodel_nodes or self.worldmodel_materials:
+            # One skinned object per material node, or per material - see worldmodel_nodes/_materials.
+            parts = ([(node, None) for node in self.worldmodel_nodes] if self.worldmodel_nodes
+                     else [(None, material) for material in self.worldmodel_materials])
             objs = []
-            for node in self.worldmodel_nodes:
+            for node, material in parts:
                 node_modes = self.worldmodel_node_alpha_mode_overrides
                 ignore = node in node_modes     # this node opts out of the by-material overrides
                 obj = scene.add_skeletal(
-                    self.worldmodel, visible_in_color=True, cast_shadow=True, node_names=(node,))
+                    self.worldmodel, visible_in_color=True, cast_shadow=True,
+                    node_names=(node,) if node is not None else None,
+                    material_names=(material,) if material is not None else None)
                 if obj is None:
                     continue
                 name = obj.get("material_name")
@@ -1162,9 +1190,8 @@ class WeaponsBase:
             clip = self._clips.get(("worldmodel", state))
             if clip is not None:
                 scene.set_skeletal_animation(self.worldmodel_obj, clip)
-        if self._player_model is not None:
-            clip = self._clips.get(("player", state))
-            if clip is not None and getattr(self._player_model, "_override_upper_body_root_joints", None) is not None:
-                self._player_model.set_upper_override(clip)
+        # The upper-body pose with its correction - re-overriding without the correction (as this once did, at
+        # every reload's end and at spawn) left the body twisted until the next start/stop of moving reapplied it.
+        self._hold_player_pose(self._clips.get(("player", state)))
         if self._viewmodel is not None:
             self._viewmodel.play(state)

@@ -45,14 +45,13 @@ class GoudaGun(USP):
                                       # between shots - shots-to-kill is unaffected, since that's
                                       # set by damage, not interval; body TTK moves to (5-1)*0.23
                                       # = 0.92s)
-    # radius unchanged at 5.0 (was 3.0 - still a real reach increase from the original "too
-    # weak" report). damage brought back down from 25.0 to 19.0: every landed shot ALSO deals
-    # its own splash to the same target it hit (near point-blank range, strength ~0.85-0.95 -
-    # see Explosion.strength and app.py's own explode()), so total effective damage per body
-    # shot is direct(5) + splash(19 * ~0.85-0.95 ~= 16-18) = ~21-23 - comfortably in the
-    # ceil(100/x)=5 bracket (any effective damage in [20, 25) kills in exactly 5 body shots),
-    # not 25.0's own ~27-28 effective (4 shots, tied with the USP).
-    explosion = Explosion(radius=5.0, damage=19.0, self_damage_fraction=0.5, push_speed=10.0)
+    # radius back down to 3.0 from 5.0 (the splash reached too far). damage 19.0 (down from
+    # 25.0): every landed shot ALSO deals its own splash to the same target it hit, measured from
+    # the blast to the target's body_center (see Explosion.strength and app.py's own explode()).
+    # A torso hit (~0.3 m from it, strength ~0.9) is direct(5) + splash(~17) = ~22 - in the
+    # ceil(100/x)=5 bracket (any effective damage in [20, 25) kills in exactly 5 body shots);
+    # a hit low on the legs (~0.9 m, strength ~0.7) is ~18, so 6 shots.
+    explosion = Explosion(radius=3.0, damage=19.0, self_damage_fraction=0.5, push_speed=10.0)
     fire_sound = "Assets/Audio/Guns/Gouda/GoudaBlast.wav"
     # The raygun's effects, recoloured yellow (only these two systems are loaded from the file).
     particle_files = {"Assets/Particles/blast/bo3_raygun.pcf": ["bo3_raygun_impact", "bo3_raygun_muzzleflash"]}

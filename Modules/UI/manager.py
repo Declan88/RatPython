@@ -75,6 +75,7 @@ class UIManager:
         self.root.manager = self
         self.renderer = None  # created on first render - layout/tests need no GL
         self.cursor_free = False
+        self.cursor_hidden = False  # hidden even while free (the controller is driving the menus)
         self._fonts = {}
         self._hover = None
         self._pressed = None
@@ -145,7 +146,7 @@ class UIManager:
         if free == self.cursor_free:
             return
         self.cursor_free = free
-        pygame.mouse.set_visible(free)
+        pygame.mouse.set_visible(free and not self.cursor_hidden)
         pygame.event.set_grab(not free)
         if free:
             pygame.mouse.set_pos((self.window.width // 2, self.window.height // 2))
@@ -155,6 +156,14 @@ class UIManager:
             self._close_popup()
             pygame.event.clear(pygame.MOUSEMOTION)
             pygame.mouse.get_rel()
+
+    def set_cursor_hidden(self, hidden):
+        """Hides the cursor even while it's free - menus driven by a controller show the hovered control's
+        highlight instead. Clicks and hover still follow the (invisible) cursor."""
+        if hidden == self.cursor_hidden:
+            return
+        self.cursor_hidden = hidden
+        pygame.mouse.set_visible(self.cursor_free and not hidden)
 
     def _pick(self, x, y):
         # An open dropdown's list floats above everything, including

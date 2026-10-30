@@ -12,6 +12,8 @@ import time
 
 import glm
 
+from Modules.Graphics.skeletal_loader import _extract_rotation
+
 # Temporary debugging aid - set True (or flip via a debugger/console) to
 # print (AND append to _DEBUG_LOCOMOTION_LOG_PATH, since a console isn't
 # always convenient to copy from) a line every time the SET of blended
@@ -81,6 +83,16 @@ _DIRECTION_EASE_SECONDS = 0.15
 # genuine, deliberate speed change (actually starting to move, actually
 # stopping) still reads as prompt.
 _SPEED_EASE_SECONDS = 0.1
+
+# Time constant (seconds) the per-clip root offset (see PlayerModel's
+# root_offsets) eases toward the blend of the playing clips' offsets with -
+# close to the clips' own crossfades (crouch_blend_duration's 0.1 s), so the
+# body moves together with the pose instead of popping ahead of it.
+_ROOT_OFFSET_EASE_SECONDS = 0.04
+
+# Time constant (seconds) the aim pitch (see PlayerModel's aim_pitch_joints) eases toward the look pitch with -
+# smooths a remote player's pitch, which only arrives with each network packet, and eases in/out of an emote.
+_AIM_EASE_SECONDS = 0.05
 
 # Seconds update()'s own is_grounded argument must read False CONTINUOUSLY
 # before PlayerModel treats the player as genuinely airborne and enters
@@ -386,6 +398,21 @@ def _as_blend_space(spec, directional_clips):
     return _LocomotionBlendSpace(spec, directional_clips)
 
 
+def _component_rotation(skeleton, pose, index):
+    """Joint `index`'s rotation in the model's own frame (+y up, +z forward - its chain root's external transform
+    included) for a sampled local pose, computed apart from the skeleton's per-frame pose state."""
+    rotation = skeleton._component_rotations(pose)[index]
+    root = index
+    while skeleton.joints[root].parent_joint_index != -1:
+        root = skeleton.joints[root].parent_joint_index
+    return _extract_rotation(skeleton.joints[root].external_root_matrix) * rotation
+
+
+def _elevation(direction):
+    """Degrees `direction` points above the horizontal."""
+    return math.degrees(math.atan2(direction.y, math.hypot(direction.x, direction.z)))
+
+
 PLAYER_CULL_BOX = (1.4, 0.4, 2.6)
 
 
@@ -395,10 +422,10 @@ class PlayerModel:
                  states=(("idle", None, 0.0),), upper_states=None,
                  animation_blend_duration=None,
                  upper_body_root_joints=None, upper_animation=None,
-                 override_upper_body_root_joints=None,
+                 override_upper_body_root_joints=None, override_upper_body_component_space=False,
                  upper_rotation_offset_degrees=(0.0, 0.0, 0.0),
                  jump_animation=None, crouch_animation=None, crouch_blend_duration=0.1,
-                 directional_clips=None,
+                 directional_clips=None, root_offsets=None, aim_pitch_joints=None, aim_level_joint=None,
                  scale=None, metallic=None, roughness=None, emissive=None, texture_path=None,
                  time_scale=1.0, tint_mask_path=None):
         """scene: the Scene this model is added to (needs scene.add_skeletal
@@ -414,6 +441,38 @@ class PlayerModel:
         docstring for the feet-vs-hull-center contract that motivates
         this); forward_offset_degrees rotates it - if a model faces
         backward/sideways at 0, try 180 first.
+
+        root_offsets: optional {clip name: (x, y, z)} - metres the whole
+        body moves while that clip plays, in the model's own frame (+y up,
+        +z forward, turned with the model), for a clip authored with its
+        root somewhere other than the rest of the set's (e.g. a pose whose
+        feet hover above the origin). Weighted by however much each clip
+        is currently playing (a blend of the locomotion/crouch/jump weights,
+        or the single clip) and eased over _ROOT_OFFSET_EASE_SECONDS, so it
+        follows crossfades. A clip without an entry has no offset. Applied
+        on top of feet_offset.
+
+        aim_pitch_joints: optional {joint name: (reach, limit degrees)} -
+        bends the body toward update()'s pitch_degrees (where the player is
+        looking) by turning each listed joint about the body's own
+        left-right axis, on top of whatever is animating it. Turns add up
+        down the hierarchy, so `reach` is how much of the pitch the body
+        has turned by once past that joint (0.1: a tenth; 1: all of it):
+        each joint turns by whatever brings its listed ancestors' total up
+        to its reach, at most `limit` either way. A joint whose ancestors
+        fell short of their reach (at their limits) makes up the
+        difference, within its own limit; past every limit the bend just
+        stops. Separate branches each reach their own end - e.g. the arms
+        and the head both ending at 1 point the gun and the face where the
+        player looks, however little the spine below them bends. Eased
+        over _AIM_EASE_SECONDS, and back to level while an emote plays.
+
+        aim_level_joint: optional joint name (a head) that defines "looking
+        straight": at pitch 0 the body is bent so that joint faces the way
+        it does in the model's rest pose, whatever the playing animation
+        does with it (a rifle pose that holds the head and gun low gets
+        raised). Each clip's offset is measured from its own keyframes the
+        first time it plays.
 
         This model's LOCOMOTION (idle/walk/run, and any facing-relative
         directional variants - see directional_clips below) is driven by
@@ -499,7 +558,16 @@ class PlayerModel:
         parent of both clavicle chains AND Neck1 in this rig) lets such
         an override supply its OWN correct Spine4/neck pose instead.
         set_upper_override switches to this mask; clear_upper_override
-        switches back to upper_body_root_joints.
+        switches back to upper_body_root_joints. May also be a {joint name:
+        weight} weightlist (Source's $weightlist - see Scene.set_skeletal_
+        upper_joint_mask) for a partial blend, e.g. a spine that eases
+        into the held pose rather than cutting at one joint.
+
+        override_upper_body_component_space: while an override is active,
+        blend its joints in component space (Source's "worldspace" layers)
+        - the held pose's chest/arms keep their facing relative to the
+        body's root, not inheriting the twist the lower body's run puts
+        into the hips/spine below them.
 
         upper_rotation_offset_degrees: passed straight through to Scene.
         add_skeletal's own param of the same name - a COMPONENT-space
@@ -629,6 +697,16 @@ class PlayerModel:
         self._scene = scene
         self._forward_offset_radians = glm.radians(forward_offset_degrees)
         self._feet_offset = float(feet_offset)
+        self._root_offsets = {name: glm.vec3(*offset) for name, offset in (root_offsets or {}).items()}
+        self._root_offset = glm.vec3(0.0)   # the eased blend of the playing clips' root offsets
+        self._aim_joint_spec = dict(aim_pitch_joints or {})
+        # [(joint index, reach, limit, nearest listed ancestor or None)], parents first, once loaded.
+        self._aim_joints = []
+        self._aim_pitch = 0.0               # the eased pitch the body is bent by (degrees, + up)
+        self._aim_level_joint = aim_level_joint
+        # (joint index, its forward axis, its rest-pose elevation, [its chain from the root]), once loaded.
+        self._aim_level = None
+        self._clip_levels = {}              # clip name -> that joint's sampled rotations in it (see _clip_level)
 
         if not states:
             raise ValueError("PlayerModel requires at least one state in `states`")
@@ -646,6 +724,7 @@ class PlayerModel:
         self._upper_override = None
         self._upper_body_root_joints = upper_body_root_joints
         self._override_upper_body_root_joints = override_upper_body_root_joints
+        self._override_upper_body_component_space = bool(override_upper_body_component_space)
 
         self._jump_blend_space = _as_blend_space(jump_animation, directional_clips)
         self._crouch_blend_space = _as_blend_space(crouch_animation, directional_clips)
@@ -752,6 +831,57 @@ class PlayerModel:
             self._scene.set_skeletal_locomotion(
                 self.obj, initial_lower_weights, initial_upper_weights, blend_duration=0.0
             )
+            self._root_offset = self._target_root_offset()   # the initial clip's, exactly (nothing to ease from)
+            self._place(position if position is not None else glm.vec3(0.0))
+            skeleton = self.obj["skeleton"]
+            listed = {index: (float(reach), float(limit)) for name, (reach, limit) in self._aim_joint_spec.items()
+                      for index in skeleton.resolve_joint_indices([name])}
+
+            def listed_ancestor(index):
+                j = skeleton.joints[index].parent_joint_index
+                while j != -1 and j not in listed:
+                    j = skeleton.joints[j].parent_joint_index
+                return None if j == -1 else j
+
+            self._aim_joints = [(index, *listed[index], listed_ancestor(index))
+                                for index in skeleton._parent_first_order() if index in listed]
+            level = skeleton.resolve_joint_indices([aim_level_joint]) if aim_level_joint else []
+            if level and self._aim_joints:
+                rest = _component_rotation(skeleton, skeleton._empty_pose(), level[0])
+                # The joint's own axis that points the model's way (+z) at rest is its "facing".
+                axis = max((glm.vec3(1, 0, 0), glm.vec3(-1, 0, 0), glm.vec3(0, 1, 0), glm.vec3(0, -1, 0),
+                            glm.vec3(0, 0, 1), glm.vec3(0, 0, -1)), key=lambda v: (rest * v).z)
+                chain = [level[0]]       # the joint and its ancestors, root first
+                while skeleton.joints[chain[0]].parent_joint_index != -1:
+                    chain.insert(0, skeleton.joints[chain[0]].parent_joint_index)
+                self._aim_level = (level[0], axis, _elevation(rest * axis), chain)
+
+    def _target_root_offset(self):
+        """The root offset (see root_offsets) of whatever the lower body is playing: its blend-space weights, or
+        its single clip (an emote)."""
+        if not self._root_offsets:
+            return glm.vec3(0.0)
+        weights = self.obj["locomotion_weights"]
+        if weights is None:
+            weights = ((self.obj["animation"], 1.0),)
+        offset = glm.vec3(0.0)
+        for clip, weight in weights:
+            clip_offset = self._root_offsets.get(clip)
+            if clip_offset is not None:
+                offset += clip_offset * weight
+        return offset
+
+    def _place(self, position):
+        """Puts the body at `position` (feet) plus feet_offset and the current root offset, turned with the
+        model (rotation.y about +Y, as _get_model_matrix applies it)."""
+        placed = glm.vec3(position)
+        placed.y += self._feet_offset
+        offset = self._root_offset
+        if offset.x or offset.y or offset.z:
+            yaw = self.obj["rotation"].y
+            c, s = math.cos(yaw), math.sin(yaw)
+            placed += glm.vec3(offset.x * c + offset.z * s, offset.y, -offset.x * s + offset.z * c)
+        self.obj["position"] = placed
 
     def _compute_effective_speed(self, speed, dt, is_sprinting):
         """Returns the speed-axis (X) value to actually feed into
@@ -891,12 +1021,80 @@ class PlayerModel:
         the frames between update() calls of a remote player (see RemotePlayer.update)."""
         if self.obj is None:
             return
-        feet_pos = glm.vec3(position)
-        feet_pos.y += self._feet_offset
-        self.obj["position"] = feet_pos
+        self._place(position)
+
+    def _clip_level(self, clip, correction):
+        """The aim_level_joint's average elevation (degrees) over `clip`, turned by `correction` (a component-space
+        rotation - see _level_correction); None for an unknown clip. The joint's rotations are sampled from the
+        clip's keyframes once and cached."""
+        if clip not in self._clip_levels:
+            skeleton = self.obj["skeleton"]
+            animation = skeleton.animations.get(clip)
+            self._clip_levels[clip] = None if animation is None else [
+                _component_rotation(skeleton, skeleton._sample_clip(clip, t), self._aim_level[0])
+                for t in (animation.duration * k / 8 for k in range(8))]
+        rotations = self._clip_levels[clip]
+        if rotations is None:
+            return None
+        axis = self._aim_level[1]
+        return sum(_elevation(correction * rotation * axis) for rotation in rotations) / len(rotations)
+
+    def _level_correction(self):
+        """Degrees to bend up by so the aim_level_joint faces as it does at rest (see aim_level_joint): from the
+        upper-body override's clip while one drives it in component space (it then sets that joint's facing
+        outright), otherwise from the lower body's clips by their weights."""
+        if self._aim_level is None:
+            return 0.0
+        if self._upper_override is not None and self._override_upper_body_component_space:
+            weights = ((self._upper_override, 1.0),)
+        else:
+            weights = self.obj["locomotion_weights"] or ((self.obj["animation"], 1.0),)
+        # The upper body's rotation corrections (a held weapon's player_upper_rotation_degrees) on the joint's
+        # chain turn it too: each one turns everything below it, so the deepest applies last.
+        offsets = self.obj.get("upper_rotation_offsets") or {}
+        turn = glm.quat(1.0, 0.0, 0.0, 0.0)
+        for joint in self._aim_level[3]:
+            if joint in offsets:
+                turn = offsets[joint] * turn
+        rest = self._aim_level[2]
+        correction = total = 0.0
+        for clip, weight in weights:
+            level = self._clip_level(clip, turn)
+            if level is not None:
+                correction += (rest - level) * weight
+                total += weight
+        return correction / total if total > 0.0 else 0.0
+
+    def _distribute_aim(self, pitch):
+        """Each aim joint's own turn (degrees, in _aim_joints order) for a bend of `pitch` - see aim_pitch_joints:
+        what it takes to bring the turn so far along its chain up to its reach, within its limit."""
+        reached = {}        # joint -> total turn at it (its listed ancestors' plus its own)
+        turns = []
+        for index, reach, limit, ancestor in self._aim_joints:
+            before = reached.get(ancestor, 0.0)
+            turn = max(-limit, min(limit, pitch * reach - before))
+            reached[index] = before + turn
+            turns.append(turn)
+        return turns
+
+    def _update_aim(self, dt, pitch_degrees):
+        """Eases the body's bend toward pitch_degrees plus the level correction (back to unbent while emoting)
+        and hands the scene the per-joint turns - see aim_pitch_joints/aim_level_joint."""
+        if not self._aim_joints:
+            return
+        target = 0.0 if self._top_state == "emote" else pitch_degrees + self._level_correction()
+        self._aim_pitch += (target - self._aim_pitch) * (1.0 - math.exp(-max(dt, 0.0) / _AIM_EASE_SECONDS))
+        if abs(self._aim_pitch) < 0.01:
+            self.obj["aim_offsets"] = None
+            return
+        # The model faces +z with +y up, so +x is its left-right axis; turning +z up toward +y is a negative angle.
+        axis = glm.vec3(1.0, 0.0, 0.0)
+        self.obj["aim_offsets"] = {
+            index: glm.angleAxis(glm.radians(-turn), axis)
+            for (index, _, _, _), turn in zip(self._aim_joints, self._distribute_aim(self._aim_pitch)) if turn}
 
     def update(self, dt, position, yaw_degrees, speed, is_crouched=False, is_grounded=True,
-               is_sprinting=None, move_direction=None, just_jumped=False, just_shot=False):
+               is_sprinting=None, move_direction=None, just_jumped=False, just_shot=False, pitch_degrees=0.0):
         """Call once per frame (or per network update, for a remote
         player) to sync this model's transform and animation state.
 
@@ -1021,10 +1219,6 @@ class PlayerModel:
         if self.obj is None:
             return
 
-        feet_pos = glm.vec3(position)
-        feet_pos.y += self._feet_offset
-        self.obj["position"] = feet_pos
-
         # Camera yaw (degrees) -> model rotation.y (radians about +Y,
         # scene_base.py's _get_model_matrix convention). Derived, not
         # guessed: camera.py's front vector is
@@ -1041,6 +1235,13 @@ class PlayerModel:
         # fix it via forward_offset_degrees (try 180 first), not by
         # changing this formula.
         self.obj["rotation"].y = glm.radians(90.0) - glm.radians(yaw_degrees) + self._forward_offset_radians
+
+        # The root offset eases toward the clips set by the LAST update (a frame behind, so it moves with their
+        # crossfade rather than ahead of it) - see root_offsets.
+        ease = 1.0 - math.exp(-max(dt, 0.0) / _ROOT_OFFSET_EASE_SECONDS)
+        self._root_offset += (self._target_root_offset() - self._root_offset) * ease
+        self._place(position)
+        self._update_aim(dt, pitch_degrees)
 
         # Computed unconditionally, every frame, regardless of top_state -
         # locomotion's own blend space needs these below, crouch_
@@ -1273,7 +1474,9 @@ class PlayerModel:
         if self.obj is not None:
             self.obj["upper_locomotion_weights"] = None
             if self._override_upper_body_root_joints is not None:
-                self._scene.set_skeletal_upper_joint_mask(self.obj, self._override_upper_body_root_joints)
+                self._scene.set_skeletal_upper_joint_mask(
+                    self.obj, self._override_upper_body_root_joints,
+                    component_space=self._override_upper_body_component_space)
             self._scene.set_skeletal_upper_animation(self.obj, animation_name, **self._animation_blend_kwargs)
 
     def clear_upper_override(self):

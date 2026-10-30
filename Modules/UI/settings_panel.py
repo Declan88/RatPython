@@ -9,9 +9,12 @@ from .widgets import Label
 
 
 def add_settings_options(card):
-    """Adds the graphics and controller options to `card` (a vertical Panel)."""
+    """Adds the graphics, HUD and controller options to `card` (a vertical Panel)."""
     card.add(Label("SETTINGS", font_size=28, color=theme.ACCENT))
     _graphics(card)
+    card.add(Label("HUD", font_size=28, color=theme.ACCENT))
+    _option(card, "Damage numbers", "damage_numbers")
+    _option(card, "Combine hit + explosion damage", "combine_explosion_damage")
     card.add(Label("CONTROLLER", font_size=28, color=theme.ACCENT))
     _controller(card)
 
