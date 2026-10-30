@@ -6,6 +6,11 @@ name: Build macOS
 # BuildCMD_Nuitka_Standalone_Packed.cmd starts this itself and uploads the result to Steam (tools/mac_build.py).
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Game version to build as (e.g. 0.1.5) - blank keeps Modules/version.py's"
+        required: false
+        default: ""
   push:
     tags: ["v*"]
 
@@ -21,6 +26,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+
+      # The build command bumps the version just before starting this run, without pushing it - so it's
+      # passed in here, and the Mac build carries the same version as the Windows one (lobbies only let
+      # players on the same version join each other).
+      - name: Set the game version
+        if: ${{ github.event.inputs.version != '' }}
+        env:
+          GAME_VERSION: ${{ github.event.inputs.version }}
+        run: python tools/bump_version.py --set "$GAME_VERSION"
 
       - uses: dtolnay/rust-toolchain@stable
 

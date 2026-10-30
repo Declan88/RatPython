@@ -30,6 +30,7 @@ from .settings_panel import add_settings_options
 from .widgets import Anchor, Button, Image, Label, Panel
 from Modules.Player.hats import available_hats, display_name
 from Modules.Player.rat_colors import hsv_to_rgb, rgb_to_hsv
+from Modules.version import VERSION
 
 # Where the fur color's brightness slider starts (and returns to on reset) -
 # well below full so a freshly picked color isn't blown out.
@@ -111,6 +112,8 @@ class LobbyMenu:
             "START SINGLEPLAYER", self._start_singleplayer, size=(_W + 36, 84), font_size=36))
         self.status = sidebar.add(Label("", font_size=26, color=_WARN, anchor=Anchor.MIDDLE_LEFT,
                                         pivot=(0, 0), offset=(80, 105)))
+        # Which version this is - lobbies only take players on the same one.
+        sidebar.add(Label(f"v{VERSION}", font_size=22, color=_MUTED, anchor=Anchor.BOTTOM_LEFT, offset=(80, -30)))
 
         self._build_wardrobe(root)
 
@@ -432,9 +435,11 @@ class LobbyMenu:
 
     def _make_row(self, info):
         full = info["max_players"] > 0 and info["players"] >= info["max_players"]
-        color = _MUTED if full else (255, 255, 255, 255)
+        color = _MUTED if full or not info["compatible"] else (255, 255, 255, 255)
         row = _button("", lambda i=info: self._select(i), size=(0, 52), size_frac=(1, 0))
-        row.add(Label(info["name"], font_size=26, color=color, anchor=(0, 0.5), offset=(12, 0)))
+        # Another version's lobby stays listed (so it's clear it exists and why it can't be joined), greyed out.
+        name = info["name"] if info["compatible"] else f"{info['name']}  (v{info['version'] or '?'})"
+        row.add(Label(name, font_size=26, color=color, anchor=(0, 0.5), offset=(12, 0)))
         row.add(Label(self._map_names[info["map"]], font_size=24, color=color,
                       anchor=(0.56, 0.5), pivot=(0, 0.5)))
         row.add(Label(f"{info['players']}/{info['max_players'] or '?'}", font_size=24, color=color,
@@ -445,6 +450,10 @@ class LobbyMenu:
 
     def _select(self, info):
         if self._busy:
+            return
+        if not info["compatible"]:
+            self.status.text = (f"That lobby is on version {info['version'] or 'older'} - you're on {VERSION}"
+                                " (everyone needs the same version)")
             return
         if 0 < info["max_players"] <= info["players"]:
             self.status.text = "That lobby is full"

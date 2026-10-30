@@ -17,6 +17,12 @@ rem code the first time and caches the login after that.
 rem
 rem   --no-upload   stop once both builds are in the Steam content folders
 rem   --no-mac      Windows only (uploads with simple_app_build.vdf, a build WITHOUT the macOS depot)
+rem
+rem Every build that uploads raises the game version's last number first (Modules\version.py, via
+rem tools\bump_version.py - 0.1.4 becomes 0.1.5; a new minor version or 1.0 is only ever set by hand). Lobbies carry
+rem the version and players on a different one can't join them. The macOS build is handed the same number, so it
+rem matches even though version.py isn't pushed; commit the bumped file with your next commit. --no-upload builds
+rem keep the current number.
 
 cd /d "%~dp0"
 
@@ -33,8 +39,18 @@ for %%A in (%*) do (
 )
 if defined NO_MAC set "STEAM_APP_VDF=%STEAM_CONTENT%\simple_app_build.vdf"
 
+echo === 0/8 game version ===
+set "GAME_VERSION="
+if defined NO_UPLOAD (
+    for /f "delims=" %%V in ('python tools\bump_version.py --print') do set "GAME_VERSION=%%V"
+) else (
+    for /f "delims=" %%V in ('python tools\bump_version.py') do set "GAME_VERSION=%%V"
+)
+if not defined GAME_VERSION (echo Couldn't read the game version from Modules\version.py & exit /b 1)
+if defined NO_UPLOAD (echo %GAME_VERSION% ^(unchanged: not uploading^)) else (echo %GAME_VERSION%)
+
 echo === 1/8 starting the macOS build on GitHub ===
-if defined NO_MAC (echo skipped) else (python tools\mac_build.py start || exit /b 1)
+if defined NO_MAC (echo skipped) else (python tools\mac_build.py start %GAME_VERSION% || exit /b 1)
 
 echo === 2/8 packing assets ===
 python tools\pack_assets.py --out build_nuitka\packed --verify || exit /b 1
@@ -72,5 +88,5 @@ if not defined STEAM_BUILD_USER set /p "STEAM_BUILD_USER=Steamworks login name: 
 "%STEAMCMD%" +login %STEAM_BUILD_USER% +run_app_build "%STEAM_APP_VDF%" +quit || exit /b 1
 
 echo.
-echo Done: uploaded with %STEAM_APP_VDF% - set the new build live on its branch in Steamworks
+echo Done: version %GAME_VERSION% uploaded with %STEAM_APP_VDF% - set the new build live on its branch in Steamworks
 echo (launch options: RatWar.exe on Windows, RatWar.app on macOS)

@@ -1,11 +1,13 @@
 """
 Runs the GitHub macOS build (.github/workflows/build-macos.yml) for "BuildCMD_Nuitka_Standalone_Packed.cmd":
 
-    python tools/mac_build.py start                 # trigger the workflow on master, remember its run id
+    python tools/mac_build.py start [0.1.5]         # trigger the workflow on master, remember its run id
     python tools/mac_build.py fetch C:\\Steambuilds\\ContentMac   # wait for it, unzip RatWar.app there
 
 GitHub builds what is PUSHED to master, not this working tree - `start` says so (and asks) when local
 changes or commits aren't on origin/master yet, since the Mac build would then differ from the Windows one.
+The game version is the exception: `start` hands it to the workflow (which writes it into Modules/version.py
+before compiling), so a version just bumped for this build needn't be pushed first.
 Needs the GitHub CLI (gh), logged in. Exits 1 on any failure.
 """
 
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = "build-macos.yml"
 BRANCH = "master"
 RUN_FILE = ROOT / "build_nuitka" / "mac_run.txt"
+VERSION_FILE = "Modules/version.py"
 DOWNLOAD_DIR = ROOT / "build_nuitka" / "mac_artifact"
 
 
@@ -42,8 +45,10 @@ def _check_pushed():
     """Lists what the Mac build WON'T include and asks whether to go on anyway."""
     _run("git", "fetch", "--quiet", "origin", BRANCH)
     unpushed = _run("git", "log", "--oneline", f"origin/{BRANCH}..HEAD").splitlines()
-    # .pyc files are tracked in this repo but never reach a build - not worth a warning.
-    dirty = [line for line in _run("git", "status", "--porcelain").splitlines() if not line.endswith(".pyc")]
+    # .pyc files are tracked in this repo but never reach a build - not worth a warning. Nor is the version file:
+    # the version goes to the workflow directly (see start).
+    dirty = [line for line in _run("git", "status", "--porcelain").splitlines()
+             if not line.endswith(".pyc") and not line.endswith(VERSION_FILE)]
     if not unpushed and not dirty:
         return
     print(f"WARNING: the Mac build uses origin/{BRANCH}, which is missing:")
@@ -61,10 +66,11 @@ def _check_pushed():
         sys.exit("Stopped - commit and push first, or run with --no-mac.")
 
 
-def start():
+def start(version=None):
     _check_pushed()
     before = _latest_run_id()
-    _run("gh", "workflow", "run", WORKFLOW, "--ref", BRANCH)
+    extra = ("-f", f"version={version}") if version else ()
+    _run("gh", "workflow", "run", WORKFLOW, "--ref", BRANCH, *extra)
     # The dispatch returns before the run exists; wait for a run newer than the one before it.
     for _ in range(30):
         time.sleep(2)
@@ -120,8 +126,8 @@ def fetch(dest):
 
 
 def main():
-    if len(sys.argv) == 2 and sys.argv[1] == "start":
-        start()
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "start":
+        start(sys.argv[2] if len(sys.argv) == 3 else None)
     elif len(sys.argv) == 3 and sys.argv[1] == "fetch":
         fetch(Path(sys.argv[2]))
     else:

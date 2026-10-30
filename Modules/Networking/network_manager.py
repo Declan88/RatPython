@@ -18,6 +18,7 @@ import time
 import py_steam_net
 from .remote_player import RemotePlayer
 from Modules.Player.rat_colors import encode_color
+from Modules.version import VERSION
 
 
 # The game's own Steam App ID (was 480, Spacewar). Keep steam_appid.txt in sync for dev runs.
@@ -485,6 +486,7 @@ class NetworkManager:
                 "mode": pending["mode"],
                 "max_players": str(pending["max_players"]),
                 "has_password": "1" if pending["password"] else "0",
+                "version": VERSION,     # only players on this same version can join (see on_lobby_joined)
             }
             if pending["password"]:
                 salt = secrets.token_hex(8)
@@ -504,7 +506,9 @@ class NetworkManager:
     def request_lobbies(self, on_result):
         """Searches for open lobbies. on_result(lobbies, error): lobbies
         is a list of dicts (id, name, map, mode, players, max_players,
-        has_password, pw_salt, pw_hash), error is None or a string."""
+        has_password, pw_salt, pw_hash, version, compatible - whether its
+        version is ours, i.e. whether we can join it), error is None or a
+        string."""
         if not self.client:
             on_result([], "Steam isn't running")
             return
@@ -540,6 +544,9 @@ class NetworkManager:
             "has_password": get("has_password") == "1",
             "pw_salt": get("pw_salt"),
             "pw_hash": get("pw_hash"),
+            # "" for a lobby made by a build from before versions existed - never ours.
+            "version": get("version"),
+            "compatible": get("version") == VERSION,
         }
 
     def current_lobby_info(self):
@@ -709,6 +716,23 @@ class NetworkManager:
             print(f"\n--> Failed to join lobby: {error}")
             if on_result:
                 on_result(False, str(error))
+            return
+        # Players on different versions can't play together (the game's messages and rules may differ): leave
+        # again straight away. The lobby list already greys such lobbies out; this also covers any other way in.
+        try:
+            version = self.client.get_lobby_data(lobby_id, "version") or ""
+        except Exception:
+            version = ""
+        if version != VERSION:
+            try:
+                self.client.leave_lobby(lobby_id)
+            except Exception as e:
+                print(f"[Net] leave_lobby failed: {e}")
+            message = (f"that lobby is on version {version}, you're on {VERSION}" if version
+                       else f"that lobby is on an older version than yours ({VERSION})")
+            print(f"\n--> Refused to join lobby {lobby_id}: {message}")
+            if on_result:
+                on_result(False, message)
             return
         self.current_lobby_id = lobby_id
         print(f"\n--> SUCCESS! Joined Lobby ID: {self.current_lobby_id}")
