@@ -16,7 +16,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14            # Apple Silicon (arm64)
+    # Apple Silicon (arm64). Was macos-14, which GitHub retires on 2 November 2026 (its scheduled "brownouts"
+    # already fail jobs on it - actions/runner-images#13518).
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
