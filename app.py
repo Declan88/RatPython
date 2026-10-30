@@ -42,7 +42,7 @@ _disable_window_ghosting()
 # AmdPowerXpressRequestHighPerformance exports in the .exe itself work (not the Windows registry hint, not a
 # DLL) - nuitka_gpu_preference_plugin.py adds them at build time.
 
-from Modules.Window.window import WindowManager
+from Modules.Window.window import WindowManager, frame_rate_limit
 from Modules.Window.nvidia_profile import ensure_threaded_optimization
 from Modules.Window.loading_screen import hide_loading_screen, show_loading_screen
 from Modules.UI import UIManager
@@ -1093,6 +1093,8 @@ def main():
     running = True
     while running:
         prof.begin()
+        # The frame rate limit (the setting can change any time; the refresh rate if the window changes display).
+        window.max_fps = frame_rate_limit(settings.fps_limit, window.refresh_rate)
         controls.begin_frame()
         running, dt = window.handle_events(
             camera, on_key_down=on_key_down, event_filter=count_click

@@ -5,6 +5,42 @@ import pygame
 import moderngl
 
 
+# The frame rate limit runs this far above the chosen display rate (see frame_rate_limit): a limiter set exactly to
+# a monitor's refresh rate lands just under it (each frame's wait rounds up a little), so the headroom keeps every
+# refresh supplied with a fresh frame.
+FPS_HEADROOM = 60
+
+
+def monitor_refresh_rate():
+    """The refresh rate (Hz) of the display the window is on - 60 if SDL can't tell."""
+    try:
+        rate = pygame.display.get_current_refresh_rate()
+    except (pygame.error, AttributeError):
+        try:
+            rate = (pygame.display.get_desktop_refresh_rates() or [0])[0]
+        except (pygame.error, AttributeError):
+            rate = 0
+    return rate if rate and rate > 0 else 60
+
+
+def frame_rate_limit(display_fps, refresh_rate):
+    """The frame rate to limit the game to for a chosen display rate: display_fps (0 = the monitor's refresh_rate,
+    negative = uncapped -> None) plus FPS_HEADROOM."""
+    if display_fps < 0:
+        return None
+    return (display_fps or refresh_rate) + FPS_HEADROOM
+
+
+def _wait_until(deadline):
+    """Returns at `deadline` (time.perf_counter): sleeps most of the way - sleep alone can overshoot by a
+    millisecond or so, too coarse at hundreds of frames a second - and spins the last moment."""
+    remaining = deadline - time.perf_counter()
+    if remaining > 0.0015:
+        time.sleep(remaining - 0.001)
+    while time.perf_counter() < deadline:
+        pass
+
+
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
@@ -204,6 +240,11 @@ class WindowManager:
         self.clock = pygame.time.Clock()
         self._fps_display_timer = 0.0
         self._last_time = time.perf_counter()
+        # The display's refresh rate (re-read when the window moves to another display) and the frame rate flip()
+        # holds the game to: None = uncapped. The game sets max_fps from its setting (see frame_rate_limit).
+        self.refresh_rate = monitor_refresh_rate()
+        self.max_fps = None
+        self._next_frame = None
 
     def reset_frame_timer(self):
         """Call this after any deliberate blocking stretch on the main
@@ -260,12 +301,15 @@ class WindowManager:
                     return False, dt
                 elif event.key == pygame.K_F11:
                     pygame.display.toggle_fullscreen()
+                    self.refresh_rate = monitor_refresh_rate()
                 elif event.key == pygame.K_F10:
                     self.toggle_vsync()
                 if on_key_down is not None:
                     on_key_down(event.key)
             elif event.type == pygame.MOUSEMOTION:
                 camera.process_mouse(event.rel[0], event.rel[1])
+            elif event.type == pygame.WINDOWDISPLAYCHANGED:
+                self.refresh_rate = monitor_refresh_rate()     # moved to another monitor
             elif event.type == pygame.VIDEORESIZE:
                 self.width, self.height = event.w, event.h
                 self.screen = pygame.display.set_mode(
@@ -277,7 +321,8 @@ class WindowManager:
         self._fps_display_timer += dt
         if self._fps_display_timer >= 0.5:
             self._fps_display_timer = 0.0
-            vsync_label = "vsync on" if self.vsync else "vsync off (uncapped)"
+            vsync_label = ("vsync on" if self.vsync else
+                           f"limit {self.max_fps:.0f}" if self.max_fps else "uncapped")
             pygame.display.set_caption(
                 f"{self.title} - {self.clock.get_fps():.0f} FPS - {vsync_label}"
             )
@@ -285,6 +330,22 @@ class WindowManager:
 
     def flip(self):
         pygame.display.flip()
+        self._limit_frame_rate()
+
+    def _limit_frame_rate(self):
+        """Holds frames to max_fps (nothing with vsync on, which paces them itself, or uncapped): waits out the
+        rest of this frame's slot. Slots follow each other exactly while the game keeps up; one that runs late
+        starts the next slot from now instead of rushing to catch up."""
+        if not self.max_fps or self.vsync:
+            self._next_frame = None
+            return
+        period = 1.0 / self.max_fps
+        now = time.perf_counter()
+        if self._next_frame is not None and self._next_frame > now:
+            _wait_until(self._next_frame)
+            now = time.perf_counter()
+        late = self._next_frame is None or now - self._next_frame > period
+        self._next_frame = (now if late else self._next_frame) + period
 
     def quit(self):
         pygame.quit()

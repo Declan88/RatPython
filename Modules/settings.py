@@ -14,6 +14,9 @@ _DEFAULTS = {
     "ssr": True,                      # screen-space reflections (water)
     "gibs": True,                     # physical gibs on death (off = a cheap blood burst)
     "bloom": True,                    # glow on "bloom_" objects (see Modules/Graphics/bloom.py)
+    # Frame rate to display: 0 = the monitor's refresh rate, -1 = uncapped, else 30-300. The game is limited to this
+    # plus some headroom (Modules/Window/window.py's frame_rate_limit).
+    "fps_limit": 0,
     "damage_numbers": True,           # the damage our hits do, popping up on the target (Modules/UI/damage_numbers.py)
     "combine_explosion_damage": True, # one number for a direct hit plus its explosion's splash on the same player
     "controller_sensitivity": 1.0,    # right-stick look speed multiplier

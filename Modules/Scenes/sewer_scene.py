@@ -41,7 +41,9 @@ class SewerScene(Scene):
             bloom_overrides={"bloom_sphere": {"intensity": 0.5, "radius": 2.5}},
             # The water object is "water_floor", with the same "Watermat" material as Boardwalk's water. These
             # are Boardwalk's water settings (see mainmap_scene.py for what each does), matched by MATERIAL
-            # name - except the collision one just below, which is by object name.
+            # name - except the collision one just below, which is by object name - but with the cheap (skybox)
+            # reflection rather than Boardwalk's screen-space one: the sewer's water is small and dark, so the
+            # per-frame scene grab SSR costs isn't worth it here.
             # Boardwalk's water object has no collider at all (see mainmap_scene.py's "Water": None): you
             # fall or wade through it instead of standing on its surface. Same here, by OBJECT name.
             collision_object_overrides={"water_floor": None},
@@ -56,13 +58,10 @@ class SewerScene(Scene):
                     "uv_scale": 0.4,
                     "uv2_scale": 2.3,
                     "normal_scale": 2,
-                    "reflection_mode": "ssr",
+                    "reflection_mode": "cheap",
                 }
             },
         )
-
-        # What "reflection_mode": "ssr" above needs (see Scene.enable_screen_space_reflections).
-        self.enable_screen_space_reflections()
 
         self.add_lights_from_glb(SEWER_MODEL, cast_shadows=True, radius_multiplier=3, intensity_multiplier=1)
         self.add_actors_from_glb(SEWER_MODEL)
