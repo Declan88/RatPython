@@ -90,4 +90,3 @@ class USP(WeaponsBase):
     # component-space weightlist blend (remote_player.py's WEAPON_POSE_WEIGHTS) so it stands exactly as before. No moving
     # correction: that blend keeps the chest facing ahead while running (it used to turn ~27 degrees left).
     player_upper_rotation_degrees = {"ValveBiped.Bip01_Spine4": (18.4, -22.7, -2.1)}
-    player_moving_yaw_degrees = 0.0

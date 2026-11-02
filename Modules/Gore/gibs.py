@@ -32,7 +32,8 @@ from Modules.Physics.physics_world import CollisionGroup
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
 
 GIB_MODEL = "Assets/Models/Gibs/Gibs.glb"
-GORE_SOUND = "Assets/Audio/Player/Gore.wav"
+# One of these, picked at random, plays for each death (gibs or the cheap version).
+GORE_SOUNDS = ("Assets/Audio/Player/Gore.wav", "Assets/Audio/Player/Gore2.wav")
 
 # The fur material of the gib model (the same one the player rat uses): the part of a gib that
 # takes the player's fur colour, matches the player's shading and uses the same tint mask.
@@ -259,7 +260,7 @@ class GibManager:
         self.particles.spawn("gore_blood_cloud", centre_of_mass)
         if sound:
             self.scene.sound_manager.add_sound(
-                GORE_SOUND, centre_of_mass, volume=1.0, min_distance=6.0, max_distance=90.0,
+                random.choice(GORE_SOUNDS), centre_of_mass, volume=1.0, min_distance=6.0, max_distance=90.0,
                 loop=False, falloff="inverse", muffle=True)
 
     def _cheap_death(self, feet, sound):
@@ -270,7 +271,7 @@ class GibManager:
         self.particles.spawn("gore_blood_cloud", centre)
         if sound:
             self.scene.sound_manager.add_sound(
-                GORE_SOUND, centre, volume=1.0, min_distance=6.0, max_distance=90.0,
+                random.choice(GORE_SOUNDS), centre, volume=1.0, min_distance=6.0, max_distance=90.0,
                 loop=False, falloff="inverse", muffle=True)
 
     @staticmethod
@@ -331,7 +332,8 @@ class GibManager:
         distance-muffled copies), and draws a set of gibs once. They spawn in front of `camera`
         into the back buffer (never presented) and are removed again before any physics step.
         Call once when the game starts, with the camera in the world."""
-        self.scene.sound_manager.preload(GORE_SOUND, muffle=True)
+        for sound in GORE_SOUNDS:
+            self.scene.sound_manager.preload(sound, muffle=True)
         front = glm.normalize(glm.vec3(camera.front))
         self.spawn(glm.vec3(camera.position) + front * 3.0 - glm.vec3(0.0, 0.8, 0.0), sound=False, tint=tint)
         self.scene.render(camera, None)

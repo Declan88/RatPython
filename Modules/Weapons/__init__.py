@@ -1,4 +1,4 @@
-from .weapons_base import WeaponsBase, FireMode
+from .weapons_base import WeaponsBase, FireMode, AltFire
 from .usp import USP
 from .gouda_gun import GoudaGun
 # A weapon module not imported somewhere STATICALLY (a literal "from .x import Y", not
@@ -16,9 +16,10 @@ from .gouda_gun import GoudaGun
 # same module - that just finds this one already loaded.
 from .pencil import Pencil
 from .corroder import Corroder      # static import: same Nuitka reason as Pencil above
+from .farm_sweeper import FarmSweeper   # (same)
 
 from .inventory import Inventory
 from .registry import create_weapon, get_weapon_class, weapon_ids
 
-__all__ = ["WeaponsBase", "FireMode", "USP", "GoudaGun", "Pencil", "Corroder", "Inventory",
+__all__ = ["WeaponsBase", "FireMode", "AltFire", "USP", "GoudaGun", "Pencil", "Corroder", "FarmSweeper", "Inventory",
            "create_weapon", "get_weapon_class", "weapon_ids"]

@@ -22,7 +22,7 @@ import glm
 
 from Modules.Graphics import pose_batch
 from Modules.Player.rat_colors import RAT_TINT_MASK_PATH
-from Modules.Weapons.weapons_base import _load_state_clip, _parse_clip_spec
+from Modules.Weapons.weapons_base import WeaponsBase, _load_state_clip, _parse_clip_spec
 
 
 # The rigs are authored around a reference camera at the model origin (0, 0, 0)
@@ -44,27 +44,14 @@ _SCALE = 1.0
 # that same pass's shared 0.012 to a 0.03 shared value after a request for more intensity,
 # and now split into separate yaw/pitch gains (and clamps) at a further request for pitch
 # (looking up/down) to read more intense than yaw (side to side) - pitch at 1.8x yaw's own
-# values, both still well under the original "too fast" pass's numbers.
-_SWAY_GAIN_YAW = 0.03     # degrees of lag added per degree of YAW turned this frame
-_SWAY_GAIN_PITCH = 0.054  # same, for PITCH - 1.8x yaw's own gain, the actual "more intense" ask
-_SWAY_DECAY = 3.0         # how fast lag settles back toward zero, per second (shared - this
-                          # governs SPEED, not amount, no reason for the two axes to differ)
-_SWAY_MAX_YAW_DEG = 4.0   # clamp - keeps a fast flick-turn from swinging the gun too far
-_SWAY_MAX_PITCH_DEG = 7.0  # same, for pitch - raised to match its own bigger gain above
+# values, both still well under the original "too fast" pass's numbers. The numbers (gain,
+# clamp, decay and pivot) are each weapon's own - WeaponsBase.viewmodel_sway_* - with the
+# base class holding these tuned defaults.
 # Below this (degrees), skip building/multiplying the sway rotation matrices at all this
 # frame - the overwhelmingly common case (mouse not moving, or lag already fully settled)
 # costs nothing beyond the two-float decay update below, not two glm.rotate calls + two 4x4
 # multiplies on top of the transform this function was already building regardless.
 _SWAY_EPSILON_DEG = 1e-3
-# The rotation's own pivot, in camera space (same convention as _OFFSET - +Y up, -Z forward).
-# Literally rotating around camera-space (0,0,0) - the eye itself, since the rig is authored
-# with the camera AT the model origin (see _OFFSET's own comment) - swings the WHOLE gun
-# through a wide arc from a point well behind/above where it actually sits, which read as
-# pivoting from the wrong place entirely. Real weapon sway pivots from roughly where the gun
-# itself is held, not the eye socket - this nudges the rotation's own pivot forward and
-# slightly down to approximate that, via a translate/rotate/translate-back sandwich (see
-# update()) instead of rotating around the raw origin.
-_SWAY_PIVOT = glm.vec3(0.0, -0.08, -0.35)
 
 
 def _unique_parts(parts):
@@ -295,6 +282,22 @@ class ViewModel:
             return None
         return self._one_shot["anim_time"]
 
+    def current_animation(self):
+        """(state, clip name, seconds in, clip length) of what the first-person model is playing right now - the
+        one-shot if one is going, otherwise the arms' looping clip (time wrapped into one loop) - or None with
+        nothing shown. For debugging animation timing (app.py's T key)."""
+        obj = self._one_shot if self._one_shot is not None else self.arms
+        if obj is None or not obj.get("animation"):
+            return None
+        clip = obj["skeleton"].animations.get(obj["animation"])
+        if clip is None:
+            return None
+        length = clip.effective_duration
+        time = obj["anim_time"]
+        if self._one_shot is None and length > 0.0:
+            time %= length
+        return self._one_shot_state or "idle", obj["animation"], time, length
+
     def _one_shot_finished(self):
         obj = self._one_shot
         if obj is None:
@@ -327,12 +330,15 @@ class ViewModel:
         # (right turn swayed the gun right instead of lagging left behind it) at the original
         # sign; flipped once confirmed, rather than re-deriving the whole pivot/rotation
         # chain for what was really just this one axis's convention being backwards.
-        self._sway_yaw = max(-_SWAY_MAX_YAW_DEG, min(_SWAY_MAX_YAW_DEG, self._sway_yaw + dyaw * _SWAY_GAIN_YAW))
-        self._sway_pitch = max(-_SWAY_MAX_PITCH_DEG, min(_SWAY_MAX_PITCH_DEG, self._sway_pitch - dpitch * _SWAY_GAIN_PITCH))
+        weapon = self._weapon if self._weapon is not None else WeaponsBase
+        gain_yaw, gain_pitch = weapon.viewmodel_sway_gain
+        max_yaw, max_pitch = weapon.viewmodel_sway_max
+        self._sway_yaw = max(-max_yaw, min(max_yaw, self._sway_yaw + dyaw * gain_yaw))
+        self._sway_pitch = max(-max_pitch, min(max_pitch, self._sway_pitch - dpitch * gain_pitch))
         # A plain per-frame multiplicative decay (not a real exp()) - cheap, and at any
         # sane frame rate indistinguishable from one: settles from full clamp to
-        # imperceptible in well under half a second at the default _SWAY_DECAY.
-        decay = max(0.0, 1.0 - _SWAY_DECAY * dt)
+        # imperceptible in well under half a second at the default viewmodel_sway_decay.
+        decay = max(0.0, 1.0 - weapon.viewmodel_sway_decay * dt)
         self._sway_yaw *= decay
         self._sway_pitch *= decay
 
@@ -377,15 +383,17 @@ class ViewModel:
             local = glm.translate(glm.mat4(1.0), glm.vec3(*offset)) * local
         if abs(self._sway_yaw) > _SWAY_EPSILON_DEG or abs(self._sway_pitch) > _SWAY_EPSILON_DEG:
             # translate(+pivot) * rotate * translate(-pivot): the standard "rotate around an
-            # arbitrary point" sandwich - shifts _SWAY_PIVOT to the origin, applies the sway
-            # rotation THERE instead of at camera-space (0,0,0), then shifts back. Without
-            # this, rotating around the raw origin swings the whole gun through a wide arc
-            # from the eye - see _SWAY_PIVOT's own comment.
+            # arbitrary point" sandwich - shifts the weapon's viewmodel_sway_pivot to the
+            # origin, applies the sway rotation THERE instead of at camera-space (0,0,0), then
+            # shifts back. Without this, rotating around the raw origin (the eye - the rig is
+            # authored with the camera at the model origin) swings the whole gun through a
+            # wide arc instead of pivoting where it's held.
+            pivot = glm.vec3(*(self._weapon or WeaponsBase).viewmodel_sway_pivot)
             local = (
-                glm.translate(glm.mat4(1.0), _SWAY_PIVOT)
+                glm.translate(glm.mat4(1.0), pivot)
                 * glm.rotate(glm.mat4(1.0), glm.radians(self._sway_pitch), glm.vec3(1.0, 0.0, 0.0))
                 * glm.rotate(glm.mat4(1.0), glm.radians(self._sway_yaw), glm.vec3(0.0, 1.0, 0.0))
-                * glm.translate(glm.mat4(1.0), -_SWAY_PIVOT)
+                * glm.translate(glm.mat4(1.0), -pivot)
                 * local
             )
         view = camera.get_view_matrix()

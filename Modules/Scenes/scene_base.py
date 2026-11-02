@@ -474,6 +474,9 @@ class Scene:
         self._target_checked = False   # see present(): the first resolve into the window is checked once
         self._screen_override = None
         self._ssr_on = False   # enable_screen_space_reflections() was called
+        # Vertical FOV (degrees) the first-person model is drawn with, None = the camera's - set each frame from the
+        # weapon in hand (WeaponsBase.viewmodel_fov_y).
+        self.viewmodel_fov = None
         # Glow of "bloom_" meshes (Modules/Graphics/bloom.py), built on the first frame one is visible.
         self._bloom = None
         self.bloom_intensity = 1.0
@@ -1121,6 +1124,7 @@ class Scene:
         Scene.update, so anything computed there would trail it by a frame."""
         for att in self._attachments:
             parent, child = att["parent"], att["child"]
+            child["spawn_fx"] = parent.get("spawn_fx")   # a held gun materializes with its owner
             bones = parent.get("bone_matrices")
             if not bones:
                 continue
@@ -4165,8 +4169,10 @@ class Scene:
         squash = glm.mat4(1.0)
         squash[2][2] = _VIEWMODEL_DEPTH_SCALE
         squash[3][2] = _VIEWMODEL_DEPTH_SCALE - 1.0
-        # The camera's projection with a much closer near plane (see _VIEWMODEL_NEAR).
-        viewmodel_proj = glm.perspective(glm.radians(camera.fov), camera.aspect, _VIEWMODEL_NEAR, camera.far)
+        # The camera's projection with a much closer near plane (see _VIEWMODEL_NEAR), and the gun's own FOV if it
+        # was animated through a different one (self.viewmodel_fov - see WeaponsBase.viewmodel_fov).
+        fov = self.viewmodel_fov or camera.fov
+        viewmodel_proj = glm.perspective(glm.radians(fov), camera.aspect, _VIEWMODEL_NEAR, camera.far)
         view_proj = squash * viewmodel_proj * camera.get_view_matrix()
 
         prog = self.skeletal_program

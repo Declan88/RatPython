@@ -48,7 +48,8 @@ _POSE_DIR = "Assets/Models/Arms/New Folder/Pistol"
 # guns (the same rifle idle the player's locomotion uses).
 PISTOL_HOLD_POSE = "Assets/Animations/Poses/Pistol/pistolidle.glb"
 RIFLE_HOLD_POSE = "Assets/Animations/Poses/Rifle/rifleidle.glb"
-_SPINE4 = "ValveBiped.Bip01_Spine4"
+# A world model's cull box when its owner has none of its own: (half width, below, above) metres, a player's size.
+_WORLDMODEL_CULL_BOX = (1.4, 0.4, 2.6)
 
 
 def _first_clip_name(path, skin_index=0):
@@ -167,21 +168,70 @@ def _spread_direction(direction, spread_degrees):
     return glm.normalize(direction * math.cos(polar) + offset * math.sin(polar))
 
 
-class Shot:
-    """One trigger pull that went off (see WeaponsBase.fire). hit: the
-    PhysicsWorld.RayHit of the line trace along the aim, or None if it hit
-    nothing within range. victim: the owner tag of the hitbox it struck (a
-    remote player's steam_id), or None if it hit level geometry/nothing.
-    damage: what this shot does to a victim."""
-    __slots__ = ("hit", "victim", "damage", "direction", "spread", "headshot")
+class Pellet:
+    """One line trace of a shot: a single bullet, or one pellet of a shotgun's load. hit: the PhysicsWorld.RayHit,
+    or None if it hit nothing within range. victim: the owner tag of the hitbox it struck (a remote player's
+    steam_id), or None if it hit level geometry/nothing."""
+    __slots__ = ("hit", "victim", "direction", "headshot", "damage", "stats")
 
-    def __init__(self, hit, damage, direction=None, spread=0.0, headshot=False):
+    def __init__(self, hit, direction, headshot=False, damage=0.0, stats=None):
         self.hit = hit
         self.victim = hit.owner if hit is not None else None
-        self.headshot = headshot     # the trace also passed through the victim's head hitbox
-        self.damage = damage
-        self.direction = direction   # the (spread-adjusted) direction the trace actually went
-        self.spread = spread         # the cone half-angle (degrees) it was drawn from
+        self.direction = direction   # the direction this trace actually went
+        self.headshot = headshot     # it also passed through the victim's head hitbox
+        self.damage = damage         # what it does to a victim (its share of its load, headshot included)
+        self.stats = stats           # the FireStats of the projectile it belongs to - its looks and explosion
+
+
+class Shot:
+    """One trigger pull that went off (see WeaponsBase.fire): its pellets - one per projectile for an ordinary gun,
+    a shotgun's whole load otherwise - in the order they were traced. alt: fired with the weapon's alt_fire.
+    hit/victim/direction/headshot/damage are the FIRST pellet's - all there is for a single-bullet gun;
+    damage_by_victim() is what the whole shot did to each player."""
+    __slots__ = ("pellets", "spread", "alt", "stats")
+
+    def __init__(self, pellets, spread=0.0, alt=False, stats=None):
+        self.pellets = pellets
+        self.spread = spread         # the cone half-angle (degrees) the aim was drawn from
+        self.alt = alt
+        self.stats = stats           # the FireStats of the mode it was fired in - its sound, flash and recoil
+
+    @property
+    def hit(self):
+        return self.pellets[0].hit
+
+    @property
+    def victim(self):
+        return self.pellets[0].victim
+
+    @property
+    def direction(self):
+        return self.pellets[0].direction
+
+    @property
+    def headshot(self):
+        return self.pellets[0].headshot
+
+    @property
+    def damage(self):
+        return self.pellets[0].damage
+
+    def damage_by_victim(self):
+        """{victim: (total damage, any pellet a headshot, where the first pellet struck them)} for every player
+        this shot's pellets hit. Totals are rounded off to a millionth, so a full load of a 100-damage shotgun is
+        exactly 100, not the 99.99999... nine float shares would add up to."""
+        tally = {}
+        for pellet in self.pellets:
+            if pellet.victim is None:
+                continue
+            entry = tally.get(pellet.victim)
+            if entry is None:
+                tally[pellet.victim] = [[pellet.damage], pellet.headshot, pellet.hit.position]
+            else:
+                entry[0].append(pellet.damage)
+                entry[1] = entry[1] or pellet.headshot
+        return {victim: (round(math.fsum(amounts), 6), headshot, position)
+                for victim, (amounts, headshot, position) in tally.items()}
 
 
 class FireMode:
@@ -192,6 +242,51 @@ class FireMode:
     SEMI = "semi"
     AUTO = "auto"
     CUSTOM = "custom"
+
+
+class AltFire:
+    """One way of firing a weapon - its alt_fire (right mouse / left trigger; a weapon with one uses that button for
+    it instead of a scope), or, with every argument left at its default, the ordinary primary fire.
+
+    stats: {weapon attribute: value} replacing the weapon's own for shots fired this way - anything a shot reads:
+        damage, pellets, pellet_spread, spread_*, recoil_*, fire_interval, fire_mode (SEMI/AUTO for this button),
+        fire_sound/fire_volume, explosion, tracer_style, tracer_spiral, impact_*, muzzle_*, damage_class...
+    projectiles: what one shot fires, as a list with one {attribute: value} dict per projectile - each a single
+        trace or a load of `pellets` - with its own overrides on top of stats: [{}, {}] fires two of the weapon's
+        ordinary loads at once, [{}, {"explosion": ...}] a bullet plus an exploding one. None = one projectile.
+    ammo_per_shot: rounds one shot uses.
+    fallback_to_primary: what a shot does with fewer than ammo_per_shot rounds left - an ordinary primary shot
+        (True), or nothing (False).
+    animation: the state played for the shot (viewmodel, world model and player pose) - "shoot" when the weapon has
+        no clip for it. A state of its own belongs in viewmodel_one_shot_states, like "shoot"."""
+
+    def __init__(self, stats=None, projectiles=None, ammo_per_shot=1, fallback_to_primary=True, animation="shoot"):
+        self.stats = dict(stats or {})
+        self.projectiles = [dict(p) for p in projectiles] if projectiles else [{}]
+        self.ammo_per_shot = max(1, int(ammo_per_shot))
+        self.fallback_to_primary = fallback_to_primary
+        self.animation = animation
+
+
+_PRIMARY_FIRE = AltFire()
+
+
+class FireStats:
+    """A weapon as one fire mode (or one projectile of it) sees it: an override's value where AltFire sets one, the
+    weapon's own otherwise. Read-only - what shots, their effects and Recoil.kick read in place of the weapon.
+    `weapon` is the weapon itself. One per (mode, projectile), cached on the weapon (WeaponsBase.fire_stats), so it
+    is a stable identity too (an impact sound slot is keyed by it)."""
+    __slots__ = ("weapon", "_overrides")
+
+    def __init__(self, weapon, overrides):
+        self.weapon = weapon
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
+        return getattr(self.weapon, name)
 
 
 class WeaponsBase:
@@ -211,6 +306,9 @@ class WeaponsBase:
     # ---- gunfire sound -------------------------------------------------
     fire_sound = "Assets/Audio/Guns/USP/usp_unsil-1.wav"
     fire_volume = 1.0
+    # Louder than fire_volume can go (it tops out at 1.0): the shot's samples amplified by this, soft-clipped so
+    # peaks round off instead of crackling (see SoundManager.add_sound's gain). 1.0 = the file as recorded.
+    fire_gain = 1.0
     # Realistic-for-a-game falloff (SoundManager's "inverse" curve): full
     # volume within a few metres, then about -4 dB per doubling of distance,
     # fading to silence over the last quarter of max_distance - and shots that
@@ -218,8 +316,14 @@ class WeaponsBase:
     # distant gunfire rather than just a quieter close one.
     fire_min_distance = 5.0
     fire_max_distance = 160.0
+    # The controller rumble a shot gives: (low motor, high motor, seconds), like bindings.RUMBLE_*. None = the
+    # default (bindings.RUMBLE_FIRE) - a heavy gun can thump harder.
+    fire_rumble = None
     fire_interval = 0.0        # minimum seconds between shots (0 = as fast as the owner can trigger it)
     fire_mode = FireMode.SEMI  # see FireMode/shots_this_frame - was a bare `automatic` bool before
+    # The alternate fire (right mouse / left trigger): an AltFire - its own stats and/or several projectiles per
+    # shot. A weapon with one fires it on that button instead of scoping. None = no alt fire.
+    alt_fire = None
 
     # ---- ammo / reload --------------------------------------------------
     # 0 = no ammo tracking at all (unlimited, never needs a reload - the
@@ -280,6 +384,24 @@ class WeaponsBase:
     # noticeable zoom" for whichever future weapon doesn't bother overriding
     # it - see pencil.py's own value for an actual sniper-grade zoom.
     scope_fov = 20.0
+    # Draws the first-person model exactly as the Blender camera it was animated through saw it: that camera's
+    # HORIZONTAL field of view (degrees - sensor fit Auto on a landscape render is horizontal; a 50 mm lens on
+    # Blender's 36 mm sensor is 2 * atan(18 / 50) = 39.5978), with viewmodel_offset putting the model where it
+    # sat in front of that camera. None = drawn with the game camera's own FOV, like every weapon before this
+    # existed. The world keeps the game's FOV either way. See viewmodel_fov_y.
+    viewmodel_fov = None
+
+    def viewmodel_fov_y(self, aspect, camera_fov_y, base_fov_y):
+        """The vertical FOV (degrees) to draw the first-person model with for a screen of `aspect` (width /
+        height): viewmodel_fov held horizontally, as Blender does - and narrowed with the camera while it zooms
+        (camera_fov_y below its normal base_fov_y), by the same tangent ratio. camera_fov_y when viewmodel_fov is
+        None."""
+        if self.viewmodel_fov is None:
+            return camera_fov_y
+        tan_half = math.tan(math.radians(self.viewmodel_fov) / 2.0) / aspect
+        tan_half *= math.tan(math.radians(camera_fov_y) / 2.0) / math.tan(math.radians(base_fov_y) / 2.0)
+        return math.degrees(2.0 * math.atan(tan_half))
+
     # Multiplies spread_degrees()'s own result once FULLY scoped, eased in by the exact
     # same smoothstepped fraction as everything else about this ADS transition (see
     # spread_degrees' own use of this) - 1.0 (the base default) means scoping gives no
@@ -440,10 +562,11 @@ class WeaponsBase:
     explosion = None
 
     # An effect (a system in a loaded .pcf) played where this weapon's shots land,
-    # instead of the usual bullet impact: its name, an ((r, g, b), (r, g, b)) 0-255
-    # colour range replacing the file's own (None keeps them), and a size scale.
+    # instead of the usual bullet impact: its name, and an ((r, g, b), (r, g, b)) 0-255
+    # colour range replacing the file's own (None keeps them).
     impact_particle = None
     impact_color = None
+    # Scales this weapon's impacts - its own impact_particle, or the usual surface bullet impact (1.0 = as authored).
     impact_size = 1.0
 
     # The bullet tracer look (a name in Modules/Graphics/tracers.py's STYLES).
@@ -476,6 +599,18 @@ class WeaponsBase:
     damage = 10.0             # health taken from a player each shot hits
     headshot_multiplier = 2.0  # ...times this when the shot hits the head
     max_range = 500.0         # metres a shot's line trace reaches
+    # Shotguns: each trigger pull fires `pellets` traces, scattered within a cone of half-angle pellet_spread degrees
+    # around the (spread-deflected) aim, and `damage` is split evenly between them - so damage is what the whole
+    # load does when every pellet lands. 1 = an ordinary single bullet.
+    pellets = 1
+    pellet_spread = 0.0
+    # Knockback on the shooter: m/s of velocity each shot adds straight back along the aim (so firing at the floor
+    # launches you up, and stacks with a jump - a shotgun jump). 0 = none.
+    self_knockback = 0.0
+    # A kill by this shot throws the victim's gibs away from the shooter at this many m/s (like an explosion's push -
+    # see Explosion), tipped upward by gib_push_lift so they arc rather than skid. 0 = they just fall where they die.
+    gib_push = 0.0
+    gib_push_lift = 0.35
 
     # ---- models --------------------------------------------------------
     # First person: viewmodel_model holds the arms, each with its own rig
@@ -526,6 +661,10 @@ class WeaponsBase:
     worldmodel_alpha_mode_overrides = {}
     worldmodel_node_alpha_mode_overrides = {}
     worldmodel_roughness_overrides = {}
+    # Metres from the camera past which the world model isn't drawn (a pistol that far away is a couple of pixels -
+    # a bigger gun can stay longer) and past which it casts no shadow.
+    worldmodel_max_draw_distance = 30.0
+    worldmodel_max_shadow_distance = 8.0
     # The bones bullets (tracers) come out of. The world model has a real muzzle
     # bone; the first-person gun doesn't (Source keeps that as an attachment, not
     # a bone), so it uses the bone at the front of the barrel instead.
@@ -552,6 +691,15 @@ class WeaponsBase:
     # and the scope zoom (see ViewModel.update), so muzzle_position()/scope_point() follow it
     # and a scoped-in view still lands exactly on the eye. (0, 0, 0) = no shift.
     viewmodel_offset = (0.0, 0.0, 0.0)
+    # Mouse-look sway - the viewmodel lagging behind a camera turn, then settling back (see ViewModel._update_sway).
+    # Pivot: where it rotates around, (x, y, z) in camera space, metres, same axes as viewmodel_offset - roughly
+    # where the gun is held (rotating around the eye swings the whole gun through a wide arc). Gain: degrees of lag
+    # per degree turned in a frame, (yaw, pitch). Max: the lag's clamp, (yaw, pitch) degrees. Decay: how fast it
+    # settles, per second. Pitch reads stronger than yaw by design (1.8x).
+    viewmodel_sway_pivot = (0.0, -0.08, -0.35)
+    viewmodel_sway_gain = (0.03, 0.054)
+    viewmodel_sway_max = (4.0, 7.0)
+    viewmodel_sway_decay = 3.0
 
     # ---- animations (state -> .glb, or None for the model's own clip) ----
     # One set for both parts: the arms and the gun share an armature (the gun
@@ -589,12 +737,13 @@ class WeaponsBase:
     # PlayerModel.set_upper_rotation_offset).
     player_animations = {"idle": PISTOL_HOLD_POSE}
     player_upper_rotation_degrees = {}
-    # While the owner is MOVING the pose reads as looking too far to one side:
+    # While the owner is MOVING the pose can read as looking too far to one side:
     # an override pose is absolute, so it doesn't follow the lean/twist the
-    # running lower body adds. This is an extra yaw on Spine4 (component space,
-    # degrees; negative = turn right) blended in while horizontal speed is
-    # above player_moving_speed (m/s) - see set_moving.
-    player_moving_yaw_degrees = 0.0
+    # running lower body adds. This is an extra rotation per joint, added onto
+    # player_upper_rotation_degrees ({joint name: (x, y, z) degrees}, component
+    # space; e.g. {"ValveBiped.Bip01_Spine4": (0, -10, 0)} turns the chest right)
+    # while horizontal speed is above player_moving_speed (m/s) - see set_moving.
+    player_moving_rotation_degrees = {}
     player_moving_speed = 1.0
 
     def __init__(self):
@@ -614,7 +763,7 @@ class WeaponsBase:
         self._viewmodel = None
         self._clips = {}   # (part, state) -> clip name actually loaded
         self._moving = False
-        # Whether the last set_moving() call skipped applying the moving-yaw spine
+        # Whether the last set_moving() call skipped applying the moving
         # correction because an emote was playing - see set_moving's own comment.
         self._moving_offset_suppressed_by_emote = False
         self._scope_blend = 0.0   # 0 = hip-fire, 1 = fully scoped - see update_scope
@@ -624,11 +773,14 @@ class WeaponsBase:
         # consult it, and start_reload always refuses (nothing to refill).
         self.ammo = self.magazine_size
         self._reloading = False
+        self._reload_queued = False   # a reload asked for mid-shot, started when the shot finishes (see start_reload)
         # Set by fire() right after a shot, waiting for "shoot" to finish before "rack"
         # itself can start (see racking's own docstring) - cleared either once "rack"
         # actually starts (update()) or on a weapon switch away mid-wait (deactivate()).
         self._rack_pending = False
         self._handling_last = (None, 0.0)   # (state, animation time) at the last handling-sound check
+        self._shot_state = "shoot"   # the animation state the last shot played (see AltFire.animation)
+        self._fire_stats = {}        # (alt, projectile index or None) -> FireStats, see fire_stats
 
     # ---- firing --------------------------------------------------------
 
@@ -636,19 +788,56 @@ class WeaponsBase:
     def reloading(self):
         return self._reloading
 
-    def can_fire(self, now=None):
+    def _fire_action(self, alt):
+        return self.alt_fire if alt and self.alt_fire is not None else _PRIMARY_FIRE
+
+    def fire_stats(self, alt=False, projectile=None):
+        """This weapon's stats as a shot fired in that mode reads them (see FireStats): the mode's own overrides,
+        plus - with `projectile` an index into its projectiles - that projectile's. alt without an alt_fire is the
+        primary fire."""
+        alt = bool(alt) and self.alt_fire is not None
+        key = (alt, projectile)
+        stats = self._fire_stats.get(key)
+        if stats is None:
+            action = self._fire_action(alt)
+            overrides = dict(action.stats)
+            if projectile is not None:
+                overrides.update(action.projectiles[projectile])
+            stats = self._fire_stats[key] = FireStats(self, overrides)
+        return stats
+
+    def projectile_stats(self, alt=False):
+        """[(FireStats, pellet count)] for each projectile one shot in that mode fires, in the order fire() traces
+        them - which is also the order a shot's pellet end points travel over the network in, so another player's
+        copy of this weapon can tell which pellet belongs to which projectile."""
+        stats = [self.fire_stats(alt, i) for i in range(len(self._fire_action(alt).projectiles))]
+        return [(s, max(1, int(s.pellets))) for s in stats]
+
+    def _firing_mode(self, alt):
+        """Which mode a shot asked for as `alt` actually fires in: alt, the primary (an alt_fire short of rounds
+        that falls back to it, or no alt_fire at all), or None - no shot."""
+        if not alt or self.alt_fire is None:
+            return False
+        if self.magazine_size > 0 and self.ammo < self.alt_fire.ammo_per_shot:
+            return False if self.alt_fire.fallback_to_primary else None
+        return True
+
+    def can_fire(self, now=None, alt=False):
         if self._reloading or self.drawing or self.racking:
             return False
         if self.magazine_size > 0 and self.ammo <= 0:
+            return False
+        alt = self._firing_mode(alt)
+        if alt is None:
             return False
         now = time.perf_counter() if now is None else now
         # A tiny epsilon, not a bare >= - two calls exactly fire_interval
         # apart can otherwise miss a shot to plain float error (e.g.
         # 0.4 - 0.3 == 0.09999999999999998 in IEEE 754, just under 0.1)
         # rather than any real timing issue.
-        return now - self._last_fire >= self.fire_interval - 1e-9
+        return now - self._last_fire >= self.fire_stats(alt).fire_interval - 1e-9
 
-    def shots_this_frame(self, click_edges, trigger_held):
+    def shots_this_frame(self, click_edges, trigger_held, alt=False):
         """How many times to call fire() this frame - the fire_mode-driven
         replacement for a caller (app.py) directly branching on a bare
         `automatic` bool. click_edges: real trigger pulls since last frame
@@ -668,10 +857,16 @@ class WeaponsBase:
         FireMode.CUSTOM: this base implementation fires nothing - the whole
         point of CUSTOM is a subclass overrides this method itself with
         bespoke logic (burst fire, a charge-up weapon, ...) instead of
-        picking between the two built-in shapes above."""
-        if self.fire_mode == FireMode.AUTO:
+        picking between the two built-in shapes above.
+
+        alt: for the alt-fire button - the alt_fire's own fire_mode (its stats can set one), and nothing at all
+        for a weapon without an alt_fire."""
+        if alt and self.alt_fire is None:
+            return 0
+        fire_mode = self.fire_stats(alt).fire_mode
+        if fire_mode == FireMode.AUTO:
             return 1 if trigger_held else 0
-        if self.fire_mode == FireMode.SEMI:
+        if fire_mode == FireMode.SEMI:
             return click_edges
         return 0
 
@@ -696,7 +891,7 @@ class WeaponsBase:
             spread *= 1.0 + (self.scope_accuracy_multiplier - 1.0) * eased
         return spread
 
-    def fire(self, scene, position, direction=None, now=None, follow=None):
+    def fire(self, scene, position, direction=None, now=None, follow=None, alt=False):
         """Pulls the trigger: plays the gunshot at `position` (world space)
         with this weapon's distance falloff (`follow`, a callable returning the
         owner's current position, keeps it attached to the owner while it
@@ -707,17 +902,25 @@ class WeaponsBase:
         the next shot. Returns a Shot describing the trace (Shot.victim is a
         struck player's id), or None - doing nothing - if it fired less than
         fire_interval ago. What a hit DOES (health, the network message) is the
-        caller's to apply."""
+        caller's to apply.
+
+        alt: fire the alt_fire instead (see AltFire) - its stats, each of its projectiles traced along the same
+        spread-deflected aim, its ammo_per_shot. Short of rounds, it falls back to a primary shot if the AltFire
+        says so (Shot.alt then False)."""
         now = time.perf_counter() if now is None else now
-        if not self.can_fire(now):
+        if not self.can_fire(now, alt):
             return None
+        alt = self._firing_mode(alt)
+        action = self._fire_action(alt)
+        stats = self.fire_stats(alt)
         spread = self.spread_degrees(now)
         self._last_fire = now
         if self.magazine_size > 0:
-            self.ammo -= 1
-        self._spread_at_last_shot = min(self.spread_max, spread + self.spread_per_shot)
-        self.play_fire_sound(scene, position, follow)
-        self.play("shoot")
+            self.ammo -= action.ammo_per_shot
+        self._spread_at_last_shot = min(stats.spread_max, spread + stats.spread_per_shot)
+        self.play_fire_sound(scene, position, follow, alt=alt)
+        self._shot_state = action.animation if action.animation in self.viewmodel_animations else "shoot"
+        self.play(self._shot_state)
         # Schedules a "rack" (bolt-cycle) animation to start once "shoot" itself
         # finishes (see update()) - NOT right now, since playing it immediately would
         # cut "shoot" off entirely (one active one-shot slot per viewmodel). ONLY for a
@@ -736,23 +939,36 @@ class WeaponsBase:
         # extra step before the reload even starts. magazine_size <= 0 (no ammo
         # tracking at all) racks after every shot - there's no "empty" to skip it for.
         self._rack_pending = "rack" in self.viewmodel_animations and (self.magazine_size <= 0 or self.ammo > 0)
-        hit = None
-        aim = None
-        if direction is not None:
-            origin = glm.vec3(position)
-            aim = _spread_direction(direction, spread)
-            hit = scene.physics.raycast(origin, origin + aim * self.max_range)
-        # After the trace: the shot goes where the camera was pointing when the
+        pellets = []
+        aim = _spread_direction(direction, spread) if direction is not None else None
+        for projectile, count in self.projectile_stats(alt):
+            # Each projectile's load shares its damage evenly between its pellets.
+            share = projectile.damage / count
+            if aim is None:
+                pellets.append(Pellet(None, None, damage=share, stats=projectile))
+                continue
+            for _ in range(count):
+                pellet = _spread_direction(aim, projectile.pellet_spread) if count > 1 else aim
+                pellets.append(self._trace(scene, glm.vec3(position), pellet, projectile, share))
+        # After the traces: the shot goes where the camera was pointing when the
         # trigger was pulled; the kick moves it for the NEXT one.
-        self.recoil.kick(self)
-        # A shot that struck a player is a headshot if the same trace also passes through THAT
-        # player's head box (a second trace, against head boxes only - see CollisionGroup.HEAD).
+        self.recoil.kick(stats)
+        return Shot(pellets, spread, alt, stats)
+
+    @staticmethod
+    def _trace(scene, origin, aim, stats, damage):
+        """One bullet/pellet's line trace along `aim`, up to stats.max_range. One that struck a player is a headshot
+        if the same trace also passes through THAT player's head box (a second trace, against head boxes only - see
+        CollisionGroup.HEAD), doing stats.headshot_multiplier times `damage`."""
+        end = origin + aim * stats.max_range
+        hit = scene.physics.raycast(origin, end)
         headshot = False
         if hit is not None and hit.owner is not None:
-            head = scene.physics.raycast(origin, origin + aim * self.max_range, CollisionGroup.HEAD)
+            head = scene.physics.raycast(origin, end, CollisionGroup.HEAD)
             headshot = head is not None and head.owner == hit.owner
-        damage = self.damage * self.headshot_multiplier if headshot else self.damage
-        return Shot(hit, damage, aim, spread, headshot)
+        if headshot:
+            damage *= stats.headshot_multiplier
+        return Pellet(hit, aim, headshot, damage, stats)
 
     # ---- ammo / reload --------------------------------------------------
 
@@ -767,6 +983,11 @@ class WeaponsBase:
         reloading, or still mid-draw."""
         if self.magazine_size <= 0 or self._reloading or self.drawing or self.ammo >= self.magazine_size:
             return False
+        if self._one_shot_still_playing(self._shot_state):
+            # Let the shot's animation finish first: update() starts the reload once it has.
+            self._reload_queued = True
+            return False
+        self._reload_queued = False
         self._reloading = True
         # Cancels any rack still owed from a shot BEFORE this reload (see fire()'s own
         # _rack_pending comment) - without this, a manual reload pressed while a rack was
@@ -855,11 +1076,11 @@ class WeaponsBase:
                 self.ammo = self.magazine_size
                 self.play("idle")
             return
-        if self._rack_pending and not self._one_shot_still_playing("shoot") and not self.drawing:
+        if self._rack_pending and not self._one_shot_still_playing(self._shot_state) and not self.drawing:
             self._rack_pending = False
             self.play("rack")
-        if self.magazine_size > 0 and self.ammo <= 0:
-            self.start_reload(now)
+        if self._reload_queued or (self.magazine_size > 0 and self.ammo <= 0):
+            self.start_reload(now)      # waits (stays queued) while a shot's animation is still playing
 
     def spawn_tracer_spiral(self, particles, start, end, camera_pos=None):
         """Spawns this weapon's own tracer_spiral (see Modules/Weapons/tracer_spiral.py) along
@@ -896,20 +1117,22 @@ class WeaponsBase:
             return scene.joint_world_position(self.worldmodel_obj, self.worldmodel_muzzle_bone)
         return None
 
-    def play_fire_sound(self, scene, position, follow=None):
+    def play_fire_sound(self, scene, position, follow=None, alt=False):
         """The gunshot alone, with no rate limit - for replaying a shot some
-        other player fired (their own weapon already rate-limited it)."""
-        if not self.fire_sound:
+        other player fired (their own weapon already rate-limited it). alt:
+        the alt fire's sound (its stats can override fire_sound and the rest)."""
+        stats = self.fire_stats(alt)
+        if not stats.fire_sound:
             return None
         # Every shot plays on the SAME channel as the last: a shot fired before
         # the previous one finished cuts it off instead of asking the mixer for
         # another free channel, so a fast trigger can't run it out of channels
         # and lose the sound.
         emitter = scene.sound_manager.add_sound(
-            self.fire_sound, glm.vec3(position), volume=self.fire_volume,
-            min_distance=self.fire_min_distance, max_distance=self.fire_max_distance,
+            stats.fire_sound, glm.vec3(position), volume=stats.fire_volume,
+            min_distance=stats.fire_min_distance, max_distance=stats.fire_max_distance,
             loop=False, follow=follow, channel=self._fire_channel,
-            falloff="inverse", muffle=True,
+            falloff="inverse", muffle=True, gain=stats.fire_gain,
         )
         self._fire_channel = emitter["channel"]
         return emitter
@@ -1001,7 +1224,9 @@ class WeaponsBase:
         rack, the scope and the spread and fire timing built up by the last life. Doesn't touch the animations -
         play("idle") stops a playing one-shot, set_active(True) draws the gun afresh."""
         self._reloading = False
+        self._reload_queued = False
         self._rack_pending = False
+        self._shot_state = "shoot"
         self._scope_blend = 0.0
         self._was_aiming = False
         self._handling_last = (None, 0.0)
@@ -1038,6 +1263,7 @@ class WeaponsBase:
         idle) stays False, exactly like today."""
         if self._reloading:
             self._reloading = False
+        self._reload_queued = False
         self._rack_pending = self.racking
         # Snaps back to hip-fire immediately rather than easing out - the NEXT weapon's
         # own view takes over this same frame, so there's nothing left to visibly ease
@@ -1087,9 +1313,10 @@ class WeaponsBase:
         attached = []
         for obj in objs:
             obj["specular_strength"] = 0
-            obj["frustum_cull"] = (1.4, 0.4, 2.6)  # same as its owner's (its position is the owner's)
-            obj["max_draw_distance"] = 30.0        # a pistol that far away is a couple of pixels
-            obj["max_shadow_distance"] = 8.0
+            # Culled with its owner's box (its position is the owner's).
+            obj["frustum_cull"] = player_obj.get("frustum_cull") or _WORLDMODEL_CULL_BOX
+            obj["max_draw_distance"] = self.worldmodel_max_draw_distance
+            obj["max_shadow_distance"] = self.worldmodel_max_shadow_distance
             if scene.attach_skeletal(obj, player_obj, self.worldmodel_bone, local) is None:
                 scene.remove_skeletal(obj)
                 continue
@@ -1117,14 +1344,15 @@ class WeaponsBase:
 
     def _upper_offsets(self):
         offsets = dict(self.player_upper_rotation_degrees)
-        if self._moving and self.player_moving_yaw_degrees:
-            x, y, z = offsets.get(_SPINE4, (0.0, 0.0, 0.0))
-            offsets[_SPINE4] = (x, y + self.player_moving_yaw_degrees, z)
+        if self._moving:
+            for joint, extra in self.player_moving_rotation_degrees.items():
+                base = offsets.get(joint, (0.0, 0.0, 0.0))
+                offsets[joint] = tuple(a + b for a, b in zip(base, extra))
         return offsets
 
     def set_moving(self, horizontal_speed):
         """Call each frame with the owner's horizontal speed (m/s): applies or
-        releases the moving-yaw correction (player_moving_yaw_degrees) on the
+        releases the moving correction (player_moving_rotation_degrees) on the
         pose set by equip_player, crossfading via the usual offset change.
 
         Ignored entirely while the player model is mid-emote (see PlayerModel.
@@ -1195,3 +1423,8 @@ class WeaponsBase:
         self._hold_player_pose(self._clips.get(("player", state)))
         if self._viewmodel is not None:
             self._viewmodel.play(state)
+
+
+# A shot's stats spawn its own tracer spiral (a mode or projectile can set tracer_spiral): the weapon's method only
+# reads tracer_spiral, which a FireStats resolves with its overrides.
+FireStats.spawn_tracer_spiral = WeaponsBase.spawn_tracer_spiral

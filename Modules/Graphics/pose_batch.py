@@ -451,6 +451,21 @@ def evaluate(requests):
         if depth in rotate:
             rs, js, ms = rotate[depth]
             W[rs, js, :3, :3] = ms @ W[rs, js, :3, :3]
+    if rotate:
+        # The pose handed back for snapshots (LazyPose -> Skeleton.last_pose) must be what is on screen, as
+        # Skeleton._world_matrices' is: a rotated joint's local rotation WITH its component-space turn in it. Left
+        # as sampled, every crossfade from a snapshot (a jump, a landing, a weapon switch) started from the body
+        # without its look bend or weapon-pose correction and visibly snapped back toward it. Recovered from the
+        # final world matrices: local = inverse(parent world) * world, less the joint's own scale.
+        Q = Q.copy()
+        for depth, (rs, js, _) in rotate.items():
+            if depth == 0:
+                parent = np.stack([tables.external[j] for j in js])[:, :3, :3]
+            else:
+                parent = W[rs, tables.parent_index[js], :3, :3]
+            local = np.linalg.inv(parent) @ W[rs, js, :3, :3]
+            local = local / S[rs, js][:, None, :]
+            Q[rs, js] = _m2q(local)
     B = (W @ tables.inverse_bind[None]).astype("f4")           # (R, J, 4, 4)
 
     from Modules.Graphics.skeletal_shader import MAX_BONES     # (imported late: avoids a cycle)

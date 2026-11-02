@@ -123,6 +123,7 @@ class NetworkManager:
         self.on_footstep = None  # callback(material, position, volume, steam_id) to play another player's footstep
         self.on_dissolve_spark = None  # callback(position) - a Zap-dissolving remote player's periodic spark/glow burst
         self.on_dissolve_arc = None    # callback(position) - a Zap-dissolving remote player's periodic tesla-arc burst
+        self.on_respawn = None         # callback(feet position) - a remote player reappeared at a new spawn
         self.on_damage = None   # callback(amount, attacker_steam_id, weapon_name, headshot, push, damage_class, origin) when someone shoots us - origin: (x,y,z) or None, see send_damage's own docstring
         # callback(killer_steam_id, victim_steam_id, weapon_name, headshot) for
         # EVERY kill in the match this client learns about (see
@@ -781,15 +782,23 @@ class NetworkManager:
     # TRANSFORM SYNC
     # =============================================================
 
-    def notify_shot(self, end_point=None):
+    # How long a shot's end points keep riding in the movement packets after it was fired, seconds - enough packets
+    # that losing one or two can't drop its tracers, without a shotgun's pellets bloating every packet from then on.
+    SHOT_ENDS_SECONDS = 0.5
+
+    def notify_shot(self, end_points=None, alt=False):
         """Call when the local player fires. Sent as a running counter in the
         movement packets (so a lost packet can't drop a shot) - other players
-        play the gunshot at our position when it goes up. end_point: where the
-        bullet ended (its hit point, or the end of its range) - the last few
-        travel in the packets too, so other players can draw the tracer."""
+        play the gunshot at our position when it goes up. end_points: where each
+        bullet/pellet of the shot ended (its hit point, or the end of its range) -
+        the last few shots' travel in the packets too, so other players can draw
+        the tracers. Each shot is one flat [x, y, z, x, y, z, ...] list, with
+        whether it was the weapon's alt fire alongside ("ea") - its sound and
+        each pellet's projectile looks come from that."""
         self._shot_count += 1
-        if end_point is not None:
-            self._recent_shot_ends.append([round(end_point.x, 1), round(end_point.y, 1), round(end_point.z, 1)])
+        if end_points:
+            flat = [round(c, 1) for point in end_points for c in (point.x, point.y, point.z)]
+            self._recent_shot_ends.append((time.monotonic(), flat, int(bool(alt))))
             del self._recent_shot_ends[:-3]
 
     def notify_footstep(self, material, volume):
@@ -1071,6 +1080,9 @@ class NetworkManager:
         packet can't drop the event."""
         if jumped:
             self._jump_count += 1
+        stale = time.monotonic() - self.SHOT_ENDS_SECONDS
+        while self._recent_shot_ends and self._recent_shot_ends[0][0] < stale:
+            del self._recent_shot_ends[0]
         self._local_state = {
             "p": [round(feet_pos.x, 3), round(feet_pos.y, 3), round(feet_pos.z, 3)],
             "y": round(yaw, 2),
@@ -1085,7 +1097,8 @@ class NetworkManager:
             "wp": self.local_weapon or "",
             "k": encode_color(self.local_color),
             "f": self._shot_count,
-            "e": self._recent_shot_ends,
+            "e": [ends for _, ends, _ in self._recent_shot_ends],
+            "ea": [alt for _, _, alt in self._recent_shot_ends],
             "fs": self._footstep_count,
             "fm": self._last_footstep[0],
             "fv": self._last_footstep[1],
@@ -1369,6 +1382,8 @@ class NetworkManager:
                     lambda *args: self.on_tracer(*args) if self.on_tracer else None)
                 self.remote_players[sender_id].on_footstep = (
                     lambda *args, sid=sender_id: self.on_footstep(*args, sid) if self.on_footstep else None)
+                self.remote_players[sender_id].on_respawn = (
+                    lambda *args: self.on_respawn(*args) if self.on_respawn else None)
                 self.remote_players[sender_id].on_dissolve_spark = (
                     lambda *args: self.on_dissolve_spark(*args) if self.on_dissolve_spark else None)
                 self.remote_players[sender_id].on_dissolve_arc = (

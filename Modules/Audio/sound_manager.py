@@ -52,11 +52,25 @@ class SoundManager:
             return self._amplified(sound, path, gain, pitch)
         if cutoff is None:
             return sound
+        return pygame.sndarray.make_sound(self._muffled_samples(path, sound, cutoff, gain))
+
+    def _muffled_samples(self, path, sound, cutoff, gain=1.0):
+        """`sound` low-passed at `cutoff` Hz (see MUFFLE_TIERS) and, with gain, made louder the same soft-clipped
+        way _amplified does - a distant loud shot stays louder than a distant quiet one. Cached per file, cutoff
+        and gain."""
         key = (path, cutoff)
         samples = self._muffled.get(key)
         if samples is None:
             samples = self._muffled[key] = self._lowpass(pygame.sndarray.array(sound), cutoff)
-        return pygame.sndarray.make_sound(samples)
+        if gain == 1.0:
+            return samples
+        gained = self._muffled.get((path, cutoff, "gain", gain))
+        if gained is None:
+            info = np.iinfo(samples.dtype)
+            data = np.tanh(samples.astype(np.float64) / info.max * gain) * info.max
+            gained = self._muffled[(path, cutoff, "gain", gain)] = np.clip(
+                data, info.min, info.max).astype(samples.dtype)
+        return gained
 
     def _amplified(self, sound, path, gain=1.0, pitch=1.0):
         """A processed copy of `sound`: pitch-shifted (resampled - higher pitch is also shorter,
@@ -103,12 +117,9 @@ class SoundManager:
         if gain != 1.0 or pitch != 1.0:
             self._amplified(sound, sound_path, gain, pitch)
         if muffle:
-            samples = None
             for _limit, cutoff in self.MUFFLE_TIERS:
-                if cutoff is not None and (sound_path, cutoff) not in self._muffled:
-                    if samples is None:
-                        samples = pygame.sndarray.array(sound)
-                    self._muffled[(sound_path, cutoff)] = self._lowpass(samples, cutoff)
+                if cutoff is not None:
+                    self._muffled_samples(sound_path, sound, cutoff, gain)
 
     def add_sound(
         self,
@@ -140,7 +151,7 @@ class SoundManager:
         once per file and cached.
 
         gain: louder than volume can go (volume tops out at 1.0): the samples are amplified by this
-        factor with soft clipping - only for a one-shot without muffle. pitch: playback speed
+        factor with soft clipping (a muffled copy too). pitch: playback speed
         factor (1.5 = a fifth up and a third shorter), likewise pre-rendered.
 
         loop=True starts it as a looping ambient sound immediately

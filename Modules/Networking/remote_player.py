@@ -269,20 +269,21 @@ class RemotePlayer:
         self._hat_wanted = None   # from the latest packet ('' = bare-headed)
         self._hat_applied = None
         self._shot_seen = None     # last shot counter value seen
-        self._pending_shots = 0
+        self._pending_shots = []   # one entry per gunshot to play: whether it was their alt fire
         # Set alongside _pending_shots whenever the shot counter increases (see
         # receive_state) - consumed the same one-shot way _pending_jump is
         # (update() passes it into model.update() as just_shot, then clears it),
         # so a shot cancels an in-progress emote on THIS peer's own screen with
         # no extra network message - see PlayerModel.update()'s own just_shot.
         self._pending_shot_cancel = False
-        self._pending_tracers = []  # end points of shots to draw a tracer for
+        self._pending_tracers = []  # (flat end points, alt) of shots to draw tracers for
         self.on_tracer = None       # callback(start, end), set by NetworkManager
         self._footstep_seen = None   # last footstep counter value seen
         self._pending_footsteps = 0
         self._footstep_material = None
         self._footstep_volume = 1.0
         self.on_footstep = None     # callback(material, position, volume), set by NetworkManager
+        self.on_respawn = None      # callback(feet position) when they reappear at a new spawn, set by NetworkManager
         self._voice_position = glm.vec3(0.0)  # where this player's shots sound from
         self._color_wanted = None  # fur color from the latest packet (None = the rat's own)
         self._color_applied = None
@@ -345,14 +346,20 @@ class RemotePlayer:
         # (capped so a long stall can't replay a burst of gunfire at once).
         shots = int(state.get("f", 0))
         if self._shot_seen is not None and shots > self._shot_seen:
-            self._pending_shots = min(self._pending_shots + shots - self._shot_seen, 3)
             self._pending_shot_cancel = True
-            # The packet carries the end points of their last few shots; the
-            # newest ones are the shots just fired.
+            # The packet carries the end points of their last few shots (one flat
+            # [x, y, z, ...] list per shot: several points for a shotgun's pellets)
+            # and whether each was an alt fire; the newest ones are the shots just fired.
+            new = shots - self._shot_seen
             ends = state.get("e") or []
-            fresh = min(shots - self._shot_seen, len(ends))
+            alts = state.get("ea") or []
+            fresh = min(new, len(ends))
+            fresh_alts = ([bool(a) for a in alts[-fresh:]] if fresh > 0 and len(alts) == len(ends)
+                          else [False] * fresh)
+            self._pending_shots.extend([False] * (new - fresh) + fresh_alts)
+            del self._pending_shots[:-3]
             if fresh > 0:
-                self._pending_tracers.extend(ends[-fresh:])
+                self._pending_tracers.extend(zip(ends[-fresh:], fresh_alts))
                 del self._pending_tracers[:-3]
         self._shot_seen = shots
         # Footsteps travel as a counter like jumps/shots (see NetworkManager.notify_footstep's
@@ -406,6 +413,9 @@ class RemotePlayer:
             # died) so the body appears there, instead of being interpolated across the map from the death spot.
             del self._snapshots[:-1]
             self._set_dead(False)
+            self.model.start_spawn_effect()     # materializes at the new spawn (PlayerModel.start_spawn_effect)
+            if self.on_respawn is not None:
+                self.on_respawn(glm.vec3(self._snapshots[-1][1]))   # their feet at the new spawn
         now = time.perf_counter()
         feet_pos, yaw = self._sample(now - INTERP_DELAY)
         self._voice_position = feet_pos + glm.vec3(0.0, _BODY_HEIGHT * 0.8, 0.0)
@@ -502,7 +512,7 @@ class RemotePlayer:
                         for _ in range(self.DISSOLVE_ARC_BURST_COUNT):
                             self.on_dissolve_arc(_random_body_point())
         if self.dead:
-            self._pending_shots = 0
+            self._pending_shots.clear()
             self._pending_tracers.clear()
             self._pending_footsteps = 0
         while self._pending_footsteps > 0:
@@ -513,24 +523,32 @@ class RemotePlayer:
                 # a footstep should sound like it's coming from the ground.
                 feet = self.model.obj["position"] if self.model.obj is not None else self._voice_position
                 self.on_footstep(self._footstep_material, glm.vec3(feet), self._footstep_volume)
-        while self._pending_shots > 0:
-            self._pending_shots -= 1
-            # From about chest height at where they're standing now.
+        for alt in self._pending_shots:
             # From about chest height, following this player while it plays.
-            self.weapon.play_fire_sound(self.scene, self._voice_position, follow=lambda: self._voice_position)
-        for end in self._pending_tracers:
-            if self.on_tracer is not None:
-                end = glm.vec3(*end)
+            self.weapon.play_fire_sound(self.scene, self._voice_position, follow=lambda: self._voice_position,
+                                        alt=alt)
+        self._pending_shots.clear()
+        for shot_ends, alt in self._pending_tracers:
+            if self.on_tracer is None:
+                break
+            # Which projectile each pellet belongs to (its tracer/impact looks): the ends arrive in the order the
+            # shooter's weapon traced them, projectile by projectile (WeaponsBase.projectile_stats).
+            looks = [stats for stats, count in self.weapon.projectile_stats(alt) for _ in range(count)]
+            flash = True    # one muzzle flash per shot, however many pellets
+            for n, i in enumerate(range(0, len(shot_ends) - 2, 3)):
+                end = glm.vec3(*shot_ends[i:i + 3])
                 aim = end - self._voice_position
-                if glm.length(aim) > 1e-3:
-                    # From the muzzle bone of the gun in their hand (or, if
-                    # it isn't posed yet, a little ahead of the chest).
-                    muzzle = self.weapon.muzzle_position(self.scene)
-                    if muzzle is None:
-                        muzzle = self._voice_position + glm.normalize(aim) * 0.6
-                    # (the flash stays on the gun's muzzle as it moves)
-                    self.on_tracer(muzzle, end, lambda: self.weapon.muzzle_position(self.scene),
-                                   self.weapon)
+                if glm.length(aim) <= 1e-3:
+                    continue
+                # From the muzzle bone of the gun in their hand (or, if
+                # it isn't posed yet, a little ahead of the chest).
+                muzzle = self.weapon.muzzle_position(self.scene)
+                if muzzle is None:
+                    muzzle = self._voice_position + glm.normalize(aim) * 0.6
+                # (the flash stays on the gun's muzzle as it moves)
+                self.on_tracer(muzzle, end, lambda: self.weapon.muzzle_position(self.scene),
+                               looks[min(n, len(looks) - 1)], flash)
+                flash = False
         self._pending_tracers.clear()
         if self._weapon_wanted is not None and self._weapon_wanted != self._weapon_id:
             self._apply_weapon(self._weapon_wanted)

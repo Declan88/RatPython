@@ -11,7 +11,7 @@ IMPACT_FILE = "Assets/Particles/Impact/impact_fx.pcf"
 # A bullet hitting a surface is a short, punchy one-shot, not a weapon's own
 # report (see WeaponsBase.fire_min_distance/fire_max_distance for that, much
 # louder/further-carrying) - audible up close, inaudible from across the map.
-# Same shape of pair gibs.py's own GORE_SOUND uses for its impact, close
+# Same shape of pair gibs.py's own GORE_SOUNDS use for its impact, close
 # enough in kind (a sudden, similarly-loud one-shot) to reuse that distance.
 IMPACT_SOUND_MIN_DISTANCE = 3.0
 IMPACT_SOUND_MAX_DISTANCE = 60.0

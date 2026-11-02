@@ -5,6 +5,7 @@ import pygame
 import os
 import ctypes
 import glm
+import math
 
 
 def _is_frozen_build():
@@ -62,8 +63,8 @@ from Modules.Debug import FrameProfiler
 from Modules.Window.cpu_affinity import (
     prefer_performance_cores, keep_other_threads_off_main_cores, apply_process_cpu_mask_from_env,
     apply_priority_from_env, cpu_affinity_label)
-from Modules.Particles.impacts import (IMPACT_FILE, IMPACT_GROUP, MATERIAL_ALIASES, LIFETIME_SCALE, MAX_IMPACT_EFFECTS,
-                                       RADIUS_SCALE, keep_frame, spawn_impact, play_impact_sound)
+from Modules.Particles.impacts import (IMPACT_FILE, IMPACT_GROUP, IMPACT_SIZE, MATERIAL_ALIASES, LIFETIME_SCALE,
+                                       MAX_IMPACT_EFFECTS, RADIUS_SCALE, keep_frame, spawn_impact, play_impact_sound)
 from Modules.Physics.physics_world import CollisionGroup
 from Modules.UI.nametags import NameTags
 from Modules.UI.scoreboard import Scoreboard
@@ -79,7 +80,7 @@ TEST_DUMMY_STEAM_ID = 1
 TEST_DUMMY_OFFSET = (3.0, 0.0, -2.0)   # metres from SPAWN_POSITION, feet-height
 TEST_DUMMY_RESPAWN_SECONDS = 1.5
 TEST_DUMMY_HEALTH = 100.0
-STARTING_LOADOUT = ["usp", "gouda_gun", "pencil", "corroder"]   # weapon ids (Modules/Weapons/registry.py)
+STARTING_LOADOUT = ["usp", "gouda_gun", "pencil", "corroder", "farm_sweeper"]   # weapon ids (Modules/Weapons/registry.py)
 # Number-row keys 1-9 select inventory slots 0-8 (only the slots that exist).
 WEAPON_SLOT_KEYS = {getattr(pygame, f"K_{n}"): n - 1 for n in range(1, 10)}
 
@@ -96,6 +97,11 @@ HITMARKER_GAIN = 10.0     # anything louder has to amplify the samples themselve
 KILL_SOUND = "Assets/Audio/player/Kill.wav"
 KILL_SOUND_VOLUME = 1.0
 KILL_SOUND_GAIN = 4.0
+# Played where a player (us, someone else, the test dummy) reappears after dying - heard only close by.
+SPAWN_SOUND = "Assets/Audio/Player/noisy-multimedia-fx-chippy-hit.wav"
+SPAWN_SOUND_MIN_DISTANCE = 4.0    # full volume within this many metres...
+SPAWN_SOUND_MAX_DISTANCE = 15.0   # ...silent past this
+SPAWN_SOUND_GAIN = 3.0            # the file is quiet (peaks at half scale): about +9 dB, soft-clipped
 
 # The rat's animations. Most were exported at Blender's default 24 fps although authored for 30, so their key
 # times are 1.25x too long; RAT_ANIM_TIME_SCALE corrects that for the files flagged below (checked per file
@@ -392,6 +398,7 @@ def main():
             if damage_class == "smite":
                 spawn_smite(pos)
         test_dummy.on_death = dummy_died
+        test_dummy.on_respawn = on_player_spawned
         test_dummy.on_dissolve_spark = spawn_dissolve_spark_burst
         test_dummy.on_dissolve_arc = spawn_dissolve_arc
         return "Test dummy spawned."
@@ -598,18 +605,18 @@ def main():
             hitmarker.trigger(headshot=False)
         return splash
 
-    def show_damage_numbers(shot, splash):
-        """Damage numbers for one of our shots: the direct hit (if it struck a player) and its explosion's splash
-        (explode's result) on each player it caught. With combine_explosion_damage on, a player both hit and caught
-        in the blast gets one number for the total instead of two."""
+    def show_damage_numbers(hits, splash):
+        """Damage numbers for one of our shots: its direct hits (damage_by_victim's result, players only - a
+        shotgun's pellets are one number per player) and its explosion's splash (explode's result) on each player it
+        caught. With combine_explosion_damage on, a player both hit and caught in the blast gets one number for the
+        total instead of two."""
         if not settings.damage_numbers:
             return
         splash = dict(splash)
-        if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
-            total = shot.damage
-            if settings.combine_explosion_damage and shot.victim in splash:
-                total += splash.pop(shot.victim)[1]
-            damage_numbers.add(shot.hit.position, total, shot.headshot)
+        for victim, (total, headshot, position) in hits.items():
+            if settings.combine_explosion_damage and victim in splash:
+                total += splash.pop(victim)[1]
+            damage_numbers.add(position, total, headshot)
         for position, amount in splash.values():
             damage_numbers.add(position, amount)
 
@@ -689,11 +696,13 @@ def main():
                                     colors=gun.impact_color, size=gun.impact_size, group=IMPACT_GROUP)
             play_impact_sound(current_scene.sound_manager, hit, gun=gun)
         else:
-            spawn_impact(particles, hit, sound_manager=current_scene.sound_manager, gun=gun)
+            spawn_impact(particles, hit, size=IMPACT_SIZE * gun.impact_size,
+                         sound_manager=current_scene.sound_manager, gun=gun)
 
-    def remote_shot(start, end, follow=None, shooter_weapon=None):
-        """Another player's shot, drawn with their weapon's looks: tracer, muzzle flash on their gun, and the
-        impact where it ended (looked up here - only the end point is sent)."""
+    def remote_shot(start, end, follow=None, shooter_weapon=None, flash=True):
+        """Another player's shot (or one pellet of it), drawn with their weapon's looks: tracer, muzzle flash on
+        their gun (flash=False for a shotgun's other pellets) and the impact where it ended (looked up here - only
+        the end point is sent)."""
         shooter_weapon = shooter_weapon or WeaponsBase
         tracers.add(start, end, style=shooter_weapon.tracer_style)
         shooter_weapon.spawn_tracer_spiral(particles, start, end, camera_pos=camera.position)
@@ -702,7 +711,7 @@ def main():
             if current_scene is not None:
                 spawn_shot_impact(shooter_weapon,
                                   current_scene.physics.raycast(start, glm.vec3(end) + glm.normalize(aim) * 0.1))
-            if shooter_weapon.muzzle_particle:
+            if flash and shooter_weapon.muzzle_particle:
                 particles.spawn(shooter_weapon.muzzle_particle, start, forward=aim,
                                 colors=shooter_weapon.muzzle_color, size=shooter_weapon.muzzle_size,
                                 offset_scale=shooter_weapon.muzzle_offset_scale, follow=follow)
@@ -712,6 +721,17 @@ def main():
         if current_scene is not None:
             current_scene.play_footstep_sound(material, position, volume=volume, character=steam_id)
     net_mgr.on_footstep = remote_footstep
+
+    def on_player_spawned(feet):
+        """A player (us, someone else, the test dummy) just appeared at `feet`: the respawn sound, audible only a
+        short way around them (SPAWN_SOUND_*). Their model's materialize wipe is started by whoever owns the model
+        (PlayerModel.start_spawn_effect)."""
+        if current_scene is None:
+            return
+        current_scene.sound_manager.add_sound(
+            SPAWN_SOUND, glm.vec3(feet) + glm.vec3(0.0, 0.5, 0.0), loop=False, falloff="inverse",
+            min_distance=SPAWN_SOUND_MIN_DISTANCE, max_distance=SPAWN_SOUND_MAX_DISTANCE, gain=SPAWN_SOUND_GAIN)
+    net_mgr.on_respawn = on_player_spawned
     net_mgr.on_dissolve_spark = spawn_dissolve_spark_burst
     net_mgr.on_dissolve_arc = spawn_dissolve_arc
 
@@ -887,6 +907,8 @@ def main():
         weapon_hud.visible = True
         death_screen.hide()
         net_mgr.notify_respawn()
+        local_player_model.start_spawn_effect()   # materializes at the spawn (seen in third person and by others)
+        on_player_spawned(player.get_feet_position())
 
     def prime_shooting(prime_camera):
         """Plays a shot for real for about a second into the back buffer (gun/arm animations, upper-body
@@ -903,7 +925,7 @@ def main():
             particles.spawn(weapon.muzzle_particle, muzzle, forward=prime_camera.front, up=prime_camera.up,
                             overlay=True, colors=weapon.muzzle_color, size=weapon.muzzle_size,
                             offset_scale=weapon.muzzle_offset_scale)
-        tracers.add(muzzle, end)
+        tracers.add(muzzle, end, style=weapon.tracer_style)
         for _ in range(10):
             current_scene.update(0.1)
             window.ctx.clear(0.1, 0.1, 0.1, 1.0)
@@ -930,8 +952,10 @@ def main():
         prime_camera.yaw, prime_camera.pitch = -90.0, 0.0
         prime_camera.update_vectors()
         sounds = current_scene.sound_manager
-        if weapon is not None and weapon.fire_sound:
-            sounds.preload(weapon.fire_sound, muffle=True)
+        for mode in ((False, True) if weapon is not None and weapon.alt_fire is not None else (False,)):
+            stats = weapon.fire_stats(mode) if weapon is not None else None
+            if stats is not None and stats.fire_sound:     # each fire mode's own shot (an alt fire can be louder)
+                sounds.preload(stats.fire_sound, muffle=True, gain=stats.fire_gain)
         sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN)
         sounds.preload(HITMARKER_SOUND, gain=HITMARKER_GAIN, pitch=HITMARKER_HEADSHOT_PITCH)
         sounds.preload(KILL_SOUND, gain=KILL_SOUND_GAIN)
@@ -1058,10 +1082,15 @@ def main():
         if (slot is not None and weapon is not None and not ui.cursor_free
                 and len(inventory) > 1 and slot < len(inventory)):
             switch_weapon(slot)
-        if key == pygame.K_t and weapon is not None and weapon.reloading and viewmodel is not None:
-            reload_time = viewmodel.one_shot_time("reload")
-            if reload_time is not None:
-                print(f"[reload] {weapon.name}: frame {reload_time * 30.0:.1f} (30fps) / {reload_time:.3f}s")
+        if key == pygame.K_t and weapon is not None and viewmodel is not None:
+            # Debug: the first-person animation playing right now and its frame - in the source file's frames
+            # (handling_fps), so a sped-up draw (draw_speed) reads in the frames it was animated in.
+            playing = viewmodel.current_animation()
+            if playing is not None:
+                state, clip, seconds, length = playing
+                scale = weapon.handling_fps * (weapon.draw_speed if state == "draw" else 1.0)
+                print(f"[anim] {weapon.name} {state} ({clip}): frame {seconds * scale:.1f} / {length * scale:.1f} "
+                      f"({weapon.handling_fps:g}fps) - {seconds:.3f}s / {length:.3f}s")
         if key == pygame.K_h:
             change_health(-10.0)
         elif key == pygame.K_j:
@@ -1079,8 +1108,21 @@ def main():
     def camera_position():
         return camera.position
 
+    def on_gun_screen_spot(point):
+        """A point on the first-person gun moved to where the CAMERA's projection shows the gun's point: the gun
+        may be drawn with its own FOV (WeaponsBase.viewmodel_fov), while the muzzle flash and tracer are drawn with
+        the camera's - without this they'd start off the barrel on screen. Scales the point's offset from the view
+        axis by tan(camera fov / 2) / tan(gun fov / 2) at its own depth."""
+        fov = current_scene.viewmodel_fov
+        if point is None or third_person or not fov or abs(fov - camera.fov) < 1e-6:
+            return point
+        view = camera.get_view_matrix()
+        p = view * glm.vec4(point, 1.0)
+        k = math.tan(math.radians(camera.fov) / 2.0) / math.tan(math.radians(fov) / 2.0)
+        return glm.vec3(glm.inverse(view) * glm.vec4(p.x * k, p.y * k, p.z, 1.0))
+
     def muzzle_position():
-        return weapon.muzzle_position(current_scene)
+        return on_gun_screen_spot(weapon.muzzle_position(current_scene))
 
     def camera_frame():
         return camera.front, camera.up
@@ -1226,14 +1268,19 @@ def main():
         if alive:
             inventory.recoil.apply(camera, dt)
         # Right-click ADS: update_scope eases a 0..1 blend that moves the viewmodel to the scope and narrows the
-        # FOV; sensitivity scales by the same ratio (felt from the next frame's mouse motion).
+        # FOV; sensitivity scales by the same ratio (felt from the next frame's mouse motion). A weapon with an
+        # alt fire uses the button for that instead (see the firing below).
         scope_blend = 0.0
         if weapon is not None:
-            aiming = alive and not third_person and not ui.cursor_free and controls.held(Action.AIM)
+            aiming = (alive and not third_person and not ui.cursor_free and weapon.alt_fire is None
+                      and controls.held(Action.AIM))
             scope_blend = weapon.update_scope(aiming, dt)
         camera.fov = BASE_FOV + (weapon.scope_fov - BASE_FOV) * scope_blend if (
             weapon is not None and weapon.has_scope) else BASE_FOV
         camera.sensitivity = BASE_SENSITIVITY * (camera.fov / BASE_FOV)
+        # The first-person gun's own FOV, if it was animated through a different one (WeaponsBase.viewmodel_fov).
+        current_scene.viewmodel_fov = (weapon.viewmodel_fov_y(camera.aspect, camera.fov, BASE_FOV)
+                                       if weapon is not None else None)
         viewmodel.update(camera, not third_person and alive, dt, scope_blend)
         if weapon is not None:
             weapon.update(follow=camera_position)   # finishes an in-progress reload once its time is up
@@ -1253,58 +1300,84 @@ def main():
         if controls.pressed(Action.RELOAD) and weapon is not None and alive and in_play:
             weapon.start_reload()
 
-        # Fire (left mouse, RT); the weapon's fire mode decides how many shots (one per press for SEMI, paced while
-        # held for AUTO). Presses only count as game input with the cursor captured, so clicking UI never shoots.
+        # Fire (left mouse, RT) and alt fire (right mouse, LT - a weapon with an alt_fire); the mode's fire_mode
+        # decides how many shots (one per press for SEMI, paced while held for AUTO). Presses only count as game
+        # input with the cursor captured, so clicking UI never shoots.
         if weapon is not None:
-            crosshair.set_spread(weapon.spread_degrees(), camera.fov)
+            crosshair.set_spread(weapon.spread_degrees() + weapon.pellet_spread, camera.fov)
             weapon_hud.update(weapon, inventory.weapons, inventory.index)
         shots_fired_this_frame = 0
         if weapon is not None and in_play and alive:
             shots = weapon.shots_this_frame(controls.pressed(Action.FIRE), controls.held(Action.FIRE))
-            shots_fired_this_frame = shots
-            for _ in range(shots):
+            alt_shots = weapon.shots_this_frame(controls.pressed(Action.AIM), controls.held(Action.AIM), alt=True)
+            shots_fired_this_frame = shots + alt_shots
+            for alt in [False] * shots + [True] * alt_shots:
                 # A line trace along the aim: the first wall, prop or player hitbox it meets is what was hit.
-                shot = weapon.fire(current_scene, camera.position, direction=camera.front, follow=camera_position)
+                shot = weapon.fire(current_scene, camera.position, direction=camera.front, follow=camera_position,
+                                   alt=alt)
                 if shot is None:      # not ready (fire rate, reloading, empty): no shot, no rumble
                     continue
-                controls.rumble(RUMBLE_FIRE)
-                end = (shot.hit.position if shot.hit is not None
-                       else camera.position + shot.direction * weapon.max_range)
-                net_mgr.notify_shot(glm.vec3(end))
-                muzzle = weapon.muzzle_position(current_scene)
+                controls.rumble(shot.stats.fire_rumble or RUMBLE_FIRE)
+                if shot.stats.self_knockback:
+                    # Thrown straight back from where we aimed (WeaponsBase.self_knockback): at the floor, up.
+                    player.apply_impulse(-camera.front * shot.stats.self_knockback)
+                muzzle = muzzle_position()
                 if muzzle is None:   # no gun model posed yet: from just off the eye
                     right = glm.normalize(glm.cross(camera.front, camera.up))
                     muzzle = camera.position + camera.front * 0.6 + right * 0.14 - camera.up * 0.12
-                tracers.add(muzzle, end, style=weapon.tracer_style)
-                weapon.spawn_tracer_spiral(particles, muzzle, end, camera_pos=camera.position)
-                spawn_shot_impact(weapon, shot.hit)
+                # A tracer and impact per pellet (just the one for an ordinary gun), each with its own projectile's
+                # looks; every pellet's end goes to the other players too, so they see the whole spread.
+                ends = [glm.vec3(pellet.hit.position if pellet.hit is not None
+                                 else camera.position + pellet.direction * pellet.stats.max_range)
+                        for pellet in shot.pellets]
+                net_mgr.notify_shot(ends, alt=shot.alt)
                 splash = {}
-                if weapon.explosion is not None and shot.hit is not None:
-                    splash = explode(weapon, shot.hit)
-                show_damage_numbers(shot, splash)
-                if weapon.muzzle_particle:
+                for pellet, end in zip(shot.pellets, ends):
+                    tracers.add(muzzle, end, style=pellet.stats.tracer_style)
+                    pellet.stats.spawn_tracer_spiral(particles, muzzle, end, camera_pos=camera.position)
+                    spawn_shot_impact(pellet.stats, pellet.hit)
+                    if pellet.stats.explosion is not None and pellet.hit is not None:
+                        for target, (position, amount) in explode(pellet.stats, pellet.hit).items():
+                            previous = splash.get(target, (position, 0.0))[1]
+                            splash[target] = (position, previous + amount)
+                hits = {victim: hit for victim, hit in shot.damage_by_victim().items()
+                        if victim in net_mgr.remote_players or victim == TEST_DUMMY_STEAM_ID}
+                show_damage_numbers(hits, splash)
+                stats = shot.stats
+                if stats.muzzle_particle:
                     # overlay while the first-person gun is on screen (its depth is squashed)
-                    particles.spawn(weapon.muzzle_particle, muzzle, forward=shot.direction,
+                    particles.spawn(stats.muzzle_particle, muzzle, forward=shot.direction,
                                     up=camera.up, overlay=not third_person,
-                                    colors=weapon.muzzle_color, size=weapon.muzzle_size,
-                                    offset_scale=weapon.muzzle_offset_scale,
+                                    colors=stats.muzzle_color, size=stats.muzzle_size,
+                                    offset_scale=stats.muzzle_offset_scale,
                                     follow=muzzle_position, follow_frame=camera_frame)
-                if shot.victim in net_mgr.remote_players or shot.victim == TEST_DUMMY_STEAM_ID:
-                    hitmarker.trigger(headshot=shot.headshot)
-                    controls.rumble(RUMBLE_HIT, 1.0 if shot.headshot else 0.6)
+                if hits:
+                    # One hitmarker, rumble and hit sound per trigger pull, however many pellets landed.
+                    any_headshot = any(headshot for _, headshot, _ in hits.values())
+                    hitmarker.trigger(headshot=any_headshot)
+                    controls.rumble(RUMBLE_HIT, 1.0 if any_headshot else 0.6)
                     # Flat, in both ears, at any distance: feedback for us, not a sound in the world.
                     hit_emitter = current_scene.sound_manager.add_sound(
                         HITMARKER_SOUND, camera.position, volume=HITMARKER_VOLUME, loop=False,
                         universal=True, channel=hit_sound_channel[0], gain=HITMARKER_GAIN,
-                        pitch=HITMARKER_HEADSHOT_PITCH if shot.headshot else 1.0)
+                        pitch=HITMARKER_HEADSHOT_PITCH if any_headshot else 1.0)
                     hit_sound_channel[0] = hit_emitter["channel"]
-                    if shot.victim == TEST_DUMMY_STEAM_ID:
-                        damage_dummy(shot.damage, weapon.name, shot.headshot, damage_class=weapon.damage_class.name)
+                for victim, (amount, headshot, struck) in hits.items():
+                    # If this kills them, their gibs fly away from us (WeaponsBase.gib_push): along the line from
+                    # our eye to where the first pellet struck them, tipped up a little.
+                    push = None
+                    away = glm.vec3(struck) - camera.position
+                    if stats.gib_push and glm.length(away) > 1e-3:
+                        away = glm.normalize(glm.normalize(away) + glm.vec3(0.0, stats.gib_push_lift, 0.0))
+                        push = away * stats.gib_push
+                    # One damage message per player hit, with every pellet that struck them added together.
+                    if victim == TEST_DUMMY_STEAM_ID:
+                        damage_dummy(amount, weapon.name, headshot, push=push, damage_class=stats.damage_class.name)
                     else:
                         # origin = where we fired from, for their damage indicator (not where it hit their
                         # hitbox: that noise swung the arrow badly at range).
-                        net_mgr.send_damage(shot.victim, shot.damage, weapon.name, headshot=shot.headshot,
-                                            damage_class=weapon.damage_class.name,
+                        net_mgr.send_damage(victim, amount, weapon.name, headshot=headshot, push=push,
+                                            damage_class=stats.damage_class.name,
                                             origin=tuple(camera.position))
 
         prof.mark("camera + weapons")

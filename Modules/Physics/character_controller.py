@@ -933,6 +933,19 @@ class CharacterController:
         requiring a fresh press each time)."""
         self._jump_requested = True
 
+    def apply_impulse(self, delta_velocity):
+        """Adds `delta_velocity` (render space, m/s) to the hull's velocity at once - a shove, like a gun's
+        knockback. Anything with an upward part lifts it off the ground (and off a ladder) the way a jump does, so
+        it isn't snapped straight back down; it adds to a jump in progress, so the two stack. Nothing while halted."""
+        if self.frozen:
+            return
+        self.velocity = self.velocity + glm.vec3(delta_velocity)
+        if delta_velocity.y > 0.0:
+            if self._on_ladder:
+                self._leave_ladder(_LADDER_REGRAB_COOLDOWN)   # blown off it, like jumping off
+            self._grounded = False
+            self._jumping = True       # holds the ground probe off until the rise is over (see _categorize_position)
+
     def halt(self):
         """Stops dead and stays put (the owner died): no velocity, movement input, queued jump or gravity - the
         hull is frozen where it is, even in mid-air, until the next teleport (the respawn) releases it."""

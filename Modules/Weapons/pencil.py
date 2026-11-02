@@ -50,12 +50,16 @@ class Pencil(USP):
     # Spine4 corrections are tuned for that pose only, so they're cleared here).
     player_animations = {"idle": RIFLE_HOLD_POSE}
     player_upper_rotation_degrees = {}
-    player_moving_yaw_degrees = 0.0
     damage = 60
     fire_interval = 1
     draw_speed = 1
     magazine_size = 5
-    fire_sound = "Assets/Audio/Guns/Pencil/Pencil.wav"
+    fire_sound = "Assets/Audio/Guns/Pencil/sniper-rifle-shot-fx.wav"
+    # A sniper's crack: far louder than the file as recorded (4x, soft-clipped - about +7 dB; past that it only
+    # flattens), full volume out to 10 m instead of 5, and heard across the map (300 m instead of 160).
+    fire_gain = 4.0
+    fire_min_distance = 10.0
+    fire_max_distance = 300.0
 
     # Accuracy: deliberately BAD at rest (hip-fire) - spread_min alone (the cone's
     # size with the trigger rested, before any per-shot penalty) is already most of

@@ -31,7 +31,6 @@ class Corroder(USP):
     # corrections are tuned for that pose only, so they're cleared here).
     player_animations = {"idle": RIFLE_HOLD_POSE}
     player_upper_rotation_degrees = {}
-    player_moving_yaw_degrees = 0.0
     damage = 7.5  # well under the USP's 15: 14 body shots (1.3 s of held fire) to kill (was 12 -> 9 shots, 0.8 s)
     headshot_multiplier = 1.8  # head = 13.5, so 8 head shots (0.7 s) - the base multiplier of 2.0 would make it 7
     fire_mode = FireMode.AUTO  # hold the trigger to keep firing

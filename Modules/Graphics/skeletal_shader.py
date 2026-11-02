@@ -143,6 +143,11 @@ SKELETAL_VERTEX_SHADER = SKELETAL_VERTEX_HEADER + SKELETAL_VERTEX_BODY
 # own code does, since it doesn't need to).
 _DISSOLVE_UNIFORMS = """
 uniform float u_dissolve_amount;   // 0 = untouched, 1 = fully gone
+// The spawn "materialize" effect (see _SPAWN_SNIPPET): 1 = just appeared, easing to 0 = done (0 skips it).
+uniform float u_spawn_amount;
+uniform float u_spawn_base_y;      // world height of the character's feet
+uniform float u_spawn_height;      // metres the reveal line climbs
+uniform vec3 u_spawn_color;        // the glow (linear RGB; above 1 to bloom)
 
 float dissolve_hash(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
@@ -154,7 +159,25 @@ float dissolve_hash(vec2 p) {
 _DISSOLVE_BLACKEN_END = 0.35
 _DISSOLVE_VANISH_START = 0.55
 _DISSOLVE_TARGET = "    fragColor = vec4(color, u_alpha_mode == 2 ? alpha : 1.0);\n}"
-_DISSOLVE_SNIPPET = f"""
+# The spawn effect (a player appearing - see PlayerModel.start_spawn_effect): a glowing line climbs from the feet
+# to the top of the head over the first _SPAWN_REVEAL_END of the effect, with nothing drawn above it (a dithered
+# edge, so it doesn't look cut with a knife), a bright band of u_spawn_color just under it, and the whole body lit
+# with that colour, fading out over the rest. Everything attached to the character (gun, hat) shares the same
+# line, so it builds up with the body.
+_SPAWN_REVEAL_END = 0.6
+_SPAWN_BAND = 0.12          # how far below the line the bright band reaches (fractions of the height)
+_SPAWN_SNIPPET = f"""
+    if (u_spawn_amount > 0.0) {{
+        float t = 1.0 - u_spawn_amount;                                      // 0 -> 1 over the effect
+        float h = (v_position.y - u_spawn_base_y) / max(u_spawn_height, 0.01);  // 0 feet .. 1 top
+        float line = mix(-{_SPAWN_BAND}, 1.0 + {_SPAWN_BAND}, clamp(t / {_SPAWN_REVEAL_END}, 0.0, 1.0));
+        float edge = (h - line) / 0.03;                                       // a soft, dithered cut
+        if (edge > 0.0 && dissolve_hash(gl_FragCoord.xy) < clamp(edge, 0.0, 1.0)) discard;
+        float band = 1.0 - clamp((line - h) / {_SPAWN_BAND}, 0.0, 1.0);
+        float body = 1.0 - clamp((t - {_SPAWN_REVEAL_END}) / (1.0 - {_SPAWN_REVEAL_END}), 0.0, 1.0);
+        color += u_spawn_color * (band * band * 2.5 + body * 0.35);
+    }}"""
+_DISSOLVE_SNIPPET = _SPAWN_SNIPPET + f"""
     if (u_dissolve_amount > 0.0) {{
         // Colour ramps to flat black - see this block's own comment above for exactly where
         // this comes from in Source's own client code.
@@ -278,3 +301,13 @@ def bind_dissolve(prog, obj):
     if "u_dissolve_amount" not in prog:
         return
     prog["u_dissolve_amount"].value = float(obj.get("dissolve_amount") or 0.0)
+    # The spawn effect, the same way (zeroed for everyone else): obj["spawn_fx"] is a dict the character's
+    # PlayerModel updates (see start_spawn_effect) and shares with whatever is attached to it.
+    if "u_spawn_amount" in prog:
+        fx = obj.get("spawn_fx")
+        amount = fx["amount"] if fx else 0.0
+        prog["u_spawn_amount"].value = amount
+        if amount > 0.0:
+            prog["u_spawn_base_y"].value = fx["base_y"]
+            prog["u_spawn_height"].value = fx["height"]
+            prog["u_spawn_color"].value = fx["color"]

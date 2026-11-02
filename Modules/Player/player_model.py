@@ -94,6 +94,13 @@ _ROOT_OFFSET_EASE_SECONDS = 0.04
 # smooths a remote player's pitch, which only arrives with each network packet, and eases in/out of an emote.
 _AIM_EASE_SECONDS = 0.05
 
+# The spawn "materialize" effect (see PlayerModel.start_spawn_effect and skeletal_shader's _SPAWN_SNIPPET): how long
+# it lasts, how high its glowing line climbs from the feet (past the head, so a hat builds up too), and its colour
+# (linear RGB, above 1 so it glows).
+SPAWN_EFFECT_SECONDS = 1.1
+SPAWN_EFFECT_HEIGHT = 1.75
+SPAWN_EFFECT_COLOR = (0.25, 0.65, 1.8)
+
 # Seconds update()'s own is_grounded argument must read False CONTINUOUSLY
 # before PlayerModel treats the player as genuinely airborne and enters
 # the "jump" top-level state - see _confirmed_airborne. CharacterController.
@@ -707,6 +714,7 @@ class PlayerModel:
         # (joint index, its forward axis, its rest-pose elevation, [its chain from the root]), once loaded.
         self._aim_level = None
         self._clip_levels = {}              # clip name -> that joint's sampled rotations in it (see _clip_level)
+        self._spawn_elapsed = None          # seconds into the spawn effect, or None when none is playing
 
         if not states:
             raise ValueError("PlayerModel requires at least one state in `states`")
@@ -1065,6 +1073,29 @@ class PlayerModel:
                 total += weight
         return correction / total if total > 0.0 else 0.0
 
+    def start_spawn_effect(self, color=SPAWN_EFFECT_COLOR):
+        """Plays the spawn effect from the start: the body (and its held gun and hat, which share it) builds up from
+        the feet behind a climbing line of glowing `color`, then the glow fades - see skeletal_shader's
+        _SPAWN_SNIPPET. Driven by update(); a no-op if the model failed to load."""
+        if self.obj is None:
+            return
+        self._spawn_elapsed = 0.0
+        self.obj["spawn_fx"] = {"amount": 1.0, "base_y": float(self.obj["position"].y),
+                                "height": SPAWN_EFFECT_HEIGHT, "color": tuple(color)}
+
+    def _update_spawn_effect(self, dt, feet):
+        """Advances the spawn effect (see start_spawn_effect), keeping its line on the feet as they move."""
+        if self._spawn_elapsed is None:
+            return
+        self._spawn_elapsed += max(dt, 0.0)
+        fx = self.obj["spawn_fx"]
+        if self._spawn_elapsed >= SPAWN_EFFECT_SECONDS:
+            self._spawn_elapsed = None
+            self.obj["spawn_fx"] = None
+            return
+        fx["amount"] = 1.0 - self._spawn_elapsed / SPAWN_EFFECT_SECONDS
+        fx["base_y"] = float(feet.y)
+
     def _distribute_aim(self, pitch):
         """Each aim joint's own turn (degrees, in _aim_joints order) for a bend of `pitch` - see aim_pitch_joints:
         what it takes to bring the turn so far along its chain up to its reach, within its limit."""
@@ -1242,6 +1273,7 @@ class PlayerModel:
         self._root_offset += (self._target_root_offset() - self._root_offset) * ease
         self._place(position)
         self._update_aim(dt, pitch_degrees)
+        self._update_spawn_effect(dt, position)
 
         # Computed unconditionally, every frame, regardless of top_state -
         # locomotion's own blend space needs these below, crouch_
